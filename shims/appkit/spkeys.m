@@ -9,6 +9,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 @property(nonatomic, copy) void (^action)(void);
 @property(nonatomic) NSInteger compactColumn; // One-based, mirrored from the outside of each digit row.
 @property(nonatomic) BOOL editingPosition;
+@property(nonatomic) BOOL compactHUD;
 - (instancetype)initWithName:(NSString *)name label:(NSString *)label usage:(unsigned)usage position:(CGPoint)position;
 - (void)layoutInRect:(CGRect)rect;
 - (void)cancelInputWithReason:(NSString *)reason;
@@ -87,8 +88,8 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 - (void)setHighlighted:(BOOL)highlighted {
     highlighted = highlighted || _actionActive;
     [super setHighlighted:highlighted];
-    UIColor *gold = [UIColor colorWithRed:0.78 green:0.73 blue:0.59 alpha:1];
-    _face.backgroundColor = highlighted ? gold : [UIColor colorWithWhite:0.06 alpha:0.8];
+    UIColor *gold = self.compactHUD ? sp_hud_ink() : [UIColor colorWithRed:0.78 green:0.73 blue:0.59 alpha:1];
+    _face.backgroundColor = highlighted ? gold : (self.compactHUD ? sp_hud_surface() : [UIColor colorWithWhite:0.06 alpha:0.8]);
     _face.layer.borderColor = [gold colorWithAlphaComponent:highlighted ? 1 : 0.7].CGColor;
     _label.textColor = highlighted ? [UIColor colorWithWhite:0.06 alpha:1] : gold;
     self.accessibilityValue = _face.accessibilityValue = highlighted ? @"Held" : @"Released";
@@ -134,7 +135,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     if (!isfinite(size)) size = sp_keyboard_default_size;
     size = MAX(sp_keyboard_min_size, MIN(sp_keyboard_max_size, size));
     CGFloat scale = sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
-    CGFloat ring = _handle ? 52 * scale : 0;
+    CGFloat ring = _handle && !self.compactHUD ? 52 * scale : 0;
     CGFloat outer = size * scale + ring;
     CGFloat minimum = sp_keyboard_min_size * scale + ring;
     if (_compactColumn) {
@@ -145,6 +146,10 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     } else if (_action || _usage == 0x2B) {
         outer = size * 0.64 * scale;
         minimum = 24;
+    }
+    if (self.compactHUD) {
+        outer = (_handle ? 48 : 38) * scale;
+        minimum = 28;
     }
     BOOL room = !CGRectIsNull(rect) && outer >= minimum && rect.size.width >= minimum + 16 && rect.size.height >= minimum + 16;
     if (room) outer = MIN(outer, MIN(rect.size.width, rect.size.height) - 16);
@@ -171,7 +176,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     if (self.hidden) return;
     _centers = centers;
     if (!_moving && !_touch) {
-        _position = _defaultPosition;
+        _position = self.compactHUD ? CGPointMake(_handle ? 0 : 0.5, _handle ? 1 : 0.5) : _defaultPosition;
         if (_compactColumn && centers.size.width > 0) {
             CGFloat offset = (_compactColumn - 1) * (outer + 4) / centers.size.width;
             _position.x = _defaultPosition.x == 0 ? offset : 1 - offset;
@@ -186,20 +191,28 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     self.bounds = CGRectMake(0, 0, outer, outer);
     self.center = CGPointMake(centers.origin.x + centers.size.width * sp_touch_x(_position.x),
                              centers.origin.y + centers.size.height * _position.y);
-    CGFloat face = outer - ring;
-    _face.bounds = CGRectMake(0, 0, face, _handle ? MAX(32, face * 0.58) : face);
+    CGFloat face = outer - ring - (self.compactHUD ? 6 : 0);
+    _face.bounds = CGRectMake(0, 0, face, ring ? MAX(32, face * 0.58) : face);
+    _face.layer.cornerRadius = self.compactHUD ? face / 2 : 8;
+    _face.layer.borderWidth = self.compactHUD ? 1 : 1.5;
+    _label.text = self.compactHUD && [_name isEqualToString:@"autorun"] ? @"⇈" : self.accessibilityLabel;
+    if (_handle) _label.text = @"Pular";
+    [self setHighlighted:self.highlighted];
     _face.center = CGPointMake(outer / 2, outer / 2);
     _label.frame = CGRectInset(_face.bounds, 4, 0);
     _label.font = [UIFont systemFontOfSize:round(face * 0.27) weight:UIFontWeightSemibold];
+    _handle.hidden = self.compactHUD;
     _handle.frame = self.bounds;
-    _shield.frame = CGRectInset(self.bounds, -sp_joystick_touch_margin, -sp_joystick_touch_margin);
+    CGFloat margin = self.compactHUD ? 0 : sp_joystick_touch_margin;
+    _shield.frame = CGRectInset(self.bounds, -margin, -margin);
 }
 - (BOOL)containsKeyPoint:(CGPoint)point {
-    if (!_handle) return CGRectContainsPoint(self.bounds, point);
+    if (!_handle && !self.compactHUD) return CGRectContainsPoint(self.bounds, point);
     CGFloat r = self.bounds.size.width / 2;
     return hypot(point.x - r, point.y - r) <= r;
 }
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.compactHUD) return [self containsKeyPoint:point];
     if (!_handle) return [super pointInside:point withEvent:event];
     if ([self containsKeyPoint:point]) return YES;
     if (event && event.type != UIEventTypeTouches) return NO;
@@ -235,7 +248,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
             _keyDown = YES;
         }
         [self setHighlighted:YES];
-        [_handle touchesBegan:[NSSet setWithObject:touch] withEvent:event];
+        if (!self.compactHUD) [_handle touchesBegan:[NSSet setWithObject:touch] withEvent:event];
         break;
     }
 }

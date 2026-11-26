@@ -753,6 +753,43 @@ static CGFloat sp_touch_setting(NSString *key, CGFloat minimum, CGFloat maximum)
     return sp_touch_number(key, 1, minimum, maximum);
 }
 
+static UIColor *sp_hud_ink(void) {
+    return [UIColor colorWithRed:0.64 green:0.77 blue:0.79 alpha:1];
+}
+
+static UIColor *sp_hud_surface(void) {
+    return [UIColor colorWithRed:0.06 green:0.09 blue:0.12 alpha:0.82];
+}
+
+// UIParent in SPTouchHUD is measured in game coordinates, excluding any cutout already
+// removed from sp_game_rect. Only UIKit needs to intersect these lanes with the actual safe area.
+static const CGFloat sp_hud_joystick_fraction = 0.23;
+static const CGFloat sp_hud_jump_fraction = 0.09;
+
+static CGRect sp_hud_lane(CGRect game, CGRect safe, BOOL right) {
+    CGFloat width = CGRectGetWidth(game) * sp_hud_joystick_fraction;
+    CGFloat x = right ? CGRectGetMaxX(game) - width : CGRectGetMinX(game);
+    return CGRectIntersection(safe, CGRectMake(x, CGRectGetMinY(game), width, CGRectGetHeight(game)));
+}
+
+// A notch inset on the uncut side can consume most of the fractional lane.
+// Anchor the minimum Jump target inside the safe area. Lua leaves the bottom
+// of that corner clear where this minimum extends into its horizontal lane.
+static CGRect sp_hud_jump_area(CGRect game, CGRect safe, BOOL right) {
+    if (CGRectIsNull(safe)) return CGRectNull;
+    CGFloat width = MIN(safe.size.width, MAX(game.size.width * sp_hud_jump_fraction, 64));
+    CGFloat x = right ? CGRectGetMaxX(safe) - width : CGRectGetMinX(safe);
+    CGFloat bottom = CGRectGetMaxY(safe);
+    CGFloat top = MAX(bottom - 64, CGRectGetMaxY(game) - game.size.height * 0.21 - 8);
+    if (top >= bottom) return CGRectNull;
+    return CGRectMake(x, top, width, bottom - top);
+}
+
+static CGRect sp_hud_band(CGRect lane, CGRect game, CGFloat top, CGFloat bottom) {
+    return CGRectIntersection(lane, CGRectMake(CGRectGetMinX(game), CGRectGetMinY(game) + top * game.size.height,
+                                               game.size.width, (bottom - top) * game.size.height));
+}
+
 static BOOL sp_physical_touch(UITouch *touch) {
     return touch.type == UITouchTypeIndirectPointer ||
            (touch.type == UITouchTypeDirect && sp_assistive_mouse() && touch.majorRadiusTolerance == 0);
@@ -794,7 +831,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
     NSArray<SPKeyboardButton *> *_keyboardButtons;
     UIButton *_overlayMenu;
     SPTouchChat *_touchChat;
-    BOOL _touchEnabled, _overlayHidden, _editingControls, _chordClosed;
+    BOOL _touchEnabled, _overlayHidden, _editingControls, _chordClosed, _showTouchAuxiliaries;
 #endif
 }
 
@@ -873,7 +910,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
         [_joystick removeFromSuperview];
         [_overlayMenu removeFromSuperview];
         _thumbButton = nil; _joystick = nil; _keyboardButtons = nil; _overlayMenu = nil; _autorun = nil;
-        _overlayHidden = _editingControls = NO;
+        _overlayHidden = _editingControls = _showTouchAuxiliaries = NO;
         return;
     }
 
@@ -925,7 +962,8 @@ static BOOL sp_physical_touch(UITouch *touch) {
 }
 
 - (void)sp_refresh_overlay_menu {
-    [_overlayMenu setTitle:_editingControls ? @"✓" : @"···" forState:UIControlStateNormal];
+    BOOL hud = sp_touch_hud();
+    [_overlayMenu setTitle:_editingControls ? @"✓" : (hud ? @"⚙" : @"···") forState:UIControlStateNormal];
     __weak SPInputView *weak = self;
     UIAction *visibility = [UIAction actionWithTitle:_overlayHidden ? @"Mostrar controles" : @"Esconder controles"
                                          image:nil identifier:nil handler:^(__kindof UIAction *action) {
@@ -945,7 +983,31 @@ static BOOL sp_physical_touch(UITouch *touch) {
         [view sp_refresh_overlay_menu];
         [view setNeedsLayout];
     }];
-    _overlayMenu.menu = [UIMenu menuWithChildren:@[visibility, edit]];
+    if (!hud) {
+        _overlayMenu.menu = [UIMenu menuWithChildren:@[visibility, edit]];
+        return;
+    }
+    UIAction *aux = [UIAction actionWithTitle:_showTouchAuxiliaries ? @"Ocultar R e modificadores" : @"Mostrar R e modificadores"
+                                       image:nil identifier:nil handler:^(__kindof UIAction *action) {
+        SPInputView *view = weak;
+        if (!view) return;
+        view->_showTouchAuxiliaries = !view->_showTouchAuxiliaries;
+        [view sp_refresh_overlay_menu];
+        [view setNeedsLayout];
+    }];
+    UIAction *hand = [UIAction actionWithTitle:@"Trocar lado do joystick" image:nil identifier:nil
+                                      handler:^(__kindof UIAction *action) {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        [defaults setBool:![defaults boolForKey:@"sp_touch_left_handed"] forKey:@"sp_touch_left_handed"];
+        [weak setNeedsLayout];
+    }];
+    UIAction *chat = [UIAction actionWithTitle:@"Teclado do chat" image:nil identifier:nil
+                                      handler:^(__kindof UIAction *action) { [weak sp_open_touch_chat]; }];
+    UIAction *zoomIn = [UIAction actionWithTitle:@"Aproximar câmera" image:nil identifier:nil
+                                        handler:^(__kindof UIAction *action) { [weak sp_touch_zoom:1]; }];
+    UIAction *zoomOut = [UIAction actionWithTitle:@"Afastar câmera" image:nil identifier:nil
+                                         handler:^(__kindof UIAction *action) { [weak sp_touch_zoom:-1]; }];
+    _overlayMenu.menu = [UIMenu menuWithChildren:@[chat, zoomIn, zoomOut, hand, aux, visibility, edit]];
 }
 
 - (void)sp_open_touch_chat {
@@ -965,27 +1027,63 @@ static BOOL sp_physical_touch(UITouch *touch) {
     [super layoutSubviews];
     [self sp_update_touch_controls];
     if (!_touchEnabled) return;
-    CGRect safe = CGRectIntersection(UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets), sp_game_rect());
+    CGRect game = sp_game_rect();
+    CGRect safe = CGRectIntersection(UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets), game);
+    BOOL hud = sp_touch_hud();
+    if (_joystick.compactHUD != hud) [self sp_refresh_overlay_menu];
+    BOOL leftHanded = sp_touch_x(0) == 1;
+    CGRect movement = hud ? sp_hud_lane(game, safe, leftHanded) : safe;
+    CGRect jump = hud ? sp_hud_jump_area(game, safe, !leftHanded) : safe;
+    CGRect menuArea = hud ? movement : safe;
     CGFloat opacity = sp_touch_setting(@"sp_touch_controls_opacity", 0.2, 1);
-    _overlayMenu.hidden = CGRectIsNull(safe) || safe.size.width < 44 || safe.size.height < 32;
+    CGFloat menuHeight = hud ? 38 : 32;
+    _overlayMenu.hidden = CGRectIsNull(menuArea) || menuArea.size.width < 44 || menuArea.size.height < menuHeight + 4;
     if (!_overlayMenu.hidden)
-        _overlayMenu.frame = CGRectMake(CGRectGetMidX(safe) - 22, CGRectGetMinY(safe) + 4, 44, 32);
+        _overlayMenu.frame = CGRectMake(CGRectGetMidX(menuArea) - 22, CGRectGetMinY(menuArea) + 4, 44, menuHeight);
+    _overlayMenu.layer.cornerRadius = hud ? menuHeight / 2 : 8;
+    _overlayMenu.layer.borderWidth = hud ? 1 : 0;
+    _overlayMenu.layer.borderColor = [sp_hud_ink() colorWithAlphaComponent:0.66].CGColor;
+    _overlayMenu.backgroundColor = hud ? sp_hud_surface() : [UIColor colorWithWhite:0.1 alpha:0.8];
+    _overlayMenu.tintColor = hud ? sp_hud_ink() : UIColor.whiteColor;
     _overlayMenu.alpha = opacity;
     CGRect area = _overlayHidden ? CGRectNull : safe;
     _thumbButton.alpha = _joystick.alpha = opacity;
-    [_thumbButton layoutInRect:area];
-    [_joystick layoutInRect:area];
-    BOOL hud = sp_touch_hud();
+    _thumbButton.compactHUD = _joystick.compactHUD = hud;
+    _joystick.showsMoveHandle = !hud || _editingControls;
+    CGRect stickArea = hud && !_overlayHidden ? sp_hud_band(movement, game, 0.56, 1) : area;
+    [_joystick layoutInRect:stickArea];
+    CGRect thumbArea = area;
+    if (hud && !_overlayHidden)
+        thumbArea = _showTouchAuxiliaries ? sp_hud_band(movement, game, 0.12, 0.29) : CGRectNull;
+    [_thumbButton layoutInRect:thumbArea];
     if (!hud) [_hudTaps removeAllObjects];
     BOOL canRun = [NSUserDefaults.standardUserDefaults boolForKey:@"sp_autorun_enabled"] &&
                   !_joystick.hidden && ![NSUserDefaults.standardUserDefaults boolForKey:@"sp_joystick_analog"];
     if (!canRun) [_joystick stopAutorun];
+    NSArray<NSString *> *modifiers = @[@"ctrl", @"shift", @"alt"];
     for (SPKeyboardButton *button in _keyboardButtons) {
         button.alpha = opacity;
         button.editingPosition = _editingControls;
-        BOOL hiddenByHUD = hud && (button.compactColumn || [button.name isEqualToString:@"tab"]);
-        BOOL hiddenAutorun = button == _autorun && !canRun;
-        [button layoutInRect:(hiddenByHUD || hiddenAutorun) ? CGRectNull : area];
+        button.compactHUD = hud;
+        CGRect buttonArea = area;
+        if (hud && !_overlayHidden) {
+            if ([button.name isEqualToString:@"space"]) {
+                buttonArea = jump;
+            } else if (button == _autorun) {
+                buttonArea = sp_hud_band(movement, game, 0.44, 0.56);
+            } else {
+                NSUInteger index = [modifiers indexOfObject:button.name];
+                buttonArea = CGRectNull;
+                if (_showTouchAuxiliaries && index != NSNotFound && !CGRectIsNull(movement)) {
+                    CGRect row = sp_hud_band(movement, game, 0.29, 0.44);
+                    if (!CGRectIsNull(row)) {
+                        CGFloat cell = row.size.width / modifiers.count;
+                        buttonArea = CGRectMake(row.origin.x + index * cell, row.origin.y, cell, row.size.height);
+                    }
+                }
+            }
+        }
+        [button layoutInRect:(button == _autorun && !canRun) ? CGRectNull : buttonArea];
     }
 }
 

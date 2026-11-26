@@ -11,6 +11,7 @@ static NSString *const sp_thumb_size_key = @"sp_thumb_size";
 static const CGFloat sp_thumb_default_size = 76, sp_thumb_min_size = 44, sp_thumb_max_size = 152;
 
 @interface SPThumbButton : UIControl
+@property(nonatomic) BOOL compactHUD;
 - (void)layoutInRect:(CGRect)rect;
 - (BOOL)heldInEvent:(UIEvent *)event;
 - (void)cancelHold;
@@ -49,9 +50,9 @@ static const CGFloat sp_thumb_default_size = 76, sp_thumb_min_size = 44, sp_thum
 
 - (void)setHighlighted:(BOOL)highlighted {
     [super setHighlighted:highlighted];
-    UIColor *gold = [UIColor colorWithRed:0.78 green:0.73 blue:0.59 alpha:1];
+    UIColor *gold = self.compactHUD ? sp_hud_ink() : [UIColor colorWithRed:0.78 green:0.73 blue:0.59 alpha:1];
     self.backgroundColor = highlighted ? [gold colorWithAlphaComponent:0.95]
-                                      : [UIColor colorWithWhite:0.06 alpha:0.65];
+                                      : (self.compactHUD ? sp_hud_surface() : [UIColor colorWithWhite:0.06 alpha:0.65]);
     self.layer.borderColor = [gold colorWithAlphaComponent:highlighted ? 1 : 0.7].CGColor;
     _label.textColor = highlighted ? [UIColor colorWithWhite:0.06 alpha:1] : gold;
     self.accessibilityValue = highlighted ? @"Held" : @"Released";
@@ -69,6 +70,7 @@ static const CGFloat sp_thumb_default_size = 76, sp_thumb_min_size = 44, sp_thum
     double size = [savedSize isKindOfClass:NSNumber.class] ? [savedSize doubleValue] : sp_thumb_default_size;
     if (!isfinite(size)) size = sp_thumb_default_size;
     size = MAX(sp_thumb_min_size, MIN(sp_thumb_max_size, size));
+    if (self.compactHUD) size = 42;
     size *= sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
     BOOL room = !CGRectIsNull(rect) && rect.size.width >= sp_thumb_min_size + 16 && rect.size.height >= sp_thumb_min_size + 16;
     // A narrow resized window may need a smaller target temporarily; retain the preferred size.
@@ -89,7 +91,9 @@ static const CGFloat sp_thumb_default_size = 76, sp_thumb_min_size = 44, sp_thum
     }
     self.bounds = CGRectMake(0, 0, size, size);
     _label.font = [UIFont systemFontOfSize:round(size * 18 / 52) weight:UIFontWeightSemibold];
-    self.layer.cornerRadius = MIN(16, size * 8 / 52);
+    self.layer.cornerRadius = self.compactHUD ? size / 2 : MIN(16, size * 8 / 52);
+    self.layer.borderWidth = self.compactHUD ? 1 : 1.5;
+    [self setHighlighted:self.highlighted];
     self.center = CGPointMake(centers.origin.x + centers.size.width * sp_touch_x(_position.x),
                              centers.origin.y + centers.size.height * _position.y);
 }

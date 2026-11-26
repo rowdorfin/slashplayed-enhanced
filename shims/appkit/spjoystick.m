@@ -15,6 +15,8 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 @end
 
 @interface SPJoystick : UIControl <SPMovableControl>
+@property(nonatomic) BOOL compactHUD;
+@property(nonatomic) BOOL showsMoveHandle;
 @property(nonatomic, readonly) CGPoint value;
 @property(nonatomic, readonly) GCController *controller;
 - (void)layoutInRect:(CGRect)rect;
@@ -178,6 +180,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 - (instancetype)initWithFrame:(CGRect)frame {
     if (!(self = [super initWithFrame:frame])) return nil;
     self.hidden = YES;
+    _showsMoveHandle = YES;
     _gameReady = atomic_load(&sp_game_presented);
     self.exclusiveTouch = NO;
     self.multipleTouchEnabled = NO;
@@ -241,6 +244,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 - (void)setAutorunActive:(BOOL)active {
     if (_autorun == active) return;
     _autorun = active;
+    _status.text = active ? @"⇈" : nil;
     [self sendValue:_value];
     if (self.autorunChanged) self.autorunChanged(active);
 }
@@ -254,6 +258,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 - (void)cancelInput {
     if (_autorun) {
         _autorun = NO;
+        _status.text = nil;
         if (self.autorunChanged) self.autorunChanged(NO);
     }
     _stickTouch = nil;
@@ -346,12 +351,12 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
         _analog = analog;
     }
     BOOL enabled = ![defaults objectForKey:sp_joystick_enabled_key] || [defaults boolForKey:sp_joystick_enabled_key];
-    id savedSize = [defaults objectForKey:sp_joystick_size_key];
-    double size = [savedSize isKindOfClass:NSNumber.class] ? [savedSize doubleValue] : sp_joystick_default_size;
-    if (!isfinite(size)) size = sp_joystick_default_size;
-    size = MAX(sp_joystick_min_size, MIN(sp_joystick_max_size, size));
+    CGFloat size = self.compactHUD
+        ? sp_touch_number(sp_joystick_size_key, 120, 104, 132)
+        : sp_touch_number(sp_joystick_size_key, sp_joystick_default_size, sp_joystick_min_size, sp_joystick_max_size);
     size *= sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
-    BOOL room = !CGRectIsNull(rect) && rect.size.width >= sp_joystick_min_size + 16 && rect.size.height >= sp_joystick_min_size + 16;
+    CGFloat minimum = self.compactHUD ? 82 : sp_joystick_min_size;
+    BOOL room = !CGRectIsNull(rect) && MIN(rect.size.width, rect.size.height) >= minimum + 16;
     if (room) size = MIN(size, MIN(rect.size.width, rect.size.height) - 16);
     CGRect centers = room ? CGRectInset(rect, size / 2 + 8, size / 2 + 8) : CGRectZero;
     if (!enabled || !room || !CGRectEqualToRect(centers, _centers)) [self cancelInput];
@@ -359,7 +364,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     if (!self.hidden) {
         _centers = centers;
         if (!_moving) {
-            _position = CGPointMake(0.12, 1);
+            _position = CGPointMake(self.compactHUD ? 0.18 : 0.12, 1);
             id saved = [defaults objectForKey:sp_joystick_position_key];
             if ([saved isKindOfClass:NSArray.class] && [saved count] == 2 &&
                 [saved[0] isKindOfClass:NSNumber.class] && [saved[1] isKindOfClass:NSNumber.class]) {
@@ -371,9 +376,23 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
         self.layer.cornerRadius = size / 2;
         self.center = CGPointMake(centers.origin.x + centers.size.width * sp_touch_x(_position.x),
                                  centers.origin.y + centers.size.height * _position.y);
-        CGFloat handleSize = 44 * sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
+        UIColor *ink = self.compactHUD ? sp_hud_ink() : [UIColor colorWithRed:0.78 green:0.73 blue:0.59 alpha:1];
+        self.layer.borderWidth = self.compactHUD ? 1 : 1.5;
+        self.layer.borderColor = [ink colorWithAlphaComponent:0.66].CGColor;
+        self.backgroundColor = self.compactHUD ? [sp_hud_surface() colorWithAlphaComponent:0.55]
+                                              : [UIColor colorWithWhite:0.06 alpha:0.45];
+        _knob.backgroundColor = [ink colorWithAlphaComponent:self.compactHUD ? 0.32 : 0.65];
+        _status.textColor = ink;
+        _status.font = [UIFont systemFontOfSize:self.compactHUD ? 15 : 24 weight:UIFontWeightSemibold];
+        CGFloat handleSize = MIN(size / 2, 44 * sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6));
+        if (!self.showsMoveHandle && !_handle.hidden) {
+            [_handle cancelTouch];
+            [self endMove];
+        }
+        _handle.hidden = !self.showsMoveHandle;
         _handle.frame = CGRectMake(size - handleSize, 0, handleSize, handleSize);
-        _shield.frame = CGRectInset(self.bounds, -sp_joystick_touch_margin, -sp_joystick_touch_margin);
+        CGFloat margin = self.compactHUD ? 8 : sp_joystick_touch_margin;
+        _shield.frame = CGRectInset(self.bounds, -margin, -margin);
         [self drawValue];
     }
     [self updateConnection];
@@ -382,7 +401,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 - (BOOL)containsStickPoint:(CGPoint)point {
     CGFloat r = self.bounds.size.width / 2;
     return CGRectContainsPoint(self.bounds, point) &&
-           (hypot(point.x - r, point.y - r) <= r || CGRectContainsPoint(_handle.frame, point));
+           (hypot(point.x - r, point.y - r) <= r || (!_handle.hidden && CGRectContainsPoint(_handle.frame, point)));
 }
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
@@ -396,7 +415,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
             touch.type != UITouchTypeDirect) return NO;
     }
     CGFloat r = self.bounds.size.width / 2;
-    return hypot(point.x - r, point.y - r) <= r + sp_joystick_touch_margin;
+    return hypot(point.x - r, point.y - r) <= r + (self.compactHUD ? 8 : sp_joystick_touch_margin);
 }
 
 - (void)updateTouch:(UITouch *)touch {

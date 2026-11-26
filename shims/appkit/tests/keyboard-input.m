@@ -64,8 +64,21 @@ static void sp_test_hud_multitouch(SPInputView *view, SPJoystick *stick) {
                       @"HUD mode hides all ten digit buttons.");
     }
     sp_test_check(sp_test_keyboard_button(view, @"tab").hidden && !stick.hidden &&
-                  !sp_test_keyboard_button(view, @"chat").hidden,
-                  @"HUD mode hides Tab and preserves movement and chat.");
+                  sp_test_keyboard_button(view, @"chat").hidden &&
+                  sp_test_keyboard_button(view, @"zoom_in").hidden &&
+                  sp_test_keyboard_button(view, @"zoom_out").hidden,
+                  @"HUD mode keeps movement and folds chat and zoom into the native menu.");
+    CGRect game = sp_game_rect();
+    CGRect safe = CGRectIntersection(UIEdgeInsetsInsetRect(view.bounds, view.safeAreaInsets), game);
+    CGRect leftLane = sp_hud_lane(game, safe, NO), rightLane = sp_hud_lane(game, safe, YES);
+    CGRect rightJump = sp_hud_jump_area(game, safe, YES);
+    CGRect leftJump = sp_hud_jump_area(game, safe, NO);
+    SPKeyboardButton *jump = sp_test_keyboard_button(view, @"space");
+    sp_test_check(CGRectContainsRect(leftLane, CGRectInset(stick.frame, -7.99, -7.99)) &&
+                  !jump.hidden && CGRectContainsRect(rightJump, jump.frame) && jump.bounds.size.width == 48 &&
+                  rightJump.size.width < rightLane.size.width &&
+                  fabs(CGRectGetMaxY(safe) - CGRectGetMaxY(jump.frame) - 8) < 0.01,
+                  @"Jump uses the narrow right lane and sits 8 points above the safe bottom.");
 
     SPKeyboardButton *run = sp_test_keyboard_button(view, @"autorun");
     sp_test_check(!run.hidden, @"The explicit autorun control is available with WASD.");
@@ -126,6 +139,12 @@ static void sp_test_hud_multitouch(SPInputView *view, SPJoystick *stick) {
     [view sp_suspend_touch:nil];
     sp_test_check(!run.highlighted && !sp_touch_keys.count, @"Resigning active clears the autorun latch.");
     [view sp_resume_touch:nil];
+    [defaults setBool:YES forKey:@"sp_touch_left_handed"];
+    [view setNeedsLayout]; [view layoutIfNeeded];
+    sp_test_check(CGRectContainsRect(rightLane, CGRectInset(stick.frame, -7.99, -7.99)) &&
+                  CGRectContainsRect(leftJump, jump.frame) && leftJump.size.width < leftLane.size.width,
+                  @"Left-handed mode mirrors the full stick and narrow Jump lanes.");
+    [defaults removeObjectForKey:@"sp_touch_left_handed"];
     [defaults removeObjectForKey:@"sp_touch_hud_mode"];
     [defaults removeObjectForKey:@"sp_autorun_enabled"];
     unsetenv("SP_SYSTEM_FLAVOR");
