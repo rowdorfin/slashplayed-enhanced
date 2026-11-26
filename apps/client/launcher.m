@@ -846,6 +846,8 @@ int main(int argc, char **argv) {
     BOOL token = [NSFileManager.defaultManager fileExistsAtPath:
                   [NSHomeDirectory() stringByAppendingPathComponent:@"Library/spnetbattle.plist"]];
 
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"sp_a16_profile"])
+        setenv("SP_A16_PROFILE", "1", 1);
     setenv("SP_SYSTEM_FLAVOR", [NSString stringWithFormat:@"_%@_", flavor].UTF8String, 1);
     NSString *appkit = [dir stringByAppendingPathComponent:@"Frameworks/libspAppKit.dylib"];
     // Game data a copy left incomplete first, so nobody signs in to then be told. Then the sign-in, so the

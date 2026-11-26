@@ -35,6 +35,7 @@
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,6 +115,11 @@ void sp_set_client(const struct mach_header *h, intptr_t slide, const char *path
 }
 
 static int in_text(uintptr_t a, size_t len) { return a >= text && len <= text_len && a - text <= text_len - len; }
+
+// Guest images loaded by spguest have no dyld entry for dladdr.
+__attribute__((visibility("default"))) bool sp_client_contains_pc(uintptr_t pc) {
+    return in_text(pc, 1);
+}
 
 static int traced(void) {
     struct kinfo_proc kp;

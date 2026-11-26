@@ -18,3 +18,5 @@ fi
 "$out/staging"
 "${CC:-cc}" "${flags[@]}" spbcdecode.c spbclayout.c spbcastc.c tests/test_bc_astc.c -o "$out/astc"
 "$out/astc"
+"${CC:-cc}" "${flags[@]}" tests/test_a16_profile.c -o "$out/a16-profile"
+"$out/a16-profile"

@@ -75,6 +75,8 @@ jobs:
         run: CC=clang shims/metal/tests/run.sh
 
       - name: Build and hash the diagnostic kit
+        env:
+          SP_A16_BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           sh apps/companion/bundle-resources.sh --build "$RUNNER_TEMP/stage"
@@ -83,13 +85,16 @@ jobs:
           cd "$RUNNER_TEMP/kit"
           shasum -a 256 slashplayed-device-kit.zip > SHA256SUMS
 
-      - name: Verify BC fallback in both packaged Metal shims
+      - name: Verify BC fallback, A16 profile and provenance in both packaged Metal shims
         run: |
           set -euo pipefail
           for platform in ios xros; do
             unzip -p "$RUNNER_TEMP/kit/slashplayed-device-kit.zip" \
               "$platform/Slashplayed.app/Frameworks/libspMetal.dylib" |
-              strings -a | grep -F 'SP_BC_FALLBACK' >/dev/null
+              strings -a > "$RUNNER_TEMP/metal-$platform.strings"
+            grep -F 'SP_BC_FALLBACK' "$RUNNER_TEMP/metal-$platform.strings" >/dev/null
+            grep -F 'SP_A16_PROFILE session' "$RUNNER_TEMP/metal-$platform.strings" >/dev/null
+            grep -Fx "$GITHUB_SHA" "$RUNNER_TEMP/metal-$platform.strings" >/dev/null
           done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

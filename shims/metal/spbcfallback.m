@@ -11,6 +11,7 @@
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <os/proc.h>
+#include <sys/sysctl.h>
 #include <stddef.h>
 #include <stdlib.h>
 #import <ptrauth.h>
@@ -45,9 +46,6 @@ SPBC_CHECK_FORMAT(RGBA8Unorm);
 SPBC_CHECK_FORMAT(RGBA8Unorm_sRGB);
 SPBC_CHECK_FORMAT(RGBA16Float);
 #undef SPBC_CHECK_FORMAT
-
-// Provided by the generated shim so BC events share the T002 writer and rotation.
-static void spBCLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
 typedef enum {
     SPBCSurface, SPBCBufferTexture, SPBCReplace, SPBCReplaceSlice, SPBCPrivateReplace,
@@ -119,6 +117,31 @@ static NSString *spBCByteBreakdown(const unsigned long long *bytes, size_t count
     return result;
 }
 
+static bool spA16Footprint(uint64_t *footprint) {
+    task_vm_info_data_t vm = {0};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) != KERN_SUCCESS ||
+        count * sizeof(natural_t) < offsetof(task_vm_info_data_t, phys_footprint) + sizeof(vm.phys_footprint))
+        return false;
+    *footprint = vm.phys_footprint;
+    return true;
+}
+
+static NSString *spA16BudgetFields(uint64_t footprint, bool measured) {
+    static uint64_t peak;
+    static bool failed;
+    if (!measured) return @" budget=unknown";
+    if (footprint > peak) peak = footprint;
+    if (!failed && spA16BudgetFailed(footprint)) {
+        failed = true;
+        spBCLog(@"SP_A16_PROFILE budget FAIL footprintBytes=%llu",
+                (unsigned long long)footprint);
+    }
+    return [NSString stringWithFormat:@" simulatedRemainingBytes=%lld budget=%s peakFootprintBytes=%llu",
+            (long long)SP_A16_BUDGET - (long long)footprint,
+            spA16BudgetState(footprint), (unsigned long long)peak];
+}
+
 static void spBCSummary(id<MTLDevice> device) {
     SPBCTextureStats textures;
     @synchronized ([SPBCTextureInfo class]) { textures = spBCTextureStats; }
@@ -139,10 +162,8 @@ static void spBCSummary(id<MTLDevice> device) {
         }
     }
 
-    task_vm_info_data_t vm = {0};
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-    bool haveFootprint = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS &&
-        count * sizeof(natural_t) >= offsetof(task_vm_info_data_t, phys_footprint) + sizeof(vm.phys_footprint);
+    uint64_t footprint = 0;
+    bool haveFootprint = spA16Footprint(&footprint);
     bool haveDeviceSize = [device respondsToSelector:@selector(currentAllocatedSize)];
     NSMutableString *formats = [NSMutableString string];
     NSMutableString *unsupported = [NSMutableString string];
@@ -172,7 +193,7 @@ static void spBCSummary(id<MTLDevice> device) {
             @"dropped=%llu pendingUploads=%llu pendingBytes=%llu inFlightUploads=%llu inFlightBytes=%llu "
             @"scratchBytes=%llu overLimit=%llu overLimitBytes=%llu "
             @"textureLiveBytesByPhysicalFormat=%@ textureLiveBytesByStorageMode=%@ "
-            @"textureStandaloneAllocatedBytes=%llu stagingAllocatedLiveBytes=%llu stagingAllocatedPeakBytes=%llu",
+            @"textureStandaloneAllocatedBytes=%llu stagingAllocatedLiveBytes=%llu stagingAllocatedPeakBytes=%llu%@",
             textures.allocated, textures.freed, textures.allocated - textures.freed, textures.liveBytes,
             atomic_load(&spBCSizingQueries), formats, atomic_load(&spBCCompressed), atomic_load(&spBCDecoded),
             atomic_load(&spBCStagingLive),
@@ -181,14 +202,15 @@ static void spBCSummary(id<MTLDevice> device) {
             metalFailures + cpuFailures, atomic_load(&spBCTextureFailures), (unsigned long)heaps.count,
             heapBytes, heapAllocated, (unsigned long)allocatedSamples, heapUsed, (unsigned long)usedSamples,
             haveDeviceSize ? @(device.currentAllocatedSize) : @"n/a",
-            haveFootprint ? @(vm.phys_footprint) : @"n/a", os_proc_available_memory(),
+            haveFootprint ? @(footprint) : @"n/a", os_proc_available_memory(),
             staging.limitHits, metalFailures, cpuFailures, atomic_load(&spBCLayoutFailures),
             atomic_load(&spBCDropped), staging.pending.uploads, staging.pending.bytes, staging.inFlight.uploads,
             staging.inFlight.bytes, staging.scratchBytes, staging.overLimit, staging.overLimitBytes,
             spBCByteBreakdown(textures.liveBytesByFormat, sizeof textures.liveBytesByFormat / sizeof *textures.liveBytesByFormat),
             spBCByteBreakdown(textures.liveBytesByStorage, sizeof textures.liveBytesByStorage / sizeof *textures.liveBytesByStorage),
             textures.standaloneAllocatedBytes, atomic_load(&spBCStagingAllocatedLive),
-            atomic_load(&spBCStagingAllocatedPeak));
+            atomic_load(&spBCStagingAllocatedPeak),
+            spA16Profile() ? spA16BudgetFields(footprint, haveFootprint) : @"");
 }
 
 static void spBCStartSummary(id<MTLDevice> device) {
@@ -660,7 +682,7 @@ static _Thread_local unsigned spBCCreating;
 static id newTexture(id owner, SEL selector, MTLTextureDescriptor *descriptor) RETAINED;
 static id newTexture(id owner, SEL selector, MTLTextureDescriptor *descriptor) {
     CreateWith real = (CreateWith)original(owner, selector);
-    if (spBCCreating || !SPBCKindOfPixelFormat(descriptor.pixelFormat)) return real(owner, selector, descriptor);
+    if ((spBCCreating && !spA16Profile()) || !SPBCKindOfPixelFormat(descriptor.pixelFormat)) return real(owner, selector, descriptor);
     // This selector is shared by MTLDevice and MTLHeap.
     if (!spBCActive(owner) && !([owner respondsToSelector:@selector(device)] &&
                                 spBCActive([(id<MTLHeap>)owner device])))
@@ -678,7 +700,7 @@ static id newTextureAtOffset(id<MTLHeap> heap, SEL selector, MTLTextureDescripto
                              NSUInteger offset) RETAINED;
 static id newTextureAtOffset(id<MTLHeap> heap, SEL selector, MTLTextureDescriptor *descriptor, NSUInteger offset) {
     CreateAtOffset real = (CreateAtOffset)original(heap, selector);
-    if (spBCCreating || !SPBCKindOfPixelFormat(descriptor.pixelFormat) || !spBCActive(heap.device))
+    if ((spBCCreating && !spA16Profile()) || !SPBCKindOfPixelFormat(descriptor.pixelFormat) || !spBCActive(heap.device))
         return real(heap, selector, descriptor, offset);
     @autoreleasepool {
         MTLTextureDescriptor *stored = spBCStoredDescriptor(descriptor);
@@ -711,8 +733,12 @@ static id spBCBufferTexture(id<MTLBuffer> buffer, SEL selector, MTLTextureDescri
                             NSUInteger offset, NSUInteger row) RETAINED;
 static id spBCBufferTexture(id<MTLBuffer> buffer, SEL selector, MTLTextureDescriptor *descriptor,
                             NSUInteger offset, NSUInteger row) {
-    if (SPBCKindOfPixelFormat(descriptor.pixelFormat) && spBCActive(buffer.device))
-        spBCReject(SPBCBufferTexture, selector, descriptor.pixelFormat, "pass original BC alias to Metal validation");
+    if (SPBCKindOfPixelFormat(descriptor.pixelFormat) && spBCActive(buffer.device)) {
+        // The A16 profile records it as a feature the A16 lacks but does not fail it: the A18 samples it natively.
+        spBCReject(SPBCBufferTexture, selector, descriptor.pixelFormat,
+                   spA16Profile() ? "unavailable-on-A16: BC buffer alias passed to native BC"
+                                  : "pass original BC alias to Metal validation");
+    }
     // Linear textures must alias the caller's bytes. A physical descriptor
     // would silently reinterpret those bytes even when the physical pitch fits.
     return ((SPBCBufferTextureFactory)original(buffer, selector))
@@ -1152,11 +1178,91 @@ static id spBCNewQueueDescriptor(id device, SEL selector, id descriptor) {
     return spBCHookQueue(((CreateWith)original(device, selector))(device, selector, descriptor), device);
 }
 
+static bool spA16GuestCaller(void *returnAddress) {
+    static bool (*contains)(uintptr_t);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        contains = dlsym(RTLD_DEFAULT, "sp_client_contains_pc");
+        if (!contains) spBCLog(@"SP_A16_PROFILE caller-range unavailable");
+    });
+    return contains && contains((uintptr_t)ptrauth_strip(returnAddress, ptrauth_key_return_address));
+}
+
+// Capability hooks are installed on a concrete class, but only the device
+// marked for the guest and direct callers in its __TEXT see simulated values.
+static BOOL spA16SupportsBC(id device, SEL selector) {
+    BOOL real = ((BOOL (*)(id, SEL))original(device, selector))(device, selector);
+    if (!real || !spBCActive(device) || !spA16GuestCaller(__builtin_return_address(0))) return real;
+    static atomic_flag logged = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set(&logged))
+        spBCLog(@"SP_A16_PROFILE cap selector=%s real=1 effective=0", sel_getName(selector));
+    return spA16EffectiveBC(true, real);
+}
+
+static BOOL spA16SupportsFamily(id device, SEL selector, MTLGPUFamily family) {
+    BOOL real = ((BOOL (*)(id, SEL, MTLGPUFamily))original(device, selector))(device, selector, family);
+    BOOL effective = spA16EffectiveFamily(true, family, real);
+    if (effective == real || !spBCActive(device) || !spA16GuestCaller(__builtin_return_address(0))) return real;
+    static NSMutableSet<NSNumber *> *loggedFamilies;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ loggedFamilies = [NSMutableSet new]; });
+    @synchronized (loggedFamilies) {
+        NSNumber *key = @(family);
+        if (![loggedFamilies containsObject:key]) {
+            [loggedFamilies addObject:key];
+            spBCLog(@"SP_A16_PROFILE cap selector=%s family=%lu real=1 effective=0",
+                    sel_getName(selector), (unsigned long)family);
+        }
+    }
+    return effective;
+}
+
+_Static_assert(MTLGPUFamilyApple9 == 1009 && MTLGPUFamilyMac2 == 2002, "Metal family values changed");
+
+static bool spBCShouldEnable(id<MTLDevice> device) {
+    return spA16Profile() || ([device respondsToSelector:@selector(supportsBCTextureCompression)] &&
+                              !device.supportsBCTextureCompression);
+}
+
+// Texture backend IDs reserved for session logs: bc-native, bc-fallback-rgba8, astc.
+static void spA16Session(id<MTLDevice> device) {
+    bool profile = spA16Profile();
+    char machine[128] = "unknown";
+    size_t machineSize = sizeof machine;
+    if (sysctlbyname("hw.machine", machine, &machineSize, NULL, 0) != 0)
+        snprintf(machine, sizeof machine, "unknown");
+    BOOL apple7 = [device supportsFamily:MTLGPUFamilyApple7];
+    BOOL apple8 = [device supportsFamily:MTLGPUFamilyApple8];
+    BOOL apple9 = [device supportsFamily:MTLGPUFamilyApple9];
+    BOOL mac2 = [device supportsFamily:MTLGPUFamilyMac2];
+    bool haveBC = [device respondsToSelector:@selector(supportsBCTextureCompression)];
+    bool nativeBC = haveBC && device.supportsBCTextureCompression;
+    uint64_t footprint = 0;
+    bool measured = spA16Footprint(&footprint);
+    size_t available = os_proc_available_memory();
+    NSString *line = [NSString stringWithFormat:
+        @"SP_A16_PROFILE session build=%s profile=%s textureBackend=%s "
+        @"real={hw.machine=%s device=\"%@\" Apple7=%d Apple8=%d Apple9=%d Mac2=%d BC=%s "
+        @"phys_footprint=%@ os_proc_available_memory=%zu footprintPlusAvailable=%@ drawable=pending} "
+        @"%s={Apple7=%d Apple8=%d Apple9=%d Mac2=%d BC=%s budgetMiB=%s}",
+        SP_A16_BUILD_SHA, profile ? "A16" : "native", spBCShouldEnable(device) ? "bc-fallback-rgba8" : "bc-native",
+        machine, device.name, apple7, apple8, apple9, mac2, haveBC ? (nativeBC ? "1" : "0") : "n/a",
+        measured ? @(footprint) : @"n/a", available, measured ? @(footprint + available) : @"n/a",
+        profile ? "simulated" : "effective", apple7, apple8,
+        spA16EffectiveFamily(profile, MTLGPUFamilyApple9, apple9),
+        spA16EffectiveFamily(profile, MTLGPUFamilyMac2, mac2),
+        !profile && !haveBC ? "n/a" : spA16EffectiveBC(profile, nativeBC) ? "1" : "0",
+        profile ? "4096" : "off"];
+    spBCLog(@"%@", line);
+    objc_setAssociatedObject(device, &spA16SessionDeviceKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (profile) spBCLog(@"SP_A16_PROFILE mem%@", spA16BudgetFields(footprint, measured));
+}
+
 static void spBCInstall(id<MTLDevice> device, Class cls) {
     bool haveProperty = [device respondsToSelector:@selector(supportsBCTextureCompression)];
-    bool enabled = haveProperty && !device.supportsBCTextureCompression;
+    bool enabled = spBCShouldEnable(device);
     spBCLog(@"SP_BC_FALLBACK %s device=%@ reason=%s", enabled ? "enabled" : "disabled", device.name,
-            enabled ? "no-native-BC" : haveProperty ? "native-BC" : "capability-unavailable");
+            spA16Profile() ? "a16-profile" : enabled ? "no-native-BC" : haveProperty ? "native-BC" : "capability-unavailable");
     if (!enabled) return;
     findSharedCache();
     const char *verbose = getenv("SP_BC_VERBOSE");
@@ -1177,5 +1283,9 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
     hook(cls, @selector(newCommandQueue), (IMP)spBCNewQueue);
     hook(cls, @selector(newCommandQueueWithMaxCommandBufferCount:), (IMP)spBCNewQueueCount);
     hook(cls, sel_registerName("newCommandQueueWithDescriptor:"), (IMP)spBCNewQueueDescriptor);
+    if (spA16Profile()) {
+        hook(cls, @selector(supportsBCTextureCompression), (IMP)spA16SupportsBC);
+        hook(cls, @selector(supportsFamily:), (IMP)spA16SupportsFamily);
+    }
     spBCStartSummary(device);
 }

@@ -26,6 +26,6 @@ $CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class libspDiskArbitration.m -o "$
 $CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class libspForceFeedback.m -o "$OUT/libspForceFeedback.dylib" -install_name @rpath/libspForceFeedback.dylib -framework Foundation 
 $CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class libspFoundation.m -o "$OUT/libspFoundation.dylib" -install_name @rpath/libspFoundation.dylib -framework Foundation -Wl,-reexport_framework,Foundation
 $CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class libspIOKit.m -o "$OUT/libspIOKit.dylib" -install_name @rpath/libspIOKit.dylib -framework Foundation -Wl,-reexport_framework,IOKit
-$CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class libspMetal.m ../metal/spbcdecode.c ../metal/spbclayout.c ../metal/spbcstaging.c -o "$OUT/libspMetal.dylib" -install_name @rpath/libspMetal.dylib -framework Foundation -Wl,-reexport_framework,Metal
+$CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class "-DSP_A16_BUILD_SHA=\"${SP_A16_BUILD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}\"" libspMetal.m ../metal/spbcdecode.c ../metal/spbclayout.c ../metal/spbcstaging.c -o "$OUT/libspMetal.dylib" -install_name @rpath/libspMetal.dylib -framework Foundation -Wl,-reexport_framework,Metal
 $CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class libspSecurity.m -o "$OUT/libspSecurity.dylib" -install_name @rpath/libspSecurity.dylib -framework Foundation -Wl,-reexport_framework,Security
 "../system/build.sh" "$PLATFORM" "$OUT"

@@ -144,6 +144,28 @@ uint32_t sp_KBGetLayoutType(int16_t kbdType) { return 'ANSI'; }
     # device here the client logs "No suitable gpu found" and quits.
     "Metal": """
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#include "../metal/spa16profile.h"
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef SP_A16_BUILD_SHA
+#define SP_A16_BUILD_SHA "unknown"
+#endif
+
+static bool spA16Profile(void) {
+    static dispatch_once_t once;
+    static bool active;
+    dispatch_once(&once, ^{
+        const char *value = getenv("SP_A16_PROFILE");
+        active = value && strcmp(value, "1") == 0;
+    });
+    return active;
+}
+
+static char spA16SessionDeviceKey;
+static bool spA16GuestCaller(void *returnAddress);
+static void spBCLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 #import <objc/message.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -155,7 +177,6 @@ uint32_t sp_KBGetLayoutType(int16_t kbdType) { return 'ANSI'; }
 #include <fcntl.h>
 #include <os/lock.h>
 #include <pthread.h>
-#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #endif
@@ -211,14 +232,31 @@ static id sp_newLibraryWithData(id self, SEL _cmd, dispatch_data_t data, NSError
 // Frame counter: logs the first drawable (with the layer's geometry), every 600th, and any whose
 // size changed, so a run shows whether the client is presenting at all and how it handles resizes.
 static id (*sp_nextDrawable_orig)(id, SEL);
+static _Atomic bool sp_drawable_trace;
 static id sp_nextDrawable(id self, SEL _cmd) {
     static _Atomic uint64_t frames;
-    static CGSize last;
-    uint64_t n = ++frames;
+    static _Atomic unsigned long long lastPixels;
+    static _Atomic bool reportedSize;
     id d = sp_nextDrawable_orig(self, _cmd);
-    CGSize size = ((CGSize (*)(id, SEL))objc_msgSend)(self, sel_registerName("drawableSize"));
-    BOOL changed = n > 1 && (size.width != last.width || size.height != last.height);
-    last = size;
+    if (d && spA16GuestCaller(__builtin_return_address(0)) &&
+        objc_getAssociatedObject(((CAMetalLayer *)self).device, &spA16SessionDeviceKey)) {
+        id<MTLTexture> texture = [(id<CAMetalDrawable>)d texture];
+        unsigned long long pixels = ((unsigned long long)texture.width << 32) | texture.height;
+        if (pixels && atomic_exchange(&lastPixels, pixels) != pixels) {
+            const char *phase = atomic_exchange(&reportedSize, true) ? "resize" : "session";
+            NSString *line = [NSString stringWithFormat:
+                @"SP_A16_PROFILE %s build=%s real=drawable:%lux%lu",
+                phase, SP_A16_BUILD_SHA, (unsigned long)texture.width, (unsigned long)texture.height];
+            spBCLog(@"%@", line);
+        }
+    }
+    if (!atomic_load(&sp_drawable_trace)) return d;
+    uint64_t n = ++frames;
+    CGSize size = ((CAMetalLayer *)self).drawableSize;
+    static _Atomic unsigned long long lastLayerSize;
+    unsigned long long layerSize = ((unsigned long long)size.width << 32) | (unsigned long long)size.height;
+    unsigned long long previous = atomic_exchange(&lastLayerSize, layerSize);
+    BOOL changed = n > 1 && previous != layerSize;
     if (n == 1 || n % 600 == 0 || changed) {
         sp_stub_log([NSString stringWithFormat:@"-[CAMetalLayer nextDrawable] #%llu %gx%g -> %s",
                      (unsigned long long)n, size.width, size.height, d ? "ok" : "nil"].UTF8String);
@@ -231,6 +269,7 @@ static id sp_nextDrawable(id self, SEL _cmd) {
 }
 
 static void spBCInstall(id<MTLDevice> device, Class cls);
+static void spA16Session(id<MTLDevice> device);
 static bool spBCActive(id device);
 static bool spBCVerbose;
 static MTLSizeAndAlign spBCHeapSize(id device, SEL selector, MTLTextureDescriptor *descriptor,
@@ -379,24 +418,26 @@ static void sp_open_metal_diag(void) {
 }
 
 // Called once before handing out the device on an instrumented entry point.
-static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
+static void sp_install_metal_diag(id<MTLDevice> dev, Class cls, bool installSizing) {
     SEL selector = @selector(heapTextureSizeAndAlignWithDescriptor:);
     Method method = class_getInstanceMethod(cls, selector);
     const char *bc = "n/a";
     if ([dev respondsToSelector:@selector(supportsBCTextureCompression)])
         bc = dev.supportsBCTextureCompression ? "yes" : "no";
     NSString *name = dev.name;
-    os_unfair_lock_lock(&sp_metal_diag_lock);
-    snprintf(sp_metal_diag_device, sizeof sp_metal_diag_device,
+    char header[sizeof sp_metal_diag_device] = {0};
+    snprintf(header, sizeof header,
              "SP_METAL_DIAG=1 device=\\"%.96s\\" class=%.96s Apple7=%d Apple8=%d Apple9=%d Mac2=%d"
              " supportsBCTextureCompression=%s selector=%s hook=%s\\n",
              name.UTF8String ?: "n/a", class_getName(cls),
              [dev supportsFamily:MTLGPUFamilyApple7], [dev supportsFamily:MTLGPUFamilyApple8],
              [dev supportsFamily:MTLGPUFamilyApple9], [dev supportsFamily:MTLGPUFamilyMac2], bc,
-             sel_getName(selector), method ? "installed" : "missing");
+             sel_getName(selector), !installSizing ? "capabilities-only" : method ? "installed" : "missing");
+    os_unfair_lock_lock(&sp_metal_diag_lock);
+    memcpy(sp_metal_diag_device, header, sizeof header);
     os_unfair_lock_unlock(&sp_metal_diag_lock);
-    sp_metal_diag_write(sp_metal_diag_device);
-    if (!method) return;
+    sp_metal_diag_write(header);
+    if (!installSizing || !method) return;
 
     // Install on the concrete class even when the original method is inherited.
     MTLSizeAndAlign (*original)(id, SEL, MTLTextureDescriptor *) =
@@ -445,15 +486,30 @@ static void spBCLog(NSString *format, ...) {
 
 static void sp_prepare_metal_device(id<MTLDevice> device, bool observer) {
     if (!device) return;
+    Class cls = object_getClass(device);
+    bool sizing = observer || spA16Profile() ||
+        ([device respondsToSelector:@selector(supportsBCTextureCompression)] && !device.supportsBCTextureCompression);
 #if SP_METAL_DIAG
-    static dispatch_once_t open_once, diag_once;
+    static dispatch_once_t open_once, capabilities_once, sizing_once;
     dispatch_once(&open_once, ^{ sp_open_metal_diag(); });
-    if (observer || ([device respondsToSelector:@selector(supportsBCTextureCompression)] &&
-                     !device.supportsBCTextureCompression))
-        dispatch_once(&diag_once, ^{ sp_install_metal_diag(device, object_getClass(device)); });
+    if (sizing) {
+        dispatch_once(&sizing_once, ^{ sp_install_metal_diag(device, cls, true); });
+    } else {
+        dispatch_once(&capabilities_once, ^{ sp_install_metal_diag(device, cls, false); });
+    }
+#else
+    (void)sizing;
 #endif
     static dispatch_once_t bc_once;
-    dispatch_once(&bc_once, ^{ spBCInstall(device, object_getClass(device)); });
+    dispatch_once(&bc_once, ^{
+        spA16Session(device);
+        spBCInstall(device, cls);
+        Method drawable = class_getInstanceMethod(NSClassFromString(@"CAMetalLayer"), @selector(nextDrawable));
+        if (drawable) {
+            sp_nextDrawable_orig = (void *)method_getImplementation(drawable);
+            method_setImplementation(drawable, (IMP)sp_nextDrawable);
+        }
+    });
 }
 
 // The re-export remains the provider of the real device. The direct factory
@@ -482,11 +538,10 @@ id<MTLDevice> sp_MTLCreateSystemDefaultDevice(void) {
 static void sp_add_device_props(id dev) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        atomic_store(&sp_drawable_trace, true);
         Class c = object_getClass(dev);
         Method m = class_getInstanceMethod(c, @selector(newLibraryWithData:error:));
         sp_newLibraryWithData_orig = (void *)method_setImplementation(m, (IMP)sp_newLibraryWithData);
-        Method nd = class_getInstanceMethod(NSClassFromString(@"CAMetalLayer"), sel_registerName("nextDrawable"));
-        if (nd) sp_nextDrawable_orig = (void *)method_setImplementation(nd, (IMP)sp_nextDrawable);
         struct { const char *sel, *types; IMP imp; } props[] = {
             {"isLowPower", "c@:", (IMP)sp_dev_isLowPower},
             {"isHeadless", "c@:", (IMP)sp_dev_isHeadless},
@@ -775,7 +830,8 @@ def shim_build_line(name, link, shim_dir):
     sources = [name + ".m"]
     sources += [os.path.relpath(os.path.join(REPO, path), shim_dir)
                 for path in EXTRA_SOURCES.get(name, ())]
-    return (f'$CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class {" ".join(sources)} -o "$OUT/{name}.dylib" '
+    build_sha = r' "-DSP_A16_BUILD_SHA=\"${SP_A16_BUILD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}\""' if name == "libspMetal" else ""
+    return (f'$CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class{build_sha} {" ".join(sources)} -o "$OUT/{name}.dylib" '
             f"-install_name @rpath/{name}.dylib -framework Foundation {' '.join(link)}\n")
 
 

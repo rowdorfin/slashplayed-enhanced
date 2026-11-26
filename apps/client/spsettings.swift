@@ -609,6 +609,13 @@ struct SettingsView: View {
 
     private var display: some View {
         Section {
+            Toggle("Perfil A16 (experimental)", isOn: Binding(
+                get: { UserDefaults.standard.bool(forKey: "sp_a16_profile") },
+                set: {
+                    UserDefaults.standard.set($0, forKey: "sp_a16_profile")
+                    settings.reload()
+                }
+            ))
             ForEach(displayChoices) { choice in
                 VStack(alignment: .leading, spacing: 4) {
                     #if os(visionOS)
