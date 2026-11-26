@@ -11,6 +11,10 @@ enum { SPBCASTCBlockBytes = 16 };
 // of transparent texels can change. The block bits are also valid for sRGB.
 void SPBC1ToASTC(const uint8_t source[8], uint8_t target[SPBCASTCBlockBytes]);
 
+// Experimental lossy quantization to three weights per plane.
+void SPBC2ToASTC(const uint8_t source[16], uint8_t target[SPBCASTCBlockBytes]);
+void SPBC3ToASTC(const uint8_t source[16], uint8_t target[SPBCASTCBlockBytes]);
+
 // Transcode the blocks covering a nonempty texel rectangle. Origins are
 // supplied by the caller via the pointers and must be block aligned. Partial
 // mip edges still consume one full block. Strides are per row of blocks.

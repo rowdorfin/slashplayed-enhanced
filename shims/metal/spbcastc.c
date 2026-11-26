@@ -86,14 +86,18 @@ static void spASTCOpaque(uint8_t out[16], uint8_t rgb[2][3], uint32_t indices, b
     }
 }
 
-static void spASTCPunchThrough(uint8_t out[16], uint8_t rgb[2][3], uint32_t indices) {
+static unsigned spASTCQuantize7(unsigned value) {
+    return (value * 127u + 127u) / 255u;
+}
+
+static void spASTCDualPlaneRGBA(uint8_t out[16], uint8_t rgb[2][3], uint32_t indices,
+                               const uint8_t colors[4], const uint8_t alphaWeights[16],
+                               unsigned alphaMin, unsigned alphaMax) {
     // 52 weight bits + 17 header + 2 plane selector leaves 57 bits.
-    // Eight direct endpoints use 56 bits (7-bit values); alpha uses just
-    // the extreme weights of the three-level second plane.
+    // Eight direct endpoints use 56 bits (7-bit values).
     for (unsigned e = 0; e < 2; e++)
         for (unsigned c = 0; c < 3; c++)
-            rgb[e][c] = (uint8_t)((rgb[e][c] * 127u + 127u) / 255u);
-    if (indices == UINT32_MAX) memset(rgb, 0, 6);
+            rgb[e][c] = (uint8_t)spASTCQuantize7(rgb[e][c]);
     bool swap = spASTCSum(rgb[0], true) > spASTCSum(rgb[1], true);
 
     unsigned mode = SPBCASTCThreeWeights | SPBCASTCDualPlane;
@@ -104,24 +108,33 @@ static void spASTCPunchThrough(uint8_t out[16], uint8_t rgb[2][3], uint32_t indi
         spASTCWrite(out, 17 + c * 14, 7, rgb[swap][c]);
         spASTCWrite(out, 24 + c * 14, 7, rgb[!swap][c]);
     }
-    spASTCWrite(out, 66, 7, 127); // alpha endpoint 1
+    spASTCWrite(out, 59, 7, spASTCQuantize7(alphaMin));
+    spASTCWrite(out, 66, 7, spASTCQuantize7(alphaMax));
     spASTCWrite(out, 74, 2, 3);  // second plane controls alpha
 
-    // Transparent black generally isn't on the opaque endpoints' RGB
-    // segment. Use the darker endpoint to limit hidden RGB error while
-    // the second plane preserves alpha exactly.
-    static const uint8_t weights[] = {0, 2, 1};
     for (unsigned i = 0; i < 32; i += 5) {
         unsigned count = i == 30 ? 2 : 5;
         uint8_t trits[5] = {0};
         for (unsigned j = 0; j < count; j++) {
             unsigned at = i + j;
-            unsigned index = indices >> (2 * (at / 2)) & 3;
-            if (at % 2) trits[j] = index == 3 ? 0 : 2;
-            else if (index != 3) trits[j] = (uint8_t)(swap ? 2 - weights[index] : weights[index]);
+            if (at % 2) trits[j] = alphaWeights[at / 2];
+            else {
+                unsigned w = colors[indices >> at & 3];
+                trits[j] = w == 3 ? 0 : (uint8_t)(swap ? 2 - w : w);
+            }
         }
         spASTCWeightBits(out, i / 5 * 8, count == 5 ? 8 : 4, spASTCPackTrits(trits));
     }
+}
+
+static void spASTCPunchThrough(uint8_t out[16], uint8_t rgb[2][3], uint32_t indices) {
+    if (indices == UINT32_MAX) memset(rgb, 0, 6);
+    // Transparent black generally isn't on the opaque RGB segment. Weight 3
+    // selects the darker endpoint while the second plane preserves alpha.
+    static const uint8_t colors[] = {0, 2, 1, 3};
+    uint8_t alpha[16];
+    for (unsigned i = 0; i < 16; i++) alpha[i] = (indices >> (2 * i) & 3) == 3 ? 0 : 2;
+    spASTCDualPlaneRGBA(out, rgb, indices, colors, alpha, 0, 255);
 }
 
 void SPBC1ToASTC(const uint8_t source[8], uint8_t target[16]) {
@@ -138,6 +151,36 @@ void SPBC1ToASTC(const uint8_t source[8], uint8_t target[16]) {
         spASTCPunchThrough(target, rgb, indices);
     else
         spASTCOpaque(target, rgb, indices, fourColors);
+}
+
+static void spASTCInterpolatedAlpha(SPBCKind kind, const uint8_t source[16], uint8_t target[16]) {
+    uint8_t rgba[64], rgb[2][3], alpha[16];
+    SPBCDecodeBlock(kind, source, rgba, 16);
+    unsigned low = 255, high = 0;
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned value = rgba[4 * i + 3];
+        if (value < low) low = value;
+        if (value > high) high = value;
+    }
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned relative = 4 * (rgba[4 * i + 3] - low);
+        alpha[i] = relative <= high - low ? 0 : relative >= 3 * (high - low) ? 2 : 1;
+    }
+    spASTCEndpoint(source[8] | (unsigned)source[9] << 8, rgb[0]);
+    spASTCEndpoint(source[10] | (unsigned)source[11] << 8, rgb[1]);
+    uint32_t indices = source[12] | (uint32_t)source[13] << 8 |
+                       (uint32_t)source[14] << 16 | (uint32_t)source[15] << 24;
+    static const uint8_t colors[] = {0, 2, 1, 1};
+    memset(target, 0, SPBCASTCBlockBytes);
+    spASTCDualPlaneRGBA(target, rgb, indices, colors, alpha, low, high);
+}
+
+void SPBC2ToASTC(const uint8_t source[16], uint8_t target[16]) {
+    spASTCInterpolatedAlpha(SPBC2, source, target);
+}
+
+void SPBC3ToASTC(const uint8_t source[16], uint8_t target[16]) {
+    spASTCInterpolatedAlpha(SPBC3, source, target);
 }
 
 bool SPBC1RectToASTC(const uint8_t *source, size_t sourceRow, size_t width, size_t height,

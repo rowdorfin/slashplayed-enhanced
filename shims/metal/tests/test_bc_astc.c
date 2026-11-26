@@ -42,7 +42,7 @@ static void decodeTrits(unsigned t, unsigned out[5]) {
     }
 }
 
-static void decodeASTC(const uint8_t block[16], uint8_t rgba[64]) {
+static void decodeASTC(const uint8_t block[16], uint8_t rgba[64], bool srgb) {
     unsigned mode = getBits(block, 0, 11, false);
     bool dual = mode == 0x451;
     assert(mode == 0x42 || mode == 0x51 || dual);
@@ -76,14 +76,16 @@ static void decodeASTC(const uint8_t block[16], uint8_t rgba[64]) {
     for (unsigned i = 0; i < 16; i++) {
         for (unsigned c = 0; c < 4; c++) {
             unsigned w = weights[dual ? 2 * i + (c == 3) : i];
-            unsigned sum = 257 * (endpoints[c][0] * (64 - w) + endpoints[c][1] * w);
+            unsigned sum = endpoints[c][0] * (64 - w) + endpoints[c][1] * w;
+            sum = srgb && c < 3 ? 256 * sum + 64 * 128 : 257 * sum;
             rgba[i * 4 + c] = (uint8_t)(((sum + 32) / 64) >> 8);
         }
     }
 }
 
+static uint32_t state = UINT32_C(0x18092001);
+
 static uint32_t randomWord(void) {
-    static uint32_t state = UINT32_C(0x18092001);
     state ^= state << 13;
     state ^= state >> 17;
     return state ^= state << 5;
@@ -98,7 +100,7 @@ static void testBlocks(void) {
         if (n % 4 == 1) source[4] = source[5] = source[6] = source[7] = 0xff;
         SPBC1ToASTC(source, target);
         SPBCDecodeBlock(SPBC1, source, ref, 16);
-        decodeASTC(target, result);
+        decodeASTC(target, result, false);
         for (unsigned i = 0; i < 16; i++) {
             assert(ref[4 * i + 3] == result[4 * i + 3]);
             if (!ref[4 * i + 3]) {
@@ -114,6 +116,49 @@ static void testBlocks(void) {
         }
     }
     assert(maxOpaque <= 1 && maxVisible <= 2);
+}
+
+static void measureAlphaBlocks(SPBCKind kind, bool srgb) {
+    unsigned maxRGB = 0, maxAlpha = 0;
+    uint64_t sumRGB = 0, sumAlpha = 0;
+    enum { Blocks = 10000 };
+    state = UINT32_C(0x18092001);
+    for (unsigned n = 0; n < Blocks; n++) {
+        uint8_t source[16], target[16], ref[64], result[64];
+        for (unsigned i = 0; i < sizeof source; i++) source[i] = (uint8_t)randomWord();
+        switch (kind) {
+            case SPBC1:
+                if (source[1] > source[3] || (source[1] == source[3] && source[0] > source[2])) {
+                    for (unsigned i = 0; i < 2; i++) {
+                        uint8_t temp = source[i];
+                        source[i] = source[i + 2];
+                        source[i + 2] = temp;
+                    }
+                }
+                source[4] |= 3;
+                SPBC1ToASTC(source, target);
+                break;
+            case SPBC2: SPBC2ToASTC(source, target); break;
+            case SPBC3: SPBC3ToASTC(source, target); break;
+            default: assert(false);
+        }
+        SPBCDecodeBlock(kind, source, ref, 16);
+        decodeASTC(target, result, srgb);
+        for (unsigned i = 0; i < 64; i++) {
+            unsigned err = ref[i] > result[i] ? ref[i] - result[i] : result[i] - ref[i];
+            if (i % 4 == 3) {
+                sumAlpha += err;
+                if (err > maxAlpha) maxAlpha = err;
+            } else {
+                sumRGB += err;
+                if (err > maxRGB) maxRGB = err;
+            }
+        }
+    }
+    assert(kind == SPBC1 ? maxAlpha == 0 : maxAlpha <= 65 && maxRGB <= 46);
+    printf("BC%d -> ASTC %-6s max/MAE RGB %u/%.3f alpha %u/%.3f\n",
+           kind, srgb ? "sRGB" : "linear", maxRGB, sumRGB / (48.0 * Blocks),
+           maxAlpha, sumAlpha / (16.0 * Blocks));
 }
 
 static void testMipsAndEdges(void) {
@@ -148,5 +193,9 @@ static void testMipsAndEdges(void) {
 int main(void) {
     testBlocks();
     testMipsAndEdges();
+    for (SPBCKind kind = SPBC1; kind <= SPBC3; kind++) {
+        measureAlphaBlocks(kind, false);
+        measureAlphaBlocks(kind, true);
+    }
     puts("BC1 to ASTC: bounded opaque error, exact punch-through alpha, mip and partial block pitches: PASS");
 }
