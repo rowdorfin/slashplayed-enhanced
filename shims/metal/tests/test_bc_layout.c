@@ -77,6 +77,23 @@ static void test_volume_and_tiles(void) {
             for (size_t x = 0; x < 63; x++) assert(coverage[z][y][x] == 1);
 }
 
+static void test_packed_staging(void) {
+    const SPBCSize mip = {8, 8, 2};
+    const SPBCKind kinds[] = {SPBC4S, SPBC5, SPBC1, SPBC6H};
+    for (size_t i = 0; i < sizeof kinds / sizeof *kinds; i++) {
+        size_t texelBytes = SPBCTexelBytes(kinds[i]);
+        SPBCOrigin cursor = {0};
+        SPBCTile tile;
+        for (size_t z = 0; z < mip.depth; z++) {
+            assert(SPBCNextTile(kinds[i], mip, texelBytes, 4096, &cursor, &tile));
+            assert(tile.origin.z == z && tile.size.depth == 1);
+            assert(tile.row == mip.width * texelBytes && tile.bytes == mip.height * tile.row);
+            assert(tile.bytes < 256 * mip.height);
+        }
+        assert(!SPBCNextTile(kinds[i], mip, texelBytes, 4096, &cursor, &tile));
+    }
+}
+
 static void test_texture_bytes(void) {
     const SPBCSize image = {7, 5, 1};
     const SPBCSize volume = {7, 5, 3};
@@ -103,6 +120,7 @@ int main(void) {
     assert(SPBCPhysicalDescriptor((SPBCDescriptor){.format = 131}).format == 71);
     assert(SPBCMipSize((SPBCSize){5, 3, 9}, 1000).depth == 1);
     test_volume_and_tiles();
+    test_packed_staging();
     test_texture_bytes();
     puts("BC layout: A/B descriptors, mip sizes, source offset and pitches, clipping, slices, and bounded tiles: PASS");
 }

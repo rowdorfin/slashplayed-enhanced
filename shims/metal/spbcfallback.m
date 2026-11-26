@@ -62,6 +62,7 @@ static _Atomic unsigned long long spBCUnsupported[SPBCUnsupportedCount];
 static _Atomic unsigned long long spBCFormats[24], spBCCompressed, spBCDecoded;
 static _Atomic unsigned long long spBCDecodeTicks, spBCMaxTicks;
 static _Atomic unsigned long long spBCStagingLive, spBCStagingPeak;
+static _Atomic unsigned long long spBCStagingAllocatedLive, spBCStagingAllocatedPeak;
 static _Atomic unsigned long long spBCMetalAllocationFailures, spBCCPUAllocationFailures, spBCLayoutFailures, spBCDropped;
 static _Atomic unsigned long long spBCTextureFailures;
 static NSHashTable<id<MTLHeap>> *spBCHeaps;
@@ -85,11 +86,15 @@ static void spBCMax(_Atomic unsigned long long *maximum, unsigned long long valu
 @interface SPBCTextureInfo : NSObject
 @property (nonatomic) MTLPixelFormat requested;
 @property (nonatomic) SPBCKind kind;
-@property (nonatomic) size_t trackedBytes;
+@property (nonatomic) size_t trackedBytes, standaloneAllocatedBytes;
+@property (nonatomic) MTLPixelFormat physicalFormat;
+@property (nonatomic) MTLStorageMode storageMode;
 @end
 
 typedef struct {
-    unsigned long long allocated, freed, liveBytes;
+    unsigned long long allocated, freed, liveBytes, standaloneAllocatedBytes;
+    unsigned long long liveBytesByFormat[MTLPixelFormatRGBA16Float + 1];
+    unsigned long long liveBytesByStorage[MTLStorageModeMemoryless + 1];
 } SPBCTextureStats;
 static SPBCTextureStats spBCTextureStats;
 
@@ -98,9 +103,21 @@ static SPBCTextureStats spBCTextureStats;
     @synchronized ([SPBCTextureInfo class]) {
         spBCTextureStats.freed++;
         spBCTextureStats.liveBytes -= _trackedBytes;
+        spBCTextureStats.standaloneAllocatedBytes -= _standaloneAllocatedBytes;
+        if (_physicalFormat < sizeof spBCTextureStats.liveBytesByFormat / sizeof *spBCTextureStats.liveBytesByFormat)
+            spBCTextureStats.liveBytesByFormat[_physicalFormat] -= _trackedBytes;
+        if (_storageMode <= MTLStorageModeMemoryless)
+            spBCTextureStats.liveBytesByStorage[_storageMode] -= _trackedBytes;
     }
 }
 @end
+
+static NSString *spBCByteBreakdown(const unsigned long long *bytes, size_t count) {
+    NSMutableString *result = [NSMutableString string];
+    for (size_t i = 0; i < count; i++)
+        if (bytes[i]) [result appendFormat:@"%zu=%llu,", i, bytes[i]];
+    return result;
+}
 
 static void spBCSummary(id<MTLDevice> device) {
     SPBCTextureStats textures;
@@ -153,7 +170,9 @@ static void spBCSummary(id<MTLDevice> device) {
             @"deviceCurrentAllocatedSize=%@ phys_footprint=%@ os_proc_available_memory=%zu "
             @"stagingLimitHits=%llu metalAllocationFailures=%llu cpuAllocationFailures=%llu layoutFailures=%llu "
             @"dropped=%llu pendingUploads=%llu pendingBytes=%llu inFlightUploads=%llu inFlightBytes=%llu "
-            @"scratchBytes=%llu overLimit=%llu overLimitBytes=%llu",
+            @"scratchBytes=%llu overLimit=%llu overLimitBytes=%llu "
+            @"textureLiveBytesByPhysicalFormat=%@ textureLiveBytesByStorageMode=%@ "
+            @"textureStandaloneAllocatedBytes=%llu stagingAllocatedLiveBytes=%llu stagingAllocatedPeakBytes=%llu",
             textures.allocated, textures.freed, textures.allocated - textures.freed, textures.liveBytes,
             atomic_load(&spBCSizingQueries), formats, atomic_load(&spBCCompressed), atomic_load(&spBCDecoded),
             atomic_load(&spBCStagingLive),
@@ -165,7 +184,11 @@ static void spBCSummary(id<MTLDevice> device) {
             haveFootprint ? @(vm.phys_footprint) : @"n/a", os_proc_available_memory(),
             staging.limitHits, metalFailures, cpuFailures, atomic_load(&spBCLayoutFailures),
             atomic_load(&spBCDropped), staging.pending.uploads, staging.pending.bytes, staging.inFlight.uploads,
-            staging.inFlight.bytes, staging.scratchBytes, staging.overLimit, staging.overLimitBytes);
+            staging.inFlight.bytes, staging.scratchBytes, staging.overLimit, staging.overLimitBytes,
+            spBCByteBreakdown(textures.liveBytesByFormat, sizeof textures.liveBytesByFormat / sizeof *textures.liveBytesByFormat),
+            spBCByteBreakdown(textures.liveBytesByStorage, sizeof textures.liveBytesByStorage / sizeof *textures.liveBytesByStorage),
+            textures.standaloneAllocatedBytes, atomic_load(&spBCStagingAllocatedLive),
+            atomic_load(&spBCStagingAllocatedPeak));
 }
 
 static void spBCStartSummary(id<MTLDevice> device) {
@@ -529,13 +552,23 @@ static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view)
     SPBCTextureInfo *info = [SPBCTextureInfo new];
     info.requested = requested;
     info.kind = SPBCKindOfPixelFormat(requested);
-    if (!view)
+    if (!view) {
         info.trackedBytes = SPBCTextureBytes(info.kind, (SPBCSize){texture.width, texture.height, texture.depth},
                                              texture.textureType, texture.mipmapLevelCount, texture.arrayLength,
                                              texture.sampleCount);
+        info.physicalFormat = texture.pixelFormat;
+        info.storageMode = texture.storageMode;
+        // Metal's heap metrics already cover heap backing. Views share their parent's allocation.
+        if (!texture.heap) info.standaloneAllocatedBytes = texture.allocatedSize;
+    }
     @synchronized ([SPBCTextureInfo class]) {
         spBCTextureStats.allocated++;
         spBCTextureStats.liveBytes += info.trackedBytes;
+        spBCTextureStats.standaloneAllocatedBytes += info.standaloneAllocatedBytes;
+        if (info.physicalFormat < sizeof spBCTextureStats.liveBytesByFormat / sizeof *spBCTextureStats.liveBytesByFormat)
+            spBCTextureStats.liveBytesByFormat[info.physicalFormat] += info.trackedBytes;
+        if (info.storageMode <= MTLStorageModeMemoryless)
+            spBCTextureStats.liveBytesByStorage[info.storageMode] += info.trackedBytes;
     }
     // Immutable after publication. Avoid the atomic association getter's
     // autorelease, which could keep the sentinel alive past the texture.
@@ -734,18 +767,24 @@ static id newHeap(id device, SEL selector, MTLHeapDescriptor *descriptor) {
 static char spBCStagingKey;
 @interface SPBCStagingInfo : NSObject {
 @public
-    size_t bytes;
+    size_t bytes, allocatedBytes;
 }
 @end
 @implementation SPBCStagingInfo
-- (void)dealloc { atomic_fetch_sub(&spBCStagingLive, bytes); }
+- (void)dealloc {
+    atomic_fetch_sub(&spBCStagingLive, bytes);
+    atomic_fetch_sub(&spBCStagingAllocatedLive, allocatedBytes);
+}
 @end
 
 static void spBCTrackStaging(id<MTLBuffer> buffer) {
     SPBCStagingInfo *info = [SPBCStagingInfo new];
     info->bytes = buffer.length;
+    info->allocatedBytes = buffer.allocatedSize;
     unsigned long long live = atomic_fetch_add(&spBCStagingLive, info->bytes) + info->bytes;
     spBCMax(&spBCStagingPeak, live);
+    unsigned long long allocated = atomic_fetch_add(&spBCStagingAllocatedLive, info->allocatedBytes) + info->allocatedBytes;
+    spBCMax(&spBCStagingAllocatedPeak, allocated);
     objc_setAssociatedObject(buffer, &spBCStagingKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
@@ -897,10 +936,13 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
 
     // Reserve once for the whole copy. Waiting between tiles would keep this
     // uncommitted copy's allocations live and repeat the stall for each tile.
+    // Buffer-to-texture blits require a whole-texel row pitch. The stricter
+    // alignment for buffer-backed texture views does not apply to these copies.
+    size_t alignment = SPBCTexelBytes(info.kind);
     size_t bytes = 0;
     SPBCOrigin cursor = {0};
     SPBCTile tile;
-    while (SPBCNextTile(info.kind, layout.size, 256, SPBCTileLimit, &cursor, &tile)) {
+    while (SPBCNextTile(info.kind, layout.size, alignment, SPBCTileLimit, &cursor, &tile)) {
         if (tile.bytes > SIZE_MAX - bytes) {
             spBCDropLayout(selector);
             return;
@@ -914,7 +956,9 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
 
     SPBCUpload *upload = [SPBCUpload new];
     upload->source = source;
-    upload->destination = texture;
+    // Metal owns encoded resources on retained command buffers. Keep the
+    // fallback's own reference only where Metal leaves lifetime to the caller.
+    if (!commandBuffer.retainedReferences) upload->destination = texture;
     upload->layout = layout;
     upload->kind = info.kind;
     upload->uploadSelector = selector;
@@ -925,7 +969,7 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
     // Allocate all tiles for this copy before encoding it. Once a blit is
     // encoded it cannot be rolled back if a later tile fails to allocate.
     cursor = (SPBCOrigin){0};
-    while (SPBCNextTile(info.kind, layout.size, 256, SPBCTileLimit, &cursor, &tile)) {
+    while (SPBCNextTile(info.kind, layout.size, alignment, SPBCTileLimit, &cursor, &tile)) {
         SPBCUploadTile *part = [SPBCUploadTile new];
         part->tile = tile;
         part->staging = spBCAllocateStaging(texture.device, tile.bytes, deadline);
@@ -946,14 +990,16 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
         [pending addObject:upload];
     }
     IMP real = original(encoder, selector);
+    bool volume = texture.textureType == MTLTextureType3D;
     insideTexture++;
     for (SPBCUploadTile *part in upload->tiles) {
         MTLRegion region = spBCPart(origin, part->tile);
+        NSUInteger imageBytes = volume ? part->tile.bytes : 0;
         if (withOptions)
-            ((BufferToTextureOptions)real)(encoder, selector, part->staging, 0, part->tile.row, part->tile.bytes,
+            ((BufferToTextureOptions)real)(encoder, selector, part->staging, 0, part->tile.row, imageBytes,
                                            region.size, texture, slice, level, region.origin, options);
         else
-            ((BufferToTexture)real)(encoder, selector, part->staging, 0, part->tile.row, part->tile.bytes,
+            ((BufferToTexture)real)(encoder, selector, part->staging, 0, part->tile.row, imageBytes,
                                     region.size, texture, slice, level, region.origin);
     }
     insideTexture--;
