@@ -982,6 +982,8 @@ static NSArray<NSString *> *sp_retire_touch_hud(NSString *game) {
     const SPPackagedAddonFile shipped[] = {
         { @"SPTouchHUD.toc", 192, @"71ed08d0ae2a9f7c715ca3f68dd6679fac7b8ca7e0bea555041e2958e7b543ed" },
         { @"SPTouchHUD.lua", 27789, @"8a3af81435e895f3cb7462f8d28e5bc6822509a0379043282d0c763138a290e0" },
+        { @"SPTouchHUD.toc", 208, @"67f89ec58966cffefa686f91f6bdc6c24a49179866613f6482491ba72ca37446" },
+        { @"SPTouchHUD.lua", 40728, @"570130a950012a7b6aa065c73f9f9edf57b6f94a9b4fb9668e463c93da1d128e" },
     };
     return sp_remove_packaged_addon(game, @"SPTouchHUD", shipped, sizeof shipped / sizeof shipped[0]);
 }

@@ -16,7 +16,9 @@ cc -O1 -Wall -o "$OUT/decode" decode.c -lm
 "$OUT/decode" < "$OUT/frames.txt"
 "${LUA:-lua}" spmovie.lua ../SPMovie/SPMovie.lua
 "${LUA:-lua}" sptouchbars.lua ../SPTouchBars/SPTouchBars.lua
-"${LUA:-lua}" sptouchhud.lua ../SPTouchHUD/SPTouchHUD.lua
+HUD_JOYSTICK=$(awk '/^static const CGFloat sp_hud_joystick_fraction = / { sub(/;$/, "", $6); print $6 }' ../../shims/appkit/spevent.m)
+HUD_JUMP=$(awk '/^static const CGFloat sp_hud_jump_fraction = / { sub(/;$/, "", $6); print $6 }' ../../shims/appkit/spevent.m)
+"${LUA:-lua}" sptouchhud.lua ../SPTouchHUD/SPTouchHUD.lua "$HUD_JOYSTICK" "$HUD_JUMP"
 
 # Fallback can only retire files whose exact packaged fingerprint is recorded by the launcher.
 awk '/^static .*sp_retire_touch_hud\(/ { recording = 1 } recording { print } recording && /^}/ { exit }' \
