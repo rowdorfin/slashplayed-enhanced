@@ -104,6 +104,15 @@ static void image_added(const struct mach_header *h, intptr_t slide) {
 // For the other shims' caller offsets.
 __attribute__((visibility("default"))) uintptr_t sp_client_text(void) { return text; }
 
+// spguest's client is outside dyld's image list. Use its existing writable alias.
+__attribute__((visibility("default")))
+void sp_set_client(const struct mach_header *h, intptr_t slide, const char *path, uintptr_t alias) {
+    find_text(h, slide, 0);
+    text_w = alias;
+    // Keep the launch marker read by the Mac companion and the local launcher script.
+    vlog("detached (guest %s, __TEXT %p+0x%lx)\n", path, (void *)text, text_len);
+}
+
 static int in_text(uintptr_t a, size_t len) { return a >= text && len <= text_len && a - text <= text_len - len; }
 
 static int traced(void) {

@@ -49,6 +49,7 @@
 #include <string.h>
 #include <CommonCrypto/CommonDigest.h>
 #import "spassemble.h"
+#include "spguest.h"
 #import "spcdn.h"  // sp_table_row, sp_build_info_for_image, sp_flavor_info
 #import "spaddons.h"
 #import "spsign.h"
@@ -57,6 +58,8 @@ static void say(NSString *s) {
     fprintf(stderr, "[sp:launch] %s\n", s.UTF8String);
 }
 
+NSString *sp_guest_hooks_problem(void);  // spguestlaunch.m
+int sp_guest_main(NSString *path, int argc, char **argv, void (^ready)(void), NSString **problem);
 void sp_launch_say(NSString *s) { say(s); }  // spjit.m, sppair.m, and spvpn.m log through it
 NSString *sp_jit_attach(void (^pump)(double));  // spjit.m
 NSString *sp_device_noun(void);  // spjit.m
@@ -517,6 +520,10 @@ static void retire_caught_up(NSString *flavor, NSDictionary<NSString *, NSString
     }
 }
 
+static BOOL guest_client(NSString *path) {
+    return path && spguest_check_file(path.fileSystemRepresentation, NULL, 0);
+}
+
 // An update's image is signed with the identity the device held when it was made, and dlopen refuses an image
 // whose signer no installed profile lists, as it does an ad hoc one (research/dlopentest, 5.3). That signer can
 // drop out of the profiles while the image stays: Xcode replaces a free team's certificate (A) and the app is
@@ -566,7 +573,7 @@ NSDictionary<NSString *, NSString *> *sp_game_build(NSString *flavor, BOOL *upda
     NSDictionary<NSString *, NSString *> *bundled = stamp_beside(bundled_image(flavor), flavor);
     NSString *library = library_image(flavor);
     NSDictionary<NSString *, NSString *> *update = updated_build(library, flavor);
-    *updated = update && !sp_update_caught_up(bundled, update) && (library_listed(library) || sp_identity_usable());
+    *updated = update && !sp_update_caught_up(bundled, update) && (guest_client(library) || library_listed(library) || sp_identity_usable());
     return *updated ? update : bundled;
 }
 
@@ -575,7 +582,7 @@ NSDictionary<NSString *, NSString *> *sp_game_build(NSString *flavor, BOOL *upda
 BOOL sp_game_has_image(NSString *flavor) {
     if ([NSFileManager.defaultManager fileExistsAtPath:bundled_image(flavor)]) return YES;
     NSString *library = library_image(flavor);
-    return updated_build(library, flavor) && (library_listed(library) || sp_identity_usable());
+    return updated_build(library, flavor) && (guest_client(library) || library_listed(library) || sp_identity_usable());
 }
 
 // The Settings sheet's Reset Game Settings (spstart.m): deletes the game's WTF/Config.wtf (its graphics, sound,
@@ -777,7 +784,9 @@ int main(int argc, char **argv) {
         library = library_image(flavor);
         bundledStamp = bundled ? image_build(bundled, flavor) : nil;
         retire_caught_up(flavor, bundledStamp);
-        libraryStamp = library_signed(library, flavor, updated_build(library, flavor));
+        libraryStamp = updated_build(library, flavor);
+        if (libraryStamp && !guest_client(library))
+            libraryStamp = library_signed(library, flavor, libraryStamp);
         if (bundled || libraryStamp) break;
         // Nothing to load: the device installs the game itself, from Blizzard's CDN, in the game's region (its
         // region file, chosen in Settings or by an earlier install, else the device's region: sp_game_region).
@@ -823,6 +832,11 @@ int main(int argc, char **argv) {
         path = sp_patch_check(flavor, bundled, bundledStamp, library, libraryStamp, choice, &pump);
         if ([path isEqual:library]) libraryStamp = image_build(library, flavor);
     }
+    BOOL guest = guest_client(path);
+    if (guest) {
+        NSString *hooks = sp_guest_hooks_problem();
+        if (hooks) fail_launch(hooks);
+    }
     // A Battle.net launcher token the companion relayed (Play with My Mac's Battle.net) and the client
     // hasn't imported yet: just before the client loads, the AppKit shim imports it into net.battle and
     // deletes the file (sp_net_battle_import, below). Only here, not when UIKit starts (on iOS that's
@@ -842,7 +856,7 @@ int main(int argc, char **argv) {
     NSMutableData *login = problem ? nil : sp_login_prepare(token, &pump, &problem);
     if (!problem) problem = sp_jit_attach(pump);
     if (problem) fail_launch(problem);
-    if (login) sp_login_write(flavor, login);  // on failure it says so; the token or the game's login screen is left
+    if (login && !guest) sp_login_write(flavor, login);  // on failure it says so; the token or the game's login screen is left
     // The loading screen (the AppKit shim's sploading.m), from here until the client's first frame, instead
     // of black: the game's name, then the data setup's progress or "Loading…". On visionOS it goes up when
     // the client brings UIKit up.
@@ -857,6 +871,15 @@ int main(int argc, char **argv) {
         void (*import)(void) = ak ? (void (*)(void))dlsym(ak, "sp_net_battle_import") : NULL;
         if (import) import();
         else say([NSString stringWithFormat:@"login: can't import the relayed token: %s", dlerror()]);
+    }
+    if (guest) {
+        int status = sp_guest_main(path, argc, argv, ^{
+            build_info_for_image(flavor, path, libraryStamp, sp_game_region_now(flavor));
+            if (login) sp_login_write(flavor, login);
+        }, &problem);
+        if (login) [login resetBytesInRange:NSMakeRange(0, login.length)];
+        if (problem) fail_launch(problem);
+        return status;
     }
     double t = CFAbsoluteTimeGetCurrent();
     void *h = dlopen(path.fileSystemRepresentation, RTLD_NOW);

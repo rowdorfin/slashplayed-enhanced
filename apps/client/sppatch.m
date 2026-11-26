@@ -38,8 +38,10 @@
 #import "spassemble.h"
 #import "spbind.h"
 #import "spcdn.h"
+#include "spguest.h"
 #import "spsign.h"
 
+NSString *sp_guest_hooks_problem(void);  // spguestlaunch.m
 void sp_launch_say(NSString *s);  // launcher.m
 void (^sp_launch_uikit(void))(double);  // launcher.m
 NSString *sp_flavor_name(NSString *flavor);  // launcher.m
@@ -373,12 +375,11 @@ static verdict check_new_build(NSString *flavor, NSString *image, NSString *prod
 // with no row for its build (#134, "Invalid schema … StartupFiles", issue #36). `tags`: the kept row's Tags for a
 // game whose region the device decides (sp_region_tags), nil for the Mac's (its own row's are kept). The new
 // image's path, or nil and *why.
-static NSString *update(NSString *flavor, NSString *product, NSString *region, NSString *tags,
+static NSString *update(NSString *flavor, NSString *product, NSString *region, NSString *tags, BOOL guest,
                         NSDictionary<NSString *, NSString *> *row, void (^pump)(double), NSString **why) {
     NSString *home = NSHomeDirectory(), *name = [@"wow-" stringByAppendingString:flavor];
-    NSData *slice = [NSData dataWithContentsOfFile:[home stringByAppendingPathComponent:
-                                                    [NSString stringWithFormat:@"Library/spslice/%@.arm64", flavor]]
-                                           options:NSDataReadingMappedIfSafe error:nil];
+    NSString *slicePath = [home stringByAppendingPathComponent:[NSString stringWithFormat:@"Library/spslice/%@.arm64", flavor]];
+    NSData *slice = [NSData dataWithContentsOfFile:slicePath options:NSDataReadingMappedIfSafe error:nil];
     NSString *map = [NSString stringWithContentsOfFile:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"rewrite-map.txt"]
                                               encoding:NSUTF8StringEncoding error:nil];
     if (!slice || !map) {
@@ -410,46 +411,58 @@ static NSString *update(NSString *flavor, NSString *product, NSString *region, N
     }
     say_update([NSString stringWithFormat:@"configs: %u fetched (%.1f KB), %u already there, %.1f s", fetched, bytes / 1e3, kept, now() - t]);
 
-    uint32_t platform = 0, minOS = 0;
-    sp_launch_build_version(&platform, &minOS);
-    t = now();
-    NSArray<NSString *> *changes = nil;
-    NSData *image = sp_assemble(slice, map, platform, minOS, &changes, &problem);
-    if (!image) {
-        *why = [@"its image couldn't be made: " stringByAppendingString:problem];
-        return nil;
-    }
-    say_update([NSString stringWithFormat:@"assembled %.1f MB in %.3f s (%lu retype changes)", image.length / 1e6, now() - t,
-                                   (unsigned long)changes.count]);
-    NSString *unsignedImage = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"spunsigned-" stringByAppendingString:name]];
-    if (![image writeToFile:unsignedImage atomically:YES]) {
-        *why = @"its image couldn't be written";
-        return nil;
-    }
-    image = nil;
     NSString *dir = [home stringByAppendingPathComponent:@"Library/spgames"];
-    NSString *dest = [dir stringByAppendingPathComponent:name], *signing = [dest stringByAppendingString:@".signing"];
+    NSString *dest = [dir stringByAppendingPathComponent:name], *staged = [dest stringByAppendingString:@".signing"];
     NSString *stamp = [dir stringByAppendingPathComponent:[@"spbuild-" stringByAppendingString:flavor]];
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    t = now();
-    BOOL ok = sp_sign_with_identity(unsignedImage, signing, &problem);
-    [NSFileManager.defaultManager removeItemAtPath:unsignedImage error:nil];
-    if (!ok) {
-        *why = [@"its image couldn't be signed: " stringByAppendingString:problem];
-        return nil;
+    if (guest) {
+        char error[256];
+        if (!spguest_check_file(slicePath.fileSystemRepresentation, error, sizeof error)) {
+            *why = @(error);
+            return nil;
+        }
+        if (![slice writeToFile:staged atomically:YES]) {
+            *why = @"the game client couldn't be written";
+            return nil;
+        }
+    } else {
+        uint32_t platform = 0, minOS = 0;
+        sp_launch_build_version(&platform, &minOS);
+        t = now();
+        NSArray<NSString *> *changes = nil;
+        NSData *image = sp_assemble(slice, map, platform, minOS, &changes, &problem);
+        if (!image) {
+            *why = [@"its image couldn't be made: " stringByAppendingString:problem];
+            return nil;
+        }
+        say_update([NSString stringWithFormat:@"assembled %.1f MB in %.3f s (%lu retype changes)", image.length / 1e6, now() - t,
+                                       (unsigned long)changes.count]);
+        NSString *unsignedImage = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"spunsigned-" stringByAppendingString:name]];
+        if (![image writeToFile:unsignedImage atomically:YES]) {
+            *why = @"its image couldn't be written";
+            return nil;
+        }
+        image = nil;
+        t = now();
+        BOOL ok = sp_sign_with_identity(unsignedImage, staged, &problem);
+        [NSFileManager.defaultManager removeItemAtPath:unsignedImage error:nil];
+        if (!ok) {
+            *why = [@"its image couldn't be signed: " stringByAppendingString:problem];
+            return nil;
+        }
+        say_update([NSString stringWithFormat:@"signed in %.3f s", now() - t]);
     }
-    say_update([NSString stringWithFormat:@"signed in %.3f s", now() - t]);
     // Into place: an older update's stamp goes first, and this one's comes last, after the row it keeps.
     [NSFileManager.defaultManager removeItemAtPath:stamp error:nil];
     NSString *keptRow = [dir stringByAppendingPathComponent:[@"spbuildinfo-" stringByAppendingString:flavor]];
     if (![sp_build_info_with(nil, product, region, tags, row, cdnsRow) writeToFile:keptRow atomically:YES encoding:NSUTF8StringEncoding
                                                                        error:nil]) {
-        [NSFileManager.defaultManager removeItemAtPath:signing error:nil];
+        [NSFileManager.defaultManager removeItemAtPath:staged error:nil];
         *why = @"its .build.info row couldn't be kept";
         return nil;
     }
-    if (rename(signing.fileSystemRepresentation, dest.fileSystemRepresentation)) {
-        [NSFileManager.defaultManager removeItemAtPath:signing error:nil];
+    if (rename(staged.fileSystemRepresentation, dest.fileSystemRepresentation)) {
+        [NSFileManager.defaultManager removeItemAtPath:staged error:nil];
         *why = [NSString stringWithFormat:@"its image couldn't be put in place (errno %d)", errno];
         return nil;
     }
@@ -553,13 +566,13 @@ static NSDictionary<NSString *, NSString *> *current_row(NSString *product, NSSt
     return row;
 }
 
-// Installs a game the device has no image of (an app built without them: sp_games' installable ones), with
+// Installs a game the device has no client for (an app built without them: sp_games' installable ones), with
 // the update's chain from nothing: the patch service's current build in the game's region (`choice`,
 // sp_game_region: the region file, else the device's region and languages), its
 // slice fetched (asking first on a costly network) and its imports checked (check_new_build), then its configs,
-// image, and stamp made and signed here (update); the launcher writes the game's .flavor.info (flavor_info). Its
-// screen says each step; there's no Play Anyway, as there's nothing else to play. A signing identity is checked
-// first, before anything is downloaded: without one it says what's missing (no_identity). The screen names the
+// client, and stamp stored here (update); the launcher writes the game's .flavor.info (flavor_info). Its
+// screen says each step; there's no Play Anyway, as there's nothing else to play. Without a usable signing
+// identity the unchanged client is kept for spguest. The screen names the
 // region ("Installing Classic Era for Europe"), and once the build is checked the region and its languages,
 // checked against the locales the build ships, go into Library/spregion-<flavor> (settle_region), which the
 // game follows from then on until Settings changes it.
@@ -600,11 +613,13 @@ NSString *sp_patch_install(NSString *flavor, NSDictionary<NSString *, NSString *
                            : [NSString stringWithFormat:@"%@ %@", title, body];
     };
     NSString *cant = [NSString stringWithFormat:@"%@ can't be installed on this %@.", game, noun];
-    if (!sp_identity_usable()) {
-        NSString *line = nil, *body = no_identity(&line);
-        say([@"install: message: no identity to sign it with: " stringByAppendingString:line]);
-        *problem = failed(cant, body, nil);
-        return nil;
+    BOOL guest = !sp_identity_usable();
+    if (guest) {
+        NSString *hooks = sp_guest_hooks_problem();
+        if (hooks) {
+            *problem = failed(cant, hooks, nil);
+            return nil;
+        }
     }
     [screen setHeading:heading body:@"Asking Blizzard for the current version…" note:nil buttons:@[]];
     NSString *why = nil;
@@ -629,11 +644,11 @@ NSString *sp_patch_install(NSString *flavor, NSDictionary<NSString *, NSString *
         *problem = failed(cant, @"Whether Slashplayed can run it couldn't be checked. Try again on Wi-Fi.", sentence(why));
         return nil;
     }
-    [screen setHeading:heading body:[NSString stringWithFormat:@"Making it and signing it on this %@.", noun] note:nil buttons:@[]];
+    [screen setHeading:heading body:guest ? @"Preparing the game client…" : [NSString stringWithFormat:@"Making it and signing it on this %@.", noun] note:nil buttons:@[]];
     double t = now();
     // The languages checked against the build's before its row is kept with them.
     NSDictionary<NSString *, NSString *> *settled = settle_region(flavor, choice, shipped);
-    NSString *image = update(flavor, product, region, sp_region_tags(region, settled[@"Text"], settled[@"Speech"]), row, ui, &why);
+    NSString *image = update(flavor, product, region, sp_region_tags(region, settled[@"Text"], settled[@"Speech"]), guest, row, ui, &why);
     if (!image) {
         say([NSString stringWithFormat:@"install: failed after %.1f s: %@", now() - t, why]);
         *problem = failed(cant, @"Try again later.", sentence(why));
@@ -661,9 +676,8 @@ NSString *sp_patch_install(NSString *flavor, NSDictionary<NSString *, NSString *
 // Which image: the updated one when its build is the patch service's current one, or when the service
 // couldn't be asked and it's a later version than the bundled one; otherwise the bundled one. A newer build
 // out than the one that would load shows the screen. When the new build binds and the device has a signing
-// identity (sp_identity_usable), the screen offers Update: the new image is made and signed here (update)
-// and is the one returned, its .build.info row kept beside it for the launcher to write once it has loaded.
-// Without an identity, 6.1's screen: the companion brings the new version.
+// identity (sp_identity_usable) or already uses spguest, the screen offers Update. The new client is
+// returned with its .build.info row beside it, for the launcher to write once it has loaded.
 //
 // One line of log for the outcome, one for the message shown, and one for the image chosen (update: image:),
 // versions only. Sets *pump to UIKit's when it shows its screen.
@@ -733,7 +747,8 @@ NSString *sp_patch_check(NSString *flavor, NSString *bundled, NSDictionary<NSStr
     NSString *why = nil;
     NSArray<NSString *> *shipped = nil;
     verdict v = check_new_build(flavor, base, product, region, row, screen, heading, has, *pump, &shipped, &why);
-    BOOL here = v == binds && sp_identity_usable();
+    BOOL guest = !bundled && spguest_check_file(library.fileSystemRepresentation, NULL, 0);
+    BOOL here = v == binds && (guest || sp_identity_usable());
     if (v == needs_update) {
         say([NSString stringWithFormat:@"message: needs a Slashplayed update: %@ %@ doesn't bind, the image is %@", product,
                                        version, stamp[@"Version"]]);
@@ -742,11 +757,12 @@ NSString *sp_patch_check(NSString *flavor, NSString *bundled, NSDictionary<NSStr
                       note:has
                    buttons:@[@"Play Anyway"]];
     } else if (here) {
-        say([NSString stringWithFormat:@"message: update here: %@ %@ binds, the image is %@, and this device can sign", product,
-                                       version, stamp[@"Version"]]);
+        say([NSString stringWithFormat:@"message: update here: %@ %@ binds, the image is %@, and this device can %@", product,
+                                       version, stamp[@"Version"], guest ? @"load the client with spguest" : @"sign"]);
         [screen setHeading:heading
                       // A game installed here (no bundled image): the Mac doesn't come into it.
-                      body:bundled ? [NSString stringWithFormat:@"This %@ can update itself in a few seconds, signed with the key "
+                      body:guest ? @"Download the new game client to update it on this device."
+                                 : bundled ? [NSString stringWithFormat:@"This %@ can update itself in a few seconds, signed with the key "
                                                                 @"your Mac sent it. Or press Play in Slashplayed Companion on your Mac.", noun]
                                    : [NSString stringWithFormat:@"This %@ can update itself in a few seconds, signed with its key.", noun]
                       note:has
@@ -774,13 +790,13 @@ NSString *sp_patch_check(NSString *flavor, NSString *bundled, NSDictionary<NSStr
         // The companion follows this line as it does Play Anyway's (ClientLauncher.Marker.update).
         say(@"Update");
         [screen setHeading:[NSString stringWithFormat:@"Updating %@ to %@…", game, version]
-                      body:[NSString stringWithFormat:@"Making the new version and signing it on this %@.", noun]
+                      body:guest ? @"Preparing the new game client…" : [NSString stringWithFormat:@"Making the new version and signing it on this %@.", noun]
                       note:nil
                    buttons:@[]];
         t = now();
         NSDictionary<NSString *, NSString *> *settled = device ? settle_region(flavor, choice, shipped) : nil;
         NSString *image = update(flavor, product, region, device ? sp_region_tags(region, settled[@"Text"], settled[@"Speech"]) : nil,
-                                 row, *pump, &why);
+                                 guest, row, *pump, &why);
         if (image) {
             say_update([NSString stringWithFormat:@"%@ %@ is Library/spgames/%@, %.1f s in all", product, version,
                                            image.lastPathComponent, now() - t]);
