@@ -14,3 +14,5 @@ if [[ -f tests/test_bc_layout.c ]]; then
   "${CC:-cc}" "${flags[@]}" spbcdecode.c spbclayout.c tests/test_bc_layout.c -o "$out/layout"
   "$out/layout"
 fi
+"${CC:-cc}" "${flags[@]}" spbcstaging.c tests/test_bc_staging.c -o "$out/staging"
+"$out/staging"

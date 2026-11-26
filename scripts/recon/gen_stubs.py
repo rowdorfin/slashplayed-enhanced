@@ -768,7 +768,7 @@ def gen_shim(lib, records, chains, xros_classes, shim_dir):
 
 
 # Compile the portable C sources directly, with the same sources as the host tests.
-EXTRA_SOURCES = {"libspMetal": ("shims/metal/spbcdecode.c", "shims/metal/spbclayout.c")}
+EXTRA_SOURCES = {"libspMetal": ("shims/metal/spbcdecode.c", "shims/metal/spbclayout.c", "shims/metal/spbcstaging.c")}
 
 
 def shim_build_line(name, link, shim_dir):

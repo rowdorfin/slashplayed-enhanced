@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #import <ptrauth.h>
 #import "spbclayout.h"
+#import "spbcstaging.h"
 
 #define RETAINED __attribute__((ns_returns_retained))
 
@@ -59,11 +60,20 @@ typedef enum {
 
 static _Atomic unsigned long long spBCUnsupported[SPBCUnsupportedCount];
 static _Atomic unsigned long long spBCFormats[24], spBCCompressed, spBCDecoded;
-static _Atomic unsigned long long spBCStagingReserved, spBCReservedPeak, spBCDecodeTicks, spBCMaxTicks;
+static _Atomic unsigned long long spBCDecodeTicks, spBCMaxTicks;
 static _Atomic unsigned long long spBCStagingLive, spBCStagingPeak;
-static _Atomic unsigned long long spBCStagingFailures, spBCTextureFailures;
+static _Atomic unsigned long long spBCMetalAllocationFailures, spBCCPUAllocationFailures, spBCLayoutFailures, spBCDropped;
+static _Atomic unsigned long long spBCTextureFailures;
 static NSHashTable<id<MTLHeap>> *spBCHeaps;
 static _Atomic unsigned long long spBCSizingQueries;
+
+static SPBCStaging spBCStaging;
+static NSCondition *spBCStagingCondition(void) {
+    static NSCondition *condition;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ condition = [NSCondition new]; });
+    return condition;
+}
 
 static void spBCMax(_Atomic unsigned long long *maximum, unsigned long long value) {
     unsigned long long previous = atomic_load(maximum);
@@ -127,21 +137,35 @@ static void spBCSummary(id<MTLDevice> device) {
         unsigned long long n = atomic_load(&spBCUnsupported[i]);
         if (n) [unsupported appendFormat:@"%u=%llu,", i, n];
     }
+    NSCondition *condition = spBCStagingCondition();
+    [condition lock];
+    SPBCStaging staging = spBCStaging;
+    [condition unlock];
+    // Keep the legacy failure key for allocation failures. Soft-limit hits
+    // can now complete successfully and are reported separately.
+    unsigned long long metalFailures = atomic_load(&spBCMetalAllocationFailures);
+    unsigned long long cpuFailures = atomic_load(&spBCCPUAllocationFailures);
     spBCLog(@"SP_BC_FALLBACK summary textures=%llu textureFrees=%llu textureLive=%llu textureLiveBytes=%llu "
             @"sizingQueries=%llu formats=%@ compressed=%llu decoded=%llu stagingLiveBytes=%llu stagingPeakBytes=%llu "
             @"stagingReserved=%llu stagingReservedPeak=%llu decodeTicks=%llu maxDecodeTicks=%llu unsupported=%@ "
             @"stagingFailures=%llu textureFailures=%llu heaps=%lu heapBytes=%llu "
             @"heapCurrentAllocatedSize=%llu heapAllocatedSamples=%lu heapUsedSize=%llu heapUsedSamples=%lu "
-            @"deviceCurrentAllocatedSize=%@ phys_footprint=%@ os_proc_available_memory=%zu",
+            @"deviceCurrentAllocatedSize=%@ phys_footprint=%@ os_proc_available_memory=%zu "
+            @"stagingLimitHits=%llu metalAllocationFailures=%llu cpuAllocationFailures=%llu layoutFailures=%llu "
+            @"dropped=%llu pendingUploads=%llu pendingBytes=%llu inFlightUploads=%llu inFlightBytes=%llu "
+            @"scratchBytes=%llu overLimit=%llu overLimitBytes=%llu",
             textures.allocated, textures.freed, textures.allocated - textures.freed, textures.liveBytes,
             atomic_load(&spBCSizingQueries), formats, atomic_load(&spBCCompressed), atomic_load(&spBCDecoded),
             atomic_load(&spBCStagingLive),
-            atomic_load(&spBCStagingPeak), atomic_load(&spBCStagingReserved), atomic_load(&spBCReservedPeak),
+            atomic_load(&spBCStagingPeak), SPBCStagingReserved(&staging), staging.reservedPeak,
             atomic_load(&spBCDecodeTicks), atomic_load(&spBCMaxTicks), unsupported,
-            atomic_load(&spBCStagingFailures), atomic_load(&spBCTextureFailures), (unsigned long)heaps.count,
+            metalFailures + cpuFailures, atomic_load(&spBCTextureFailures), (unsigned long)heaps.count,
             heapBytes, heapAllocated, (unsigned long)allocatedSamples, heapUsed, (unsigned long)usedSamples,
             haveDeviceSize ? @(device.currentAllocatedSize) : @"n/a",
-            haveFootprint ? @(vm.phys_footprint) : @"n/a", os_proc_available_memory());
+            haveFootprint ? @(vm.phys_footprint) : @"n/a", os_proc_available_memory(),
+            staging.limitHits, metalFailures, cpuFailures, atomic_load(&spBCLayoutFailures),
+            atomic_load(&spBCDropped), staging.pending.uploads, staging.pending.bytes, staging.inFlight.uploads,
+            staging.inFlight.bytes, staging.scratchBytes, staging.overLimit, staging.overLimitBytes);
 }
 
 static void spBCStartSummary(id<MTLDevice> device) {
@@ -253,21 +277,34 @@ static bool spBCRegion(id<MTLTexture> texture, NSUInteger level, NSUInteger slic
     return true;
 }
 
-enum { SPBCTileLimit = 4 * 1024 * 1024, SPBCStagingLimit = 128 * 1024 * 1024 };
+enum { SPBCTileLimit = 4 * 1024 * 1024 };
 
-static bool spBCReserve(size_t bytes) {
-    unsigned long long live = atomic_load(&spBCStagingReserved);
-    do {
-        if (bytes > SPBCStagingLimit - live) return false;
-    } while (!atomic_compare_exchange_weak(&spBCStagingReserved, &live, live + bytes));
-    spBCMax(&spBCReservedPeak, live + bytes);
-    return true;
+static void spBCReserve(SPBCStagingReservation *reservation, size_t bytes, NSDate *deadline) {
+    NSCondition *condition = spBCStagingCondition();
+    [condition lock];
+    if (!SPBCStagingFits(&spBCStaging, bytes)) {
+        spBCStaging.limitHits++;
+        // Only committed uploads can make progress while this encoder waits.
+        // The condition releases its lock while asleep and shares one deadline
+        // across the whole upload, including any allocation retry.
+        while (!SPBCStagingFits(&spBCStaging, bytes) && SPBCStagingCanWait(&spBCStaging, bytes)) {
+            if (![condition waitUntilDate:deadline]) break;
+        }
+    }
+    SPBCStagingReserve(&spBCStaging, reservation, bytes);
+    [condition unlock];
 }
 
-static void spBCStagingFailure(void) {
-    unsigned long long count = atomic_fetch_add(&spBCStagingFailures, 1) + 1;
+static void spBCDrop(SEL selector, const char *reason) {
+    unsigned long long count = atomic_fetch_add(&spBCDropped, 1) + 1;
     if (!(count & (count - 1)))
-        spBCLog(@"SP_BC_FALLBACK staging allocation or reservation failed count=%llu", count);
+        spBCLog(@"SP_BC_FALLBACK upload dropped selector=%s reason=%s count=%llu",
+                sel_getName(selector), reason, count);
+}
+
+static void spBCDropLayout(SEL selector) {
+    atomic_fetch_add(&spBCLayoutFailures, 1);
+    spBCDrop(selector, "invalid upload layout");
 }
 
 static bool spBCDecodeTile(SPBCKind kind, const uint8_t *source, SPBCLayout layout,
@@ -287,11 +324,13 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
     if (texture.storageMode == MTLStorageModePrivate) {
         spBCReject(implicitImage ? SPBCPrivateReplace : SPBCPrivateReplaceSlice, selector, info.requested,
                    "Private texture requires a blit upload");
+        spBCDrop(selector, "private texture");
         return;
     }
     size_t rows = SPBCBlockCount(region.size.height);
     if (implicitImage && (!rows || row > SIZE_MAX / rows)) {
         spBCReject(SPBCReplace, selector, info.requested, "invalid implicit image pitch");
+        spBCDropLayout(selector);
         return;
     }
     if (implicitImage) image = row * rows;
@@ -300,22 +339,33 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
     if (!source || !spBCRegion(texture, level, slice, &mip) ||
         !SPBCMakeLayout(info.kind, mip, spBCOrigin(region.origin), spBCSize(region.size), 0, row, image, &layout)) {
         spBCReject(implicitImage ? SPBCReplace : SPBCReplaceSlice, selector, info.requested, "invalid region or pitch");
+        spBCDropLayout(selector);
         return;
     }
     SPBCOrigin cursor = {0};
     SPBCTile tile;
-    if (!SPBCNextTile(info.kind, layout.size, 1, SPBCTileLimit, &cursor, &tile)) return;
-    size_t capacity = tile.bytes;
-    if (!spBCReserve(capacity)) { spBCStagingFailure(); return; }
-    uint8_t *decoded = malloc(capacity);
-    if (!decoded) {
-        atomic_fetch_sub(&spBCStagingReserved, capacity);
-        spBCStagingFailure();
+    if (!SPBCNextTile(info.kind, layout.size, 1, SPBCTileLimit, &cursor, &tile)) {
+        spBCDropLayout(selector);
         return;
     }
+    size_t capacity = tile.bytes;
+    uint8_t *decoded = malloc(capacity);
+    if (!decoded) {
+        atomic_fetch_add(&spBCCPUAllocationFailures, 1);
+        spBCDrop(selector, "CPU scratch allocation failed");
+        return;
+    }
+    // One synchronous scratch tile is reused across the whole replaceRegion.
+    NSCondition *condition = spBCStagingCondition();
+    [condition lock];
+    SPBCStagingAddScratch(&spBCStaging, capacity);
+    [condition unlock];
     ReplaceRegion real = (ReplaceRegion)superIMP(texture, replaceSlice());
     do {
-        if (!spBCDecodeTile(info.kind, source, layout, tile, decoded)) break;
+        if (!spBCDecodeTile(info.kind, source, layout, tile, decoded)) {
+            spBCDropLayout(selector);
+            break;
+        }
         MTLRegion part = spBCPart(region.origin, tile);
         insideTexture++;
         real(texture, replaceSlice(), part, level, slice, decoded, tile.row,
@@ -323,7 +373,9 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
         insideTexture--;
     } while (SPBCNextTile(info.kind, layout.size, 1, SPBCTileLimit, &cursor, &tile));
     free(decoded);
-    atomic_fetch_sub(&spBCStagingReserved, capacity);
+    [condition lock];
+    SPBCStagingReleaseScratch(&spBCStaging, capacity);
+    [condition unlock];
 }
 
 static void textureReplaceSlice(id self, SEL selector, MTLRegion region, NSUInteger level, NSUInteger slice,
@@ -678,7 +730,7 @@ static id newHeap(id device, SEL selector, MTLHeapDescriptor *descriptor) {
 }
 
 // Count the buffer until Metal releases it too. The reservation separately
-// follows the shim upload and still governs the existing scratch/staging cap.
+// follows the shim upload and governs admission to the soft staging budget.
 static char spBCStagingKey;
 @interface SPBCStagingInfo : NSObject {
 @public
@@ -697,28 +749,70 @@ static void spBCTrackStaging(id<MTLBuffer> buffer) {
     objc_setAssociatedObject(buffer, &spBCStagingKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+@interface SPBCUploadTile : NSObject {
+@public
+    id<MTLBuffer> staging;
+    SPBCTile tile;
+}
+@end
+@implementation SPBCUploadTile @end
+
 @interface SPBCUpload : NSObject {
 @public
-    id<MTLBuffer> source, staging;
+    id<MTLBuffer> source;
     id<MTLTexture> destination;
+    NSMutableArray<SPBCUploadTile *> *tiles;
     SPBCLayout layout;
-    SPBCTile tile;
     SPBCKind kind;
+    SEL uploadSelector;
+    SPBCStagingReservation reservation;
 }
 - (void)decode;
+- (void)releaseStaging;
 @end
 
 @implementation SPBCUpload
 - (void)decode {
-    spBCDecodeTile(kind, source.contents, layout, tile, staging.contents);
+    const uint8_t *bytes = source.contents;
+    for (SPBCUploadTile *part in tiles) {
+        if (!spBCDecodeTile(kind, bytes, layout, part->tile, part->staging.contents)) {
+            spBCDropLayout(uploadSelector);
+            break;
+        }
+    }
     source = nil;  // The GPU reads staging; the source is only needed through commit.
 }
-- (void)dealloc {
-    size_t bytes = tile.bytes;
-    staging = nil;
-    if (bytes) atomic_fetch_sub(&spBCStagingReserved, bytes);
+- (void)releaseStaging {
+    // Release the shim's Metal references before publishing reusable capacity,
+    // even if Metal still retains the command buffer or its resources.
+    [tiles removeAllObjects];
+    destination = nil;
+    NSCondition *condition = spBCStagingCondition();
+    [condition lock];
+    if (reservation.phase != SPBCStagingReleased) {
+        SPBCStagingRelease(&spBCStaging, &reservation);
+        [condition broadcast];
+    }
+    [condition unlock];
 }
+- (void)dealloc { [self releaseStaging]; }
 @end
+
+static id<MTLBuffer> spBCAllocateStaging(id<MTLDevice> device, size_t bytes, NSDate *deadline) {
+    id<MTLBuffer> buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    if (buffer) return buffer;
+    atomic_fetch_add(&spBCMetalAllocationFailures, 1);
+
+    NSCondition *condition = spBCStagingCondition();
+    [condition lock];
+    bool released = spBCStaging.inFlight.bytes && [condition waitUntilDate:deadline];
+    [condition unlock];
+    if (released) {
+        buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!buffer) atomic_fetch_add(&spBCMetalAllocationFailures, 1);
+    }
+    return buffer;
+}
 
 static char uploadsKey, ownerKey;
 @interface SPBCOwner : NSObject
@@ -751,15 +845,22 @@ static void commitCommandBuffer(id<MTLCommandBuffer> commandBuffer, SEL selector
     }
     if (pending.count) {
         for (SPBCUpload *upload in pending) [upload decode];
-        // Drop staging at completion even if the command buffer outlives the handler.
         __block NSArray<SPBCUpload *> *retained = pending;
         [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> done) {
             (void)done;
-            (void)retained;
+            for (SPBCUpload *upload in retained) [upload releaseStaging];
             retained = nil;
         }];
     }
     ((void (*)(id, SEL))original(commandBuffer, selector))(commandBuffer, selector);
+    if (pending.count) {
+        // Publish eligibility to wait only after the real commit has returned.
+        // Completion may already have released some or all reservations.
+        NSCondition *condition = spBCStagingCondition();
+        [condition lock];
+        for (SPBCUpload *upload in pending) SPBCStagingSubmit(&spBCStaging, &upload->reservation);
+        [condition unlock];
+    }
 }
 
 typedef void (*BufferToTexture)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger, MTLSize, id, NSUInteger, NSUInteger, MTLOrigin);
@@ -772,37 +873,69 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
     if (source.storageMode == MTLStorageModePrivate || !source.contents) {
         spBCReject(withOptions ? SPBCPrivateSourceOptions : SPBCPrivateSource, selector, info.requested,
                    "source buffer is not CPU visible");
+        spBCDrop(selector, "source buffer is not CPU visible");
         return;
     }
     SPBCOwner *owner = objc_getAssociatedObject(encoder, &ownerKey);
     id<MTLCommandBuffer> commandBuffer = owner.commandBuffer;
+    SPBCUnsupported operation = withOptions ? SPBCBufferCopyOptions : SPBCBufferCopy;
+    if (!commandBuffer || options) {
+        const char *reason = commandBuffer ? "unsupported blit options" : "missing command buffer";
+        spBCReject(operation, selector, info.requested, reason);
+        spBCDrop(selector, reason);
+        return;
+    }
     SPBCSize mip;
     SPBCLayout layout;
-    if (!commandBuffer || options || !spBCRegion(texture, level, slice, &mip) ||
+    if (!spBCRegion(texture, level, slice, &mip) ||
         !SPBCMakeLayout(info.kind, mip, spBCOrigin(origin), spBCSize(size), offset, row, image, &layout) ||
         layout.end > source.length) {
-        spBCReject(withOptions ? SPBCBufferCopyOptions : SPBCBufferCopy, selector, info.requested,
-                   "invalid command buffer, region, pitch, source range, or blit options");
+        spBCReject(operation, selector, info.requested, "invalid region, pitch, or source range");
+        spBCDropLayout(selector);
         return;
     }
 
-    // Allocate the entire batch before encoding its first tile. A failed
-    // reservation or allocation drops the operation without leaving a partial copy.
-    NSMutableArray<SPBCUpload *> *batch = [NSMutableArray new];
+    // Reserve once for the whole copy. Waiting between tiles would keep this
+    // uncommitted copy's allocations live and repeat the stall for each tile.
+    size_t bytes = 0;
     SPBCOrigin cursor = {0};
     SPBCTile tile;
     while (SPBCNextTile(info.kind, layout.size, 256, SPBCTileLimit, &cursor, &tile)) {
-        if (!spBCReserve(tile.bytes)) { spBCStagingFailure(); return; }
-        SPBCUpload *upload = [SPBCUpload new];
-        upload->tile = tile;
-        upload->staging = [texture.device newBufferWithLength:tile.bytes options:MTLResourceStorageModeShared];
-        if (!upload->staging) { spBCStagingFailure(); return; }
-        spBCTrackStaging(upload->staging);
-        upload->source = source;
-        upload->destination = texture;
-        upload->layout = layout;
-        upload->kind = info.kind;
-        [batch addObject:upload];
+        if (tile.bytes > SIZE_MAX - bytes) {
+            spBCDropLayout(selector);
+            return;
+        }
+        bytes += tile.bytes;
+    }
+    if (!bytes) {
+        spBCDropLayout(selector);
+        return;
+    }
+
+    SPBCUpload *upload = [SPBCUpload new];
+    upload->source = source;
+    upload->destination = texture;
+    upload->layout = layout;
+    upload->kind = info.kind;
+    upload->uploadSelector = selector;
+    upload->tiles = [NSMutableArray new];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.002];
+    spBCReserve(&upload->reservation, bytes, deadline);
+
+    // Allocate all tiles for this copy before encoding it. Once a blit is
+    // encoded it cannot be rolled back if a later tile fails to allocate.
+    cursor = (SPBCOrigin){0};
+    while (SPBCNextTile(info.kind, layout.size, 256, SPBCTileLimit, &cursor, &tile)) {
+        SPBCUploadTile *part = [SPBCUploadTile new];
+        part->tile = tile;
+        part->staging = spBCAllocateStaging(texture.device, tile.bytes, deadline);
+        if (!part->staging) {
+            [upload releaseStaging];
+            spBCDrop(selector, "Metal staging allocation failed");
+            return;
+        }
+        spBCTrackStaging(part->staging);
+        [upload->tiles addObject:part];
     }
     @synchronized (commandBuffer) {
         NSMutableArray *pending = objc_getAssociatedObject(commandBuffer, &uploadsKey);
@@ -810,18 +943,18 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
             pending = [NSMutableArray new];
             objc_setAssociatedObject(commandBuffer, &uploadsKey, pending, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        [pending addObjectsFromArray:batch];
+        [pending addObject:upload];
     }
     IMP real = original(encoder, selector);
     insideTexture++;
-    for (SPBCUpload *upload in batch) {
-        MTLRegion part = spBCPart(origin, upload->tile);
+    for (SPBCUploadTile *part in upload->tiles) {
+        MTLRegion region = spBCPart(origin, part->tile);
         if (withOptions)
-            ((BufferToTextureOptions)real)(encoder, selector, upload->staging, 0, upload->tile.row, upload->tile.bytes,
-                                           part.size, texture, slice, level, part.origin, options);
+            ((BufferToTextureOptions)real)(encoder, selector, part->staging, 0, part->tile.row, part->tile.bytes,
+                                           region.size, texture, slice, level, region.origin, options);
         else
-            ((BufferToTexture)real)(encoder, selector, upload->staging, 0, upload->tile.row, upload->tile.bytes,
-                                    part.size, texture, slice, level, part.origin);
+            ((BufferToTexture)real)(encoder, selector, part->staging, 0, part->tile.row, part->tile.bytes,
+                                    region.size, texture, slice, level, region.origin);
     }
     insideTexture--;
 }
