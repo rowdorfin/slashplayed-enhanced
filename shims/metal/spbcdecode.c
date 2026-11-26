@@ -102,8 +102,10 @@ static void decode_bc1(const uint8_t *block, uint8_t *out, size_t rowBytes) {
     color_palette(block, false, palette);
 #if defined(__aarch64__)
     uint8x16_t colors = vld1q_u8((const uint8_t *)palette);
-    int8x16_t shift = vld1q_s8((const int8_t[]){0,0,0,0,-2,-2,-2,-2,-4,-4,-4,-4,-6,-6,-6,-6});
-    uint8x16_t channel = vld1q_u8((const uint8_t[]){0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3});
+    static const int8_t shifts[16] = {0,0,0,0,-2,-2,-2,-2,-4,-4,-4,-4,-6,-6,-6,-6};
+    static const uint8_t channels[16] = {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3};
+    int8x16_t shift = vld1q_s8(shifts);
+    uint8x16_t channel = vld1q_u8(channels);
 #endif
     for (unsigned y = 0; y < 4; y++) {
         unsigned indices = block[4 + y];
