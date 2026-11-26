@@ -1009,6 +1009,8 @@ static BOOL sp_physical_touch(UITouch *touch) {
 
 - (void)sp_suspend_touch:(NSNotification *)notification {
     if ([notification.object isKindOfClass:UIScene.class] && notification.object != self.window.windowScene) return;
+    // Logged because a stray deactivation drops every touch until the next activation.
+    sp_stub_log([NSString stringWithFormat:@"input: suspended by %@", notification.name ?: @"direct call"].UTF8String);
     [_touchChat close];
     [_thumbButton cancelHold];
     for (SPKeyboardButton *button in _keyboardButtons) [button cancelInput];
@@ -1028,6 +1030,8 @@ static BOOL sp_physical_touch(UITouch *touch) {
 
 - (void)sp_resume_touch:(NSNotification *)notification {
     if ([notification.object isKindOfClass:UIScene.class] && notification.object != self.window.windowScene) return;
+    if (sp_input_suspended)
+        sp_stub_log([NSString stringWithFormat:@"input: resumed by %@", notification.name ?: @"direct call"].UTF8String);
     sp_input_suspended = NO;
     [_joystick setSuspended:NO];
     [self setNeedsLayout];

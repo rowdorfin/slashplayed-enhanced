@@ -29,7 +29,12 @@
 
 static NSUInteger sp_test_checks;
 static void sp_test_check(BOOL ok, NSString *message) {
-    if (!ok) @throw [NSException exceptionWithName:@"Thumb input test failed" reason:message userInfo:nil];
+    // The input state rides along so a CI failure says whether a deactivation or a latched button caused it.
+    if (!ok) @throw [NSException exceptionWithName:@"Thumb input test failed"
+                                            reason:[NSString stringWithFormat:@"%@ [suspended=%d buttons=%lu keys=%lu events=%lu]",
+                                                    message, sp_input_suspended, (unsigned long)sp_mouse_buttons,
+                                                    (unsigned long)sp_touch_keys.count, (unsigned long)sp_events.count]
+                                          userInfo:nil];
     sp_test_checks++;
 }
 static SPTestTouch *sp_test_touch(UIView *target, CGPoint at) {
