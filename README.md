@@ -18,6 +18,18 @@ The direction is deliberate UI and UX, refined on a real iPad: comfortable touch
 feedback, readable settings, and controls that stay where you put them. Each change should make
 playing feel more natural and the interface more finished.
 
+## Touch controls on the A16 branch
+
+On iPhone or iPad, open **Settings → Controls → Controles touchscreen** before starting the game.
+The switch (`sp_touch_controls_enabled`) defaults to off. Use the in-game **···** button to hide,
+show, or reposition the on-screen buttons. Settings saves the global scale and opacity and lets you
+choose which buttons appear. The stick sends WASD by default, and the number buttons use WoW's current
+key bindings. Tap WoW's original UI to left-click, hold or use two fingers to right-click, and drag
+with one finger to turn the camera. Use **+ / −** to zoom and **⌨** to open chat.
+
+The Enhanced footage and SPTouchBars features below describe the original Enhanced layout. The A16
+branch uses native touch controls over WoW's original action bars.
+
 ## What Enhanced adds
 
 | Area | In this fork |
@@ -144,11 +156,10 @@ In-game voice chat isn't supported on the device yet
 
 2. Follow [Building from source](CONTRIBUTING.md#setup) for the Xcode, Rust, and dependency setup.
    Build with `apps/companion/build.sh`, then open the companion in `build/companion/`.
-3. Use the companion's setup assistant to pair your device and install the app. SPTouchBars is bundled
-   for Forever; Bagnon downloads on first game launch. In game, open **Settings > AddOns > SPTouchBars**
-   or type `/sptouch` to arrange the touch bars.
-4. Sign in using the normal Slashplayed flow, then play from the device. A hardware keyboard is still
-   needed for game text entry. [The guide](docs/guide.md) covers setup and day-to-day use.
+3. Use the companion's setup assistant to pair your device and install the app. Bagnon downloads on
+   first game launch.
+4. Sign in using the normal Slashplayed flow, then play from the device. For touchscreen play, enable
+   **Controles touchscreen** in the launcher's Settings. [The guide](docs/guide.md) covers setup.
 
 Until an Enhanced update channel exists, rebuild from this fork to receive its changes. The inherited
 companion updater points to upstream Slashplayed; installing an upstream companion update replaces

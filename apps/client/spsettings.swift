@@ -49,8 +49,21 @@ private let joystickSizeKey = "sp_joystick_size"
 private let joystickDefaultSize = 156.0
 private let joystickSizeRange = 100.0...260.0
 // Optional keyboard overlays use the same literals and size limits as spkeys.m.
-private let keyboardButtons = [(name: "ctrl", label: "Ctrl"), (name: "shift", label: "Shift"),
-                               (name: "alt", label: "Alt"), (name: "space", label: "Space")]
+private let touchControlsKey = "sp_touch_controls_enabled"
+private let touchScaleKey = "sp_touch_controls_scale"
+private let touchOpacityKey = "sp_touch_controls_opacity"
+private let joystickAnalogKey = "sp_joystick_analog"
+private let keyboardButtons: [(name: String, label: String, enabled: Bool)] = [
+    ("ctrl", "Ctrl", false), ("shift", "Shift", false), ("alt", "Alt", false),
+    ("space", "Pular", true), ("tab", "Tab", true), ("chat", "Teclado do chat", true),
+    ("zoom_in", "Zoom +", true), ("zoom_out", "Zoom −", true),
+] + "1234567890".map { ("action_\($0)", String($0), true) }
+
+private func touchControlValue(_ key: String, in range: ClosedRange<Double>) -> Double {
+    let value = (UserDefaults.standard.object(forKey: key) as? NSNumber)?.doubleValue ?? 1
+    return value.isFinite ? min(range.upperBound, max(range.lowerBound, value)) : 1
+}
+
 private let keyboardSizeKey = "sp_keyboard_size"
 private let keyboardDefaultSize = 76.0
 private let keyboardSizeRange = 44.0...152.0
@@ -139,6 +152,10 @@ struct Snapshot {
     var chordRightFinger = false
     var thumbEnabled = true
     var thumbSize = thumbDefaultSize
+    var touchControls = false
+    var touchScale = 1.0
+    var touchOpacity = 1.0
+    var joystickAnalog = false
     var joystickEnabled = true
     var joystickSize = joystickDefaultSize
     var keyboardEnabled: Set<String> = []
@@ -183,10 +200,14 @@ final class Settings: ObservableObject {
         s.thumbEnabled = UserDefaults.standard.object(forKey: thumbEnabledKey) as? Bool ?? true
         let thumbSize = (UserDefaults.standard.object(forKey: thumbSizeKey) as? NSNumber)?.doubleValue ?? thumbDefaultSize
         s.thumbSize = thumbSize.isFinite ? min(thumbSizeRange.upperBound, max(thumbSizeRange.lowerBound, thumbSize)) : thumbDefaultSize
+        s.touchControls = UserDefaults.standard.bool(forKey: touchControlsKey)
+        s.touchScale = touchControlValue(touchScaleKey, in: 0.6...1.6)
+        s.touchOpacity = touchControlValue(touchOpacityKey, in: 0.2...1.0)
+        s.joystickAnalog = UserDefaults.standard.bool(forKey: joystickAnalogKey)
         s.joystickEnabled = UserDefaults.standard.object(forKey: joystickEnabledKey) as? Bool ?? true
         let joystickSize = (UserDefaults.standard.object(forKey: joystickSizeKey) as? NSNumber)?.doubleValue ?? joystickDefaultSize
         s.joystickSize = joystickSize.isFinite ? min(joystickSizeRange.upperBound, max(joystickSizeRange.lowerBound, joystickSize)) : joystickDefaultSize
-        s.keyboardEnabled = Set(keyboardButtons.filter { UserDefaults.standard.bool(forKey: "sp_\($0.name)_enabled") }.map(\.name))
+        s.keyboardEnabled = Set(keyboardButtons.filter { (UserDefaults.standard.object(forKey: "sp_\($0.name)_enabled") as? Bool ?? $0.enabled) }.map(\.name))
         let keyboardSize = (UserDefaults.standard.object(forKey: keyboardSizeKey) as? NSNumber)?.doubleValue ?? keyboardDefaultSize
         s.keyboardSize = keyboardSize.isFinite ? min(keyboardSizeRange.upperBound, max(keyboardSizeRange.lowerBound, keyboardSize)) : keyboardDefaultSize
         s.games = flavors.map { flavor in
@@ -454,10 +475,30 @@ struct SettingsView: View {
     #if !os(visionOS)
     private var controls: some View {
         Group {
-            Section("On-screen controls") {
+            Section {
+                Toggle("Controles touchscreen", isOn: Binding(get: { settings.now.touchControls }, set: {
+                    UserDefaults.standard.set($0, forKey: touchControlsKey)
+                    settings.reload()
+                }))
+                LabeledContent("Escala", value: "\(Int((settings.now.touchScale * 100).rounded()))%")
+                Slider(value: Binding(get: { settings.now.touchScale }, set: {
+                    settings.now.touchScale = $0
+                    UserDefaults.standard.set($0, forKey: touchScaleKey)
+                }), in: 0.6...1.6, step: 0.05)
+                .accessibilityLabel("Escala dos controles")
+                LabeledContent("Opacidade", value: "\(Int((settings.now.touchOpacity * 100).rounded()))%")
+                Slider(value: Binding(get: { settings.now.touchOpacity }, set: {
+                    settings.now.touchOpacity = $0
+                    UserDefaults.standard.set($0, forKey: touchOpacityKey)
+                }), in: 0.2...1.0, step: 0.05)
+                .accessibilityLabel("Opacidade dos controles")
                 controlLink("Joystick", icon: "circle.circle", page: .joystick, value: settings.now.joystickEnabled ? "On" : "Off")
                 controlLink("Right-click Button", icon: "cursorarrow.click", page: .rightClick, value: settings.now.thumbEnabled ? "On" : "Off")
                 controlLink("Keyboard Buttons", icon: "keyboard", page: .keyboard, value: "\(settings.now.keyboardEnabled.count) enabled")
+            } header: {
+                Text("On-screen controls")
+            } footer: {
+                Text("Desativados por padrão. Em jogo, use ··· para esconder, mostrar ou mover os botões.")
             }
             Section {
                 LabeledContent("Click With") {
@@ -643,6 +684,10 @@ struct SettingsView: View {
     #if !os(visionOS)
     private var joystick: some View {
         Section {
+            Toggle("Joystick analógico", isOn: Binding(get: { settings.now.joystickAnalog }, set: {
+                UserDefaults.standard.set($0, forKey: joystickAnalogKey)
+                settings.reload()
+            }))
             Toggle("Show Joystick", isOn: Binding(get: { settings.now.joystickEnabled }, set: {
                 UserDefaults.standard.set($0, forKey: joystickEnabledKey)
                 settings.reload()
@@ -663,7 +708,7 @@ struct SettingsView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Drag the stick to move your character. Hold the ↔ handle for two seconds until its border fills, then drag to reposition. Lift to lock it again.")
-                Text("An invisible margin absorbs stray finger touches. The game needs controller support enabled. If the joystick shows !, turn it off and on. Size and position are saved on this device.")
+                Text("Por padrão, o joystick envia WASD, inclusive nas diagonais. O modo analógico requer suporte a controle no jogo.")
             }
         }
     }
@@ -696,7 +741,7 @@ struct SettingsView: View {
             Text("Layout")
         } footer: {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Hold Ctrl, Shift, or Alt while using a finger, Apple Pencil, R, or another key. Drag a modifier square to move it.")
+                Text("Segure Ctrl, Shift ou Alt para modificar outra entrada. Toque duas vezes para travar e toque novamente para soltar. Use ··· → Mover botões para ajustar as posições sem acionar teclas.")
                 Text("Press anywhere in Space’s circle to jump. Hold still for two seconds while the ring fills; once it turns gold, Space releases and you can drag to reposition. Lift to lock it again. The invisible outer margin absorbs stray touches. Size and positions are saved on this device.")
             }
         }

@@ -5,6 +5,7 @@
 @property(nonatomic) CGPoint at;
 @property(nonatomic) UITouchPhase testPhase;
 @property(nonatomic) UITouchType testType;
+@property(nonatomic) NSUInteger testTapCount;
 @property(nonatomic, weak) UIView *target;
 @end
 @implementation SPTestTouch
@@ -13,6 +14,7 @@
 - (UITouchPhase)phase { return self.testPhase; }
 - (UITouchType)type { return self.testType; }
 - (CGFloat)majorRadiusTolerance { return 1; }
+- (NSUInteger)tapCount { return self.testTapCount; }
 @end
 
 @interface SPTestEvent : UIEvent
@@ -20,6 +22,7 @@
 @property(nonatomic) UIEventButtonMask testMask;
 @end
 @implementation SPTestEvent
+- (UIEventType)type { return UIEventTypeTouches; }
 - (NSSet<UITouch *> *)allTouches { return self.testTouches; }
 - (UIEventButtonMask)buttonMask { return self.testMask; }
 @end
@@ -33,6 +36,7 @@ static SPTestTouch *sp_test_touch(UIView *target, CGPoint at) {
     SPTestTouch *touch = [SPTestTouch new];
     touch.target = target; touch.at = at; touch.testPhase = UITouchPhaseBegan;
     touch.testType = UITouchTypeDirect;
+    touch.testTapCount = 1;
     return touch;
 }
 static SPTestEvent *sp_test_event(NSArray<UITouch *> *touches) {
@@ -288,6 +292,13 @@ static void sp_test_pencil(SPInputView *view, SPThumbButton *thumb) {
     sp_window = self.window;
     UIViewController *controller = [UIViewController new];
     unsetenv("SP_GAME_TOUCH");
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults removeObjectForKey:@"sp_touch_controls_enabled"];
+    [defaults removeObjectForKey:@"sp_joystick_analog"];
+    [defaults removeObjectForKey:@"sp_action_1_enabled"];
+    [defaults removeObjectForKey:@"sp_action_1_position"];
+    [defaults removeObjectForKey:@"sp_touch_controls_scale"];
+    [defaults removeObjectForKey:@"sp_touch_controls_opacity"];
     SPInputView *physicalView = [[SPInputView alloc] initWithFrame:self.window.bounds];
     @try {
         for (UIView *child in physicalView.subviews) {
@@ -306,8 +317,8 @@ static void sp_test_pencil(SPInputView *view, SPThumbButton *thumb) {
         [self finish:exception.reason inView:physicalView];
         return;
     }
-    setenv("SP_GAME_TOUCH", "1", 1);
-    SPInputView *view = [[SPInputView alloc] initWithFrame:self.window.bounds];
+    [defaults setBool:YES forKey:@"sp_touch_controls_enabled"];
+    SPInputView *view = physicalView;
     controller.view = view; self.window.rootViewController = controller;
     view.backgroundColor = [UIColor colorWithRed:0.06 green:0.1 blue:0.085 alpha:1];
     [self.window makeKeyAndVisible];
@@ -318,15 +329,47 @@ static void sp_test_pencil(SPInputView *view, SPThumbButton *thumb) {
             if ([child isKindOfClass:SPThumbButton.class]) thumb = (id)child;
             if ([child isKindOfClass:SPJoystick.class]) stick = (id)child;
         }
-        @try { sp_test_run(view, thumb); sp_test_pencil(view, thumb); sp_test_keyboard(view, thumb); }
+        @try {
+            sp_test_check(thumb && !thumb.hidden && stick && !stick.hidden, @"Enabling the preference creates the overlay on the existing view.");
+            sp_test_action_and_movement(view, stick);
+            // The legacy margin fixtures isolate the original controls when probing clear areas.
+            for (NSString *name in @[@"tab", @"chat", @"zoom_in", @"zoom_out"])
+                [defaults setBool:NO forKey:[NSString stringWithFormat:@"sp_%@_enabled", name]];
+            [view setNeedsLayout]; [view layoutIfNeeded];
+            sp_test_run(view, thumb);
+            sp_test_pencil(view, thumb);
+            sp_test_keyboard(view, thumb);
+        }
         @catch (NSException *exception) { [self finish:exception.reason inView:view]; return; }
         sp_test_space_ring(view, ^(NSString *error) {
             if (error) { [self finish:error inView:view]; return; }
-            sp_test_joystick(view, thumb, stick, ^(NSString *error) { [self finish:error inView:view]; });
+            [defaults setBool:YES forKey:@"sp_joystick_analog"];
+            sp_test_joystick(view, thumb, stick, ^(NSString *error) {
+                if (!error) {
+                    @try {
+                        SPKeyboardButton *one = sp_test_keyboard_button(view, @"action_1");
+                        SPTestTouch *held = sp_test_touch(one, one.center);
+                        sp_test_send(held, UITouchPhaseBegan, sp_test_event(@[held]));
+                        sp_test_check([sp_touch_keys containsIndex:0x1E], @"Digit one is held before disabling.");
+                        [defaults setBool:NO forKey:@"sp_touch_controls_enabled"];
+                        [view setNeedsLayout]; [view layoutIfNeeded];
+                        sp_test_check(!stick.superview && !thumb.superview && !one.superview &&
+                                      ![sp_touch_keys containsIndex:0x1E],
+                                      @"Turning OFF releases held keys and removes the controls in place.");
+                        SPTestTouch *finger = sp_test_touch(view, CGPointZero);
+                        sp_test_check(![view sp_game_touches:[NSSet setWithObject:finger]].count,
+                                      @"Turning OFF restores pointer-only input.");
+                    } @catch (NSException *exception) { error = exception.reason; }
+                }
+                [defaults setBool:YES forKey:@"sp_touch_controls_enabled"];
+                [self finish:error inView:view];
+            });
         });
     });
 }
 - (void)finish:(NSString *)error inView:(SPInputView *)view {
+        for (NSString *name in @[@"tab", @"chat", @"zoom_in", @"zoom_out"])
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:[NSString stringWithFormat:@"sp_%@_enabled", name]];
         if (!error) {
             for (NSString *name in @[@"ctrl", @"shift", @"alt", @"space"])
                 [NSUserDefaults.standardUserDefaults setBool:YES forKey:[NSString stringWithFormat:@"sp_%@_enabled", name]];

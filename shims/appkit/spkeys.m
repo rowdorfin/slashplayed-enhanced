@@ -5,6 +5,9 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 
 @interface SPKeyboardButton : UIControl <SPMovableControl>
 @property(nonatomic, readonly) NSString *name;
+@property(nonatomic, copy) void (^action)(void);
+@property(nonatomic) NSInteger compactColumn; // One-based, mirrored from the outside of each digit row.
+@property(nonatomic) BOOL editingPosition;
 - (instancetype)initWithName:(NSString *)name label:(NSString *)label usage:(unsigned)usage position:(CGPoint)position;
 - (void)layoutInRect:(CGRect)rect;
 - (void)cancelInput;
@@ -37,7 +40,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     UITouch *_touch;
     CGPoint _position, _defaultPosition, _fingerStart, _centerStart;
     CGRect _centers;
-    BOOL _moving, _keyDown;
+    BOOL _moving, _keyDown, _latched;
 }
 - (instancetype)initWithName:(NSString *)name label:(NSString *)label usage:(unsigned)usage position:(CGPoint)position {
     if (!(self = [super initWithFrame:CGRectZero])) return nil;
@@ -86,7 +89,13 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     _label.textColor = highlighted ? [UIColor colorWithWhite:0.06 alpha:1] : gold;
     self.accessibilityValue = _face.accessibilityValue = highlighted ? @"Held" : @"Released";
 }
+- (void)setEditingPosition:(BOOL)editingPosition {
+    if (_editingPosition == editingPosition) return;
+    [self cancelInput];
+    _editingPosition = editingPosition;
+}
 - (void)releaseKey {
+    _latched = NO;
     if (_keyDown) sp_touch_key(_usage, NO);
     _keyDown = NO;
     [self setHighlighted:NO];
@@ -107,17 +116,39 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     double size = [savedSize isKindOfClass:NSNumber.class] ? [savedSize doubleValue] : sp_keyboard_default_size;
     if (!isfinite(size)) size = sp_keyboard_default_size;
     size = MAX(sp_keyboard_min_size, MIN(sp_keyboard_max_size, size));
-    CGFloat outer = size + (_handle ? 52 : 0), minimum = sp_keyboard_min_size + (_handle ? 52 : 0);
-    BOOL room = !CGRectIsNull(rect) && rect.size.width >= minimum + 16 && rect.size.height >= minimum + 16;
+    CGFloat scale = sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
+    CGFloat ring = _handle ? 52 * scale : 0;
+    CGFloat outer = size * scale + ring;
+    CGFloat minimum = sp_keyboard_min_size * scale + ring;
+    if (_compactColumn) {
+        // Reserve a gap between the two groups even at maximum scale in landscape.
+        CGFloat cell = MAX(0, (CGRectGetWidth(rect) - 92) / 10);
+        outer = MIN(size * 0.60 * scale, cell - 4);
+        minimum = 18;
+    } else if (_action || _usage == 0x2B) {
+        outer = size * 0.64 * scale;
+        minimum = 24;
+    }
+    BOOL room = !CGRectIsNull(rect) && outer >= minimum && rect.size.width >= minimum + 16 && rect.size.height >= minimum + 16;
     if (room) outer = MIN(outer, MIN(rect.size.width, rect.size.height) - 16);
-    CGRect centers = room ? CGRectInset(rect, outer / 2 + 8, outer / 2 + 8) : CGRectZero;
-    BOOL enabled = [defaults boolForKey:_enabledKey];  // optional buttons start hidden
+    CGRect lane = rect;
+    if (room && _compactColumn) {
+        lane.size.width = (CGRectGetWidth(rect) - 76) / 2;
+        if (_defaultPosition.x == 1) lane.origin.x = CGRectGetMaxX(rect) - lane.size.width;
+    }
+    CGRect centers = room ? CGRectInset(lane, outer / 2 + 8, outer / 2 + 8) : CGRectZero;
+    BOOL enabled = [defaults objectForKey:_enabledKey] ? [defaults boolForKey:_enabledKey]
+                                                       : !(_usage >= 0xE0 && _usage <= 0xE2);
     if (!enabled || !room || !CGRectEqualToRect(centers, _centers)) [self cancelInput];
     self.hidden = !enabled || !room;
     if (self.hidden) return;
     _centers = centers;
     if (!_moving && !_touch) {
         _position = _defaultPosition;
+        if (_compactColumn && centers.size.width > 0) {
+            CGFloat offset = (_compactColumn - 1) * (outer + 4) / centers.size.width;
+            _position.x = _defaultPosition.x == 0 ? offset : 1 - offset;
+        }
         id saved = [defaults objectForKey:_positionKey];
         if ([saved isKindOfClass:NSArray.class] && [saved count] == 2 &&
             [saved[0] isKindOfClass:NSNumber.class] && [saved[1] isKindOfClass:NSNumber.class]) {
@@ -128,7 +159,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     self.bounds = CGRectMake(0, 0, outer, outer);
     self.center = CGPointMake(centers.origin.x + centers.size.width * _position.x,
                              centers.origin.y + centers.size.height * _position.y);
-    CGFloat face = _handle ? outer - 52 : outer;
+    CGFloat face = outer - ring;
     _face.bounds = CGRectMake(0, 0, face, _handle ? MAX(32, face * 0.58) : face);
     _face.center = CGPointMake(outer / 2, outer / 2);
     _label.frame = CGRectInset(_face.bounds, 4, 0);
@@ -165,11 +196,17 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     if (self.hidden || _touch || _moving) return;
-    for (UITouch *touch in touches) if (touch.type == UITouchTypeDirect || touch.type == UITouchTypePencil) {
+    for (UITouch *touch in touches) if ((touch.type == UITouchTypeDirect && !sp_physical_touch(touch)) || touch.type == UITouchTypePencil) {
         _touch = touch;
         _fingerStart = [touch locationInView:self.superview]; _centerStart = self.center;
-        sp_touch_key(_usage, YES);
-        _keyDown = YES;
+        if (_editingPosition) {
+            [self beginMove:touch];
+            break;
+        }
+        if (_usage && !_keyDown) {
+            sp_touch_key(_usage, YES);
+            _keyDown = YES;
+        }
         [self setHighlighted:YES];
         [_handle touchesBegan:[NSSet setWithObject:touch] withEvent:event];
         break;
@@ -177,7 +214,9 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 }
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     if (!_touch || ![touches containsObject:_touch]) return;
+    if (_editingPosition) { [self moveWithTouch:_touch]; return; }
     if (_handle) { [_handle touchesMoved:touches withEvent:event]; return; }
+    if (_compactColumn || _action || _usage == 0x2B) return;
     CGPoint at = [_touch locationInView:self.superview];
     if (!_moving && hypot(at.x - _fingerStart.x, at.y - _fingerStart.y) < 10) return;
     _moving = YES;
@@ -187,7 +226,13 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     if (_touch && [touches containsObject:_touch]) {
         [_handle touchesEnded:touches withEvent:event];
         [self touchesMoved:touches withEvent:event];
-        [self releaseKey]; _touch = nil; [self endMove];
+        BOOL activate = !_editingPosition && !_moving && [self containsKeyPoint:[_touch locationInView:self]];
+        BOOL modifier = _usage >= 0xE0 && _usage <= 0xE2;
+        if (activate && modifier && !_latched && _touch.tapCount == 2) _latched = YES;
+        else [self releaseKey];
+        _touch = nil;
+        [self endMove];
+        if (activate && _action) _action();
     }
 }
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
@@ -209,6 +254,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 - (void)endMove {
     if (!_moving) return;
     _moving = NO;
+    if (CGPointEqualToPoint(self.center, _centerStart)) return;
     [NSUserDefaults.standardUserDefaults setObject:@[@(_position.x), @(_position.y)] forKey:_positionKey];
 }
 @end

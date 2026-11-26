@@ -4,6 +4,55 @@ static SPKeyboardButton *sp_test_keyboard_button(SPInputView *view, NSString *na
         if ([child isKindOfClass:SPKeyboardButton.class] && [((SPKeyboardButton *)child).name isEqual:name]) return (id)child;
     @throw [NSException exceptionWithName:@"Missing keyboard button" reason:name userInfo:nil];
 }
+static void sp_test_action_and_movement(SPInputView *view, SPJoystick *stick) {
+    SPKeyboardButton *one = sp_test_keyboard_button(view, @"action_1");
+    sp_test_check(!one.hidden && [view hitTest:one.center withEvent:nil] == one, @"Digit one owns a visible touch target.");
+    SPTestTouch *pointer = sp_test_touch(view, one.center);
+    pointer.testType = UITouchTypeIndirectPointer;
+    sp_test_check([view hitTest:one.center withEvent:sp_test_event(@[pointer])] == view,
+                  @"A physical pointer can target WoW behind a virtual key.");
+
+    [sp_events removeAllObjects];
+    SPTestTouch *walk = sp_test_touch(stick, CGPointMake(stick.center.x - 40, stick.center.y - 40));
+    SPTestTouch *camera = sp_test_touch(view, CGPointMake(450, 220));
+    SPTestTouch *key = sp_test_touch(one, one.center);
+    SPTestEvent *event = sp_test_event(@[walk, camera]);
+    sp_test_send(walk, UITouchPhaseBegan, event);
+    sp_test_check([sp_touch_keys containsIndex:0x1A] && [sp_touch_keys containsIndex:0x04],
+                  @"The default joystick holds W and A on an upper-left diagonal.");
+    sp_test_send(camera, UITouchPhaseBegan, event);
+    camera.at = CGPointMake(475, 230);
+    sp_test_send(camera, UITouchPhaseMoved, event);
+    SPEvent *drag = sp_events.lastObject;
+    sp_test_check(drag->type == SPRightMouseDragged, @"A single-finger drag uses right-button mouselook.");
+    event = sp_test_event(@[walk, camera, key]);
+    sp_test_send(key, UITouchPhaseBegan, event);
+    SPEvent *down = sp_events.lastObject;
+    sp_test_check([sp_touch_keys containsIndex:0x1E] && down->type == SPKeyDown &&
+                  down->keyCode == sp_hid_to_mac[0x1E] && [down->characters isEqual:@"1"],
+                  @"Digit one sends HID 0x1E down while movement and camera are held.");
+    sp_test_send(key, UITouchPhaseEnded, event);
+    SPEvent *up = sp_events.lastObject;
+    sp_test_check(![sp_touch_keys containsIndex:0x1E] && up->type == SPKeyUp && up->keyCode == down->keyCode,
+                  @"Lifting digit one sends its corresponding key-up.");
+    sp_test_send(walk, UITouchPhaseEnded, event);
+    sp_test_send(camera, UITouchPhaseEnded, event);
+    sp_test_check(!sp_touch_keys.count && sp_mouse_buttons == 0, @"All three controls release independently.");
+
+    [sp_events removeAllObjects];
+    one.editingPosition = YES;
+    key = sp_test_touch(one, one.center); event = sp_test_event(@[key]);
+    sp_test_send(key, UITouchPhaseBegan, event);
+    key.at = CGPointMake(CGRectGetMidX(view.bounds), CGRectGetMidY(view.bounds));
+    sp_test_send(key, UITouchPhaseMoved, event);
+    sp_test_send(key, UITouchPhaseEnded, event);
+    sp_test_check(!sp_events.count && CGRectGetMaxX(one.frame) < CGRectGetMidX(view.bounds),
+                  @"Editing a digit saves its position without pressing it or covering the center.");
+    one.editingPosition = NO;
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:@"sp_action_1_position"];
+    [view setNeedsLayout]; [view layoutIfNeeded];
+}
+
 static void sp_test_keyboard(SPInputView *view, SPThumbButton *thumb) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults removeObjectForKey:sp_keyboard_size_key];
@@ -14,6 +63,9 @@ static void sp_test_keyboard(SPInputView *view, SPThumbButton *thumb) {
         [defaults removeObjectForKey:[NSString stringWithFormat:@"sp_%@_enabled", name]];
         [defaults removeObjectForKey:[NSString stringWithFormat:@"sp_%@_position", name]];
     }
+    [view setNeedsLayout]; [view layoutIfNeeded];
+    // Jump is on with the master switch. An explicit OFF still wins.
+    [defaults setBool:NO forKey:@"sp_space_enabled"];
     [view setNeedsLayout]; [view layoutIfNeeded];
     for (NSString *name in names) {
         SPKeyboardButton *button = sp_test_keyboard_button(view, name);
@@ -56,6 +108,16 @@ static void sp_test_keyboard(SPInputView *view, SPThumbButton *thumb) {
     }
 
     SPKeyboardButton *ctrl = sp_test_keyboard_button(view, @"ctrl");
+    SPTestTouch *latch = sp_test_touch(ctrl, ctrl.center);
+    latch.testTapCount = 2;
+    SPTestEvent *latchEvent = sp_test_event(@[latch]);
+    sp_test_send(latch, UITouchPhaseBegan, latchEvent);
+    sp_test_send(latch, UITouchPhaseEnded, latchEvent);
+    sp_test_check(ctrl.highlighted && (sp_mod_flags & SPControl), @"A double tap latches Ctrl.");
+    latch = sp_test_touch(ctrl, ctrl.center); latchEvent = sp_test_event(@[latch]);
+    sp_test_send(latch, UITouchPhaseBegan, latchEvent);
+    sp_test_send(latch, UITouchPhaseEnded, latchEvent);
+    sp_test_check(!ctrl.highlighted && sp_mod_flags == 0, @"Tapping a latched Ctrl releases it.");
     SPKeyboardButton *shift = sp_test_keyboard_button(view, @"shift");
     SPKeyboardButton *alt = sp_test_keyboard_button(view, @"alt");
     SPKeyboardButton *space = sp_test_keyboard_button(view, @"space");
@@ -77,8 +139,9 @@ static void sp_test_keyboard(SPInputView *view, SPThumbButton *thumb) {
     sp_test_send(spaceTouch, UITouchPhaseBegan, sp_test_event(@[spaceTouch]));
     sp_test_check(((SPEvent *)sp_events.lastObject)->type == SPKeyDown && ((SPEvent *)sp_events.lastObject)->modifierFlags == allFlags,
                   @"On-screen modifiers combine with Space.");
+    NSUInteger beforeRepeat = sp_events.count;
     sp_repeat_at = 0; sp_key_repeats();
-    sp_test_check(((SPEvent *)sp_events.lastObject)->isARepeat, @"Holding Space uses normal keyboard repeat.");
+    sp_test_check(sp_events.count == beforeRepeat, @"Holding the touch Jump button does not repeat key-downs.");
     [view sp_suspend_touch:nil];
     sp_test_check(sp_mod_flags == 0 && sp_mouse_buttons == 0 && !sp_repeat_key && !space.highlighted,
                   @"App deactivation releases modifiers, Space, R, and repeat state.");

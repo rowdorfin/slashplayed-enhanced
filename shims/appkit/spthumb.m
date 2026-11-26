@@ -69,6 +69,7 @@ static const CGFloat sp_thumb_default_size = 76, sp_thumb_min_size = 44, sp_thum
     double size = [savedSize isKindOfClass:NSNumber.class] ? [savedSize doubleValue] : sp_thumb_default_size;
     if (!isfinite(size)) size = sp_thumb_default_size;
     size = MAX(sp_thumb_min_size, MIN(sp_thumb_max_size, size));
+    size *= sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
     BOOL room = !CGRectIsNull(rect) && rect.size.width >= sp_thumb_min_size + 16 && rect.size.height >= sp_thumb_min_size + 16;
     // A narrow resized window may need a smaller target temporarily; retain the preferred size.
     if (room) size = MIN(size, MIN(rect.size.width, rect.size.height) - 16);
@@ -78,7 +79,7 @@ static const CGFloat sp_thumb_default_size = 76, sp_thumb_min_size = 44, sp_thum
     if (self.hidden) return;
     _centers = centers;
     if (!_thumbTouch) {
-        _position = CGPointMake(0, 0.82);
+        _position = CGPointMake(0, 0.46);
         id saved = [defaults objectForKey:sp_thumb_position_key];
         if ([saved isKindOfClass:NSArray.class] && [saved count] == 2 &&
             [saved[0] isKindOfClass:NSNumber.class] && [saved[1] isKindOfClass:NSNumber.class]) {
@@ -103,14 +104,14 @@ static BOOL sp_thumb_touch_active(UITouch *touch) {
     // same event. Inspect the event too, so callback order cannot change which button the tap gets.
     if (sp_thumb_touch_active(_thumbTouch)) return YES;
     for (UITouch *touch in event.allTouches)
-        if (touch.view == self && touch.type == UITouchTypeDirect && touch.phase == UITouchPhaseBegan) return YES;
+        if (touch.view == self && touch.type == UITouchTypeDirect && !sp_physical_touch(touch) && touch.phase == UITouchPhaseBegan) return YES;
     return NO;
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     if (_thumbTouch) return;
     for (UITouch *touch in touches) {
-        if (touch.type != UITouchTypeDirect) continue;
+        if (touch.type != UITouchTypeDirect || sp_physical_touch(touch)) continue;
         _thumbTouch = touch;
         _fingerStart = [touch locationInView:self.superview];
         _centerStart = self.center;

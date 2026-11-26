@@ -68,6 +68,11 @@ jobs:
 
       - uses: ./.github/actions/companion-deps
 
+      - name: Test AppKit input and display in iPad simulators
+        run: |
+          shims/appkit/test-thumb.sh
+          bash shims/appkit/test-display.sh
+
       - name: Fetch the start screen's font
         run: scripts/fetch-font.sh
 

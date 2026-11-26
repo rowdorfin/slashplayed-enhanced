@@ -1,4 +1,4 @@
-// A touch-owned left stick feeds the same GameController API the client uses for physical pads.
+// A touch-owned left stick sends WASD or feeds the GameController API the client uses for physical pads.
 // Included on iPhone and iPad only. A separate handle moves the control, never the character.
 static NSString *const sp_joystick_enabled_key = @"sp_joystick_enabled";
 static NSString *const sp_joystick_position_key = @"sp_joystick_position";
@@ -167,7 +167,8 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     GCVirtualController *_virtualController;
     CGPoint _value, _position, _fingerStart, _centerStart;
     CGRect _centers;
-    BOOL _moving, _suspended, _connected, _gameReady, _requested;
+    BOOL _moving, _suspended, _connected, _gameReady, _requested, _analog;
+    unsigned _movementKeys;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -219,6 +220,17 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 - (void)sendValue:(CGPoint)value {
     _value = value;
     if (_connected) [_virtualController setPosition:value forDirectionPadElement:GCInputLeftThumbstick];
+    // Per-axis thresholds preserve diagonals, with hysteresis near each direction's boundary.
+    const CGFloat axes[] = {value.y, -value.x, -value.y, value.x};
+    const unsigned usages[] = {0x1A, 0x04, 0x16, 0x07}; // W, A, S, D
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned bit = 1 << i;
+        BOOL held = (_movementKeys & bit) != 0;
+        BOOL next = !_analog && axes[i] >= (held ? 0.18 : 0.27);
+        if (held == next) continue;
+        _movementKeys ^= bit;
+        sp_touch_key(usages[i], next);
+    }
     [self drawValue];
 }
 
@@ -230,6 +242,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 }
 
 - (void)updateConnection {
+    if (!_analog) return;
     BOOL want = _gameReady && _requested && self.window && !self.hidden && !_suspended &&
                 self.window.windowScene.activationState == UISceneActivationStateForegroundActive;
     if (!want) {
@@ -279,6 +292,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 
 - (void)setSuspended:(BOOL)suspended {
     _suspended = suspended;
+    if (suspended) [self cancelInput];
     [self updateConnection];
 }
 
@@ -291,18 +305,31 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 
 - (void)didMoveToWindow {
     [super didMoveToWindow];
+    if (!self.window) [self cancelInput];
     [self updateConnection];
 }
 
-- (void)dealloc { [_virtualController disconnect]; }
+- (void)dealloc {
+    [_virtualController disconnect];
+}
 
 - (void)layoutInRect:(CGRect)rect {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    BOOL analog = [defaults boolForKey:@"sp_joystick_analog"];
+    if (_analog != analog) {
+        [self cancelInput];
+        [_virtualController disconnect];
+        _virtualController = nil;
+        _connected = _requested = NO;
+        _status.text = nil;
+        _analog = analog;
+    }
     BOOL enabled = ![defaults objectForKey:sp_joystick_enabled_key] || [defaults boolForKey:sp_joystick_enabled_key];
     id savedSize = [defaults objectForKey:sp_joystick_size_key];
     double size = [savedSize isKindOfClass:NSNumber.class] ? [savedSize doubleValue] : sp_joystick_default_size;
     if (!isfinite(size)) size = sp_joystick_default_size;
     size = MAX(sp_joystick_min_size, MIN(sp_joystick_max_size, size));
+    size *= sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
     BOOL room = !CGRectIsNull(rect) && rect.size.width >= sp_joystick_min_size + 16 && rect.size.height >= sp_joystick_min_size + 16;
     if (room) size = MIN(size, MIN(rect.size.width, rect.size.height) - 16);
     CGRect centers = room ? CGRectInset(rect, size / 2 + 8, size / 2 + 8) : CGRectZero;
@@ -323,7 +350,8 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
         self.layer.cornerRadius = size / 2;
         self.center = CGPointMake(centers.origin.x + centers.size.width * _position.x,
                                  centers.origin.y + centers.size.height * _position.y);
-        _handle.frame = CGRectMake(size - 44, 0, 44, 44);
+        CGFloat handleSize = 44 * sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
+        _handle.frame = CGRectMake(size - handleSize, 0, handleSize, handleSize);
         _shield.frame = CGRectInset(self.bounds, -sp_joystick_touch_margin, -sp_joystick_touch_margin);
         [self drawValue];
     }
@@ -371,8 +399,8 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
         sp_stub_log([NSString stringWithFormat:@"input: joystick touch ready=%d suspended=%d moving=%d hidden=%d window=%d scene=%ld",
                      _gameReady, _suspended, _moving, self.hidden, self.window != nil,
                      (long)self.window.windowScene.activationState].UTF8String);
-    if (_stickTouch || _moving || !_gameReady || self.hidden) return;
-    for (UITouch *touch in touches) if (touch.type == UITouchTypeDirect) {
+    if (_stickTouch || _moving || (_analog && !_gameReady) || self.hidden) return;
+    for (UITouch *touch in touches) if (touch.type == UITouchTypeDirect && !sp_physical_touch(touch)) {
         if (![self containsStickPoint:[touch locationInView:self]]) continue;
         // A real new touch in an active scene is fresher than a missed activation notification.
         // Keep background cancellation intact: old moved touches never enter this recovery path.
