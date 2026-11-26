@@ -659,16 +659,34 @@ static bool spBCDecodeTile(SPBCKind kind, const uint8_t *source, SPBCLayout layo
     return ok;
 }
 
-static _Thread_local bool spBCScratchInUse;
+typedef struct {
+    uint8_t *bytes;
+    bool busy, purge, claimed;
+} SPBCScratchSlot;
 
-static void spBCFreeScratchCache(void *cache) {
-    free(cache);
+static os_unfair_lock spBCScratchLock = OS_UNFAIR_LOCK_INIT;
+static SPBCScratchSlot spBCScratchSlots[SPBCScratchCacheThreads];
+
+static size_t spBCFreeScratchSlot(SPBCScratchSlot *slot) {
+    if (!slot->bytes) return 0;
+    free(slot->bytes);
+    slot->bytes = NULL;
+    slot->purge = false;
     atomic_fetch_sub(&spBCScratchCaches, 1);
+    return SPBCScratchCacheSize;
 }
 
-static uint8_t *spBCScratch(size_t bytes, bool *cached) {
-    *cached = false;
-    if (bytes > SPBCScratchCacheSize || spBCScratchInUse) return malloc(bytes);
+static void spBCFreeScratchCache(void *cache) {
+    os_unfair_lock_lock(&spBCScratchLock);
+    SPBCScratchSlot *slot = cache;
+    spBCFreeScratchSlot(slot);
+    slot->claimed = false;
+    os_unfair_lock_unlock(&spBCScratchLock);
+}
+
+static uint8_t *spBCScratch(size_t bytes, SPBCScratchSlot **cached) {
+    *cached = NULL;
+    if (bytes > SPBCScratchCacheSize) return malloc(bytes);
 
     static pthread_key_t key;
     static bool haveKey;
@@ -676,24 +694,79 @@ static uint8_t *spBCScratch(size_t bytes, bool *cached) {
     dispatch_once(&once, ^{ haveKey = pthread_key_create(&key, spBCFreeScratchCache) == 0; });
     if (!haveKey) return malloc(bytes);
 
-    uint8_t *scratch = pthread_getspecific(key);
-    if (!scratch) {
-        unsigned count = atomic_load(&spBCScratchCaches);
-        do {
-            if (count >= SPBCScratchCacheThreads) return malloc(bytes);
-        } while (!atomic_compare_exchange_weak(&spBCScratchCaches, &count, count + 1));
-
-        scratch = malloc(SPBCScratchCacheSize);
-        if (!scratch || pthread_setspecific(key, scratch) != 0) {
-            spBCFreeScratchCache(scratch);
-            return malloc(bytes);
+    os_unfair_lock_lock(&spBCScratchLock);
+    SPBCScratchSlot *slot = pthread_getspecific(key);
+    // The key owns its slot until that thread exits, even after a trim.
+    if (!slot) {
+        for (unsigned i = 0; i < SPBCScratchCacheThreads; i++) {
+            if (spBCScratchSlots[i].claimed) continue;
+            if (!pthread_setspecific(key, &spBCScratchSlots[i])) {
+                slot = &spBCScratchSlots[i];
+                slot->claimed = true;
+            }
+            break;
         }
-    } else {
-        atomic_fetch_add(&spBCScratchCacheHits, 1);
     }
-    *cached = true;
-    spBCScratchInUse = true;
-    return scratch;
+    if (slot && !slot->busy) {
+        if (slot->bytes) atomic_fetch_add(&spBCScratchCacheHits, 1);
+        else {
+            slot->bytes = malloc(SPBCScratchCacheSize);
+            if (slot->bytes) atomic_fetch_add(&spBCScratchCaches, 1);
+        }
+        if (slot->bytes) {
+            slot->busy = true;
+            *cached = slot;
+        }
+    }
+    uint8_t *result = *cached ? (*cached)->bytes : NULL;
+    os_unfair_lock_unlock(&spBCScratchLock);
+    return result ?: malloc(bytes);
+}
+
+static void spBCReleaseScratch(uint8_t *bytes, SPBCScratchSlot *slot) {
+    if (!slot) {
+        free(bytes);
+        return;
+    }
+    os_unfair_lock_lock(&spBCScratchLock);
+    slot->busy = false;
+    size_t purged = slot->purge ? spBCFreeScratchSlot(slot) : 0;
+    os_unfair_lock_unlock(&spBCScratchLock);
+    if (purged) spBCLog(@"SP_MEM_TRIM scratchDeferredFreed=%zu", purged);
+}
+
+static size_t spBCTrimScratch(size_t *deferred) {
+    size_t freed = 0;
+    os_unfair_lock_lock(&spBCScratchLock);
+    for (unsigned i = 0; i < SPBCScratchCacheThreads; i++) {
+        SPBCScratchSlot *slot = &spBCScratchSlots[i];
+        if (slot->busy) {
+            slot->purge = true;
+            *deferred += SPBCScratchCacheSize;
+        } else {
+            freed += spBCFreeScratchSlot(slot);
+        }
+    }
+    os_unfair_lock_unlock(&spBCScratchLock);
+    return freed;
+}
+
+static void spBCStartMemoryPressure(void) {
+    static dispatch_source_t source;
+    source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+                                    DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+                                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (!source) return;
+    dispatch_source_set_event_handler(source, ^{
+        @autoreleasepool {
+            unsigned long event = dispatch_source_get_data(source);
+            size_t deferred = 0;
+            size_t scratch = spBCTrimScratch(&deferred);
+            spBCLog(@"SP_MEM_TRIM event=0x%lx scratchFreed=%zu scratchDeferred=%zu",
+                    event, scratch, deferred);
+        }
+    });
+    dispatch_resume(source);
 }
 
 static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo *info, MTLRegion region,
@@ -727,7 +800,7 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
         return;
     }
     size_t capacity = tile.bytes;
-    bool cached;
+    SPBCScratchSlot *cached;
     uint8_t *decoded = spBCScratch(capacity, &cached);
     if (!decoded) {
         atomic_fetch_add(&spBCCPUAllocationFailures, 1);
@@ -751,8 +824,7 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
              texture.textureType == MTLTextureType3D ? tile.bytes : 0);
         insideTexture--;
     } while (SPBCNextTile(info.kind, layout.size, 1, SPBCTileLimit, &cursor, &tile));
-    if (cached) spBCScratchInUse = false;
-    else free(decoded);
+    spBCReleaseScratch(decoded, cached);
     [condition lock];
     SPBCStagingReleaseScratch(&spBCStaging, capacity);
     [condition unlock];
@@ -1619,6 +1691,56 @@ static bool spA16GuestCaller(void *returnAddress) {
     return contains && contains((uintptr_t)ptrauth_strip(returnAddress, ptrauth_key_return_address));
 }
 
+static os_unfair_lock spBCMemoryQueryLock = OS_UNFAIR_LOCK_INIT;
+
+static void spBCMemoryQuery(SPA16MemoryQuery *query, SEL selector, uint64_t value, void *caller) {
+    if (!spA16GuestCaller(caller)) return;
+    os_unfair_lock_lock(&spBCMemoryQueryLock);
+    bool changed = spA16RecordMemoryQuery(query, value);
+    uint64_t count = query->count;
+    os_unfair_lock_unlock(&spBCMemoryQueryLock);
+    if (changed)
+        spBCLog(@"SP_MEM_QUERY sel=%s value=%llu count=%llu", sel_getName(selector),
+                (unsigned long long)value, (unsigned long long)count);
+}
+
+#define SP_BC_MEMORY_QUERY(name, type) \
+    static type spBCQuery_##name(id self, SEL selector) { \
+        static SPA16MemoryQuery query; \
+        type value = ((type (*)(id, SEL))original(self, selector))(self, selector); \
+        int savedErrno = errno; \
+        spBCMemoryQuery(&query, selector, value, __builtin_return_address(0)); \
+        errno = savedErrno; \
+        return value; \
+    }
+SP_BC_MEMORY_QUERY(recommendedMaxWorkingSetSize, NSUInteger)
+SP_BC_MEMORY_QUERY(currentAllocatedSize, NSUInteger)
+SP_BC_MEMORY_QUERY(hasUnifiedMemory, BOOL)
+SP_BC_MEMORY_QUERY(maxBufferLength, NSUInteger)
+SP_BC_MEMORY_QUERY(physicalMemory, unsigned long long)
+#undef SP_BC_MEMORY_QUERY
+
+static void spBCInstallPhysicalMemoryQuery(void) {
+    hook(object_getClass(NSProcessInfo.processInfo), @selector(physicalMemory), (IMP)spBCQuery_physicalMemory);
+}
+
+static void spBCInstallMemoryQueries(Class cls) {
+    hook(cls, @selector(recommendedMaxWorkingSetSize), (IMP)spBCQuery_recommendedMaxWorkingSetSize);
+    hook(cls, @selector(currentAllocatedSize), (IMP)spBCQuery_currentAllocatedSize);
+    hook(cls, @selector(hasUnifiedMemory), (IMP)spBCQuery_hasUnifiedMemory);
+    hook(cls, @selector(maxBufferLength), (IMP)spBCQuery_maxBufferLength);
+    spBCInstallPhysicalMemoryQuery();
+}
+
+// Foundation may be queried before the guest requests its Metal device.
+__attribute__((constructor)) static void spBCEarlyMemoryQuery(void) {
+    // The launcher can enable the profile after loading a shim.
+    const char *profile = getenv("SP_A16_PROFILE");
+    if (profile && strcmp(profile, "1") == 0) {
+        @autoreleasepool { spBCInstallPhysicalMemoryQuery(); }
+    }
+}
+
 // Capability hooks are installed on a concrete class, but only the device
 // marked for the guest and direct callers in its __TEXT see simulated values.
 static BOOL spA16SupportsBC(id device, SEL selector) {
@@ -1696,6 +1818,7 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
             spA16Profile() ? "a16-profile" : enabled ? "no-native-BC" : haveProperty ? "native-BC" : "capability-unavailable");
     hook(cls, @selector(newTextureWithDescriptor:), (IMP)newTexture);
     if (!enabled) return;
+    spBCInstallMemoryQueries(cls);
     findSharedCache();
     spBCUploadMarker = sel_registerName(SP_BC_UPLOAD_CB_KEY);
     const char *verbose = getenv("SP_BC_VERBOSE");
@@ -1719,5 +1842,6 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
         hook(cls, @selector(supportsBCTextureCompression), (IMP)spA16SupportsBC);
         hook(cls, @selector(supportsFamily:), (IMP)spA16SupportsFamily);
     }
+    spBCStartMemoryPressure();
     spBCStartSummary(device);
 }

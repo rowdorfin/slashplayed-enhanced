@@ -46,6 +46,13 @@ int main(void) {
     assert(!spA16EffectiveBC(false, false));
     assert(!spA16EffectiveBC(true, true));
     assert(!spA16EffectiveBC(true, false));
+    SPA16MemoryQuery query = {0};
+    assert(spA16RecordMemoryQuery(&query, 0));
+    assert(!spA16RecordMemoryQuery(&query, 0));
+    assert(spA16RecordMemoryQuery(&query, 4096));
+    assert(spA16RecordMemoryQuery(&query, 0));
+    assert(query.count == 4 && query.lastValue == 0);
+    puts("A16 memory query: zero, duplicate, and value changes passed");
     printf("A16 profile: %zu budget cases, %zu family cases, 4 BC cases passed\n",
            sizeof budgets / sizeof *budgets, sizeof families / sizeof *families);
 }

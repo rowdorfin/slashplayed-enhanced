@@ -27,4 +27,16 @@ static inline bool spA16EffectiveFamily(bool profile, unsigned long family, bool
     return real && !(profile && ((family >= 1009 && family < 2000) || family == 2002));
 }
 
+typedef struct {
+    uint64_t count, lastValue;
+} SPA16MemoryQuery;
+
+// The caller serializes observations of each selector.
+static inline bool spA16RecordMemoryQuery(SPA16MemoryQuery *query, uint64_t value) {
+    bool changed = !query->count || query->lastValue != value;
+    query->count++;
+    query->lastValue = value;
+    return changed;
+}
+
 #endif
