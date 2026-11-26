@@ -21,6 +21,32 @@ SPBCSize SPBCMipSize(SPBCSize base, size_t level) {
                       spBCMipDimension(base.depth, level)};
 }
 
+size_t SPBCTextureBytes(SPBCKind kind, SPBCSize base, unsigned long type,
+                        size_t levels, size_t arrayLength, size_t samples) {
+    size_t texel = SPBCTexelBytes(kind);
+    if (!texel || !base.width || !base.height || !base.depth || !levels ||
+        levels > sizeof(size_t) * CHAR_BIT || !arrayLength || !samples) return 0;
+    size_t layers = 1;
+    switch (type) {
+        case 1: case 3: case 8: layers = arrayLength; break;  // array types
+        case 5: layers = 6; break;
+        case 6:
+            if (arrayLength > SIZE_MAX / 6) return 0;
+            layers = arrayLength * 6;
+            break;
+    }
+    size_t total = 0;
+    for (size_t level = 0; level < levels; level++) {
+        SPBCSize mip = SPBCMipSize(base, level);
+        if (mip.width > SIZE_MAX / mip.height) return 0;
+        size_t area = mip.width * mip.height;
+        if (area > (SIZE_MAX - total) / mip.depth) return 0;
+        total += area * mip.depth;
+    }
+    if (total > SIZE_MAX / texel / layers / samples) return 0;
+    return total * texel * layers * samples;
+}
+
 bool SPBCValidSlice(unsigned long type, size_t arrayLength, size_t slice) {
     switch (type) {
         case 1: case 3: return slice < arrayLength;  // 1D/2D array

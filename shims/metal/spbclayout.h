@@ -24,6 +24,9 @@ typedef struct {
 
 SPBCDescriptor SPBCPhysicalDescriptor(SPBCDescriptor descriptor);
 SPBCSize SPBCMipSize(SPBCSize base, size_t level);
+// Packed physical texels across all subresources, excluding Metal padding.
+size_t SPBCTextureBytes(SPBCKind kind, SPBCSize base, unsigned long type,
+                        size_t levels, size_t arrayLength, size_t samples);
 bool SPBCValidSlice(unsigned long type, size_t arrayLength, size_t slice);
 bool SPBCMakeLayout(SPBCKind kind, SPBCSize mip, SPBCOrigin origin, SPBCSize requested,
                     size_t offset, size_t row, size_t image, SPBCLayout *layout);

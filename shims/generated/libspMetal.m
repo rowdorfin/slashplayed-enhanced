@@ -152,6 +152,7 @@ static id sp_nextDrawable(id self, SEL _cmd) {
 
 static void spBCInstall(id<MTLDevice> device, Class cls);
 static bool spBCActive(id device);
+static bool spBCVerbose;
 static MTLSizeAndAlign spBCHeapSize(id device, SEL selector, MTLTextureDescriptor *descriptor,
                                   MTLSizeAndAlign (*real)(id, SEL, MTLTextureDescriptor *),
                                   MTLPixelFormat *physicalFormat);
@@ -322,12 +323,16 @@ static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
         (MTLSizeAndAlign (*)(id, SEL, MTLTextureDescriptor *))method_getImplementation(method);
     IMP hook = imp_implementationWithBlock(^MTLSizeAndAlign(id self, MTLTextureDescriptor *descriptor) {
         int saved_errno = errno;
-        uint64_t seq = sp_metal_diag_begin(selector, descriptor);
-        MTLPixelFormat physical = MTLPixelFormatInvalid;
         BOOL fallback = spBCActive(self);
+        // The fallback summary counts these queries. Keep full before/after
+        // records available for replaying a Metal validation failure.
+        BOOL trace = !fallback || spBCVerbose;
+        uint64_t seq = trace ? sp_metal_diag_begin(selector, descriptor) : 0;
+        MTLPixelFormat physical = MTLPixelFormatInvalid;
         errno = saved_errno;
         MTLSizeAndAlign result = fallback ? spBCHeapSize(self, selector, descriptor, original, &physical)
                                           : original(self, selector, descriptor);
+        if (!trace) return result;
         saved_errno = errno;
         char line[192];
         if (fallback)

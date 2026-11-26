@@ -7,7 +7,12 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #include <stdatomic.h>
+#import <dispatch/dispatch.h>
+#import <mach/mach.h>
 #import <mach/mach_time.h>
+#import <os/proc.h>
+#include <stddef.h>
+#include <stdlib.h>
 #import <ptrauth.h>
 #import "spbclayout.h"
 
@@ -53,18 +58,65 @@ typedef enum {
 } SPBCUnsupported;
 
 static _Atomic unsigned long long spBCUnsupported[SPBCUnsupportedCount];
-static _Atomic unsigned long long spBCFormats[24], spBCTextures, spBCCompressed, spBCDecoded;
-static _Atomic unsigned long long spBCStaging, spBCPeak, spBCDecodeTicks, spBCMaxTicks;
-static _Atomic unsigned long long spBCStagingFailures, spBCTextureFailures, spBCEvents;
+static _Atomic unsigned long long spBCFormats[24], spBCCompressed, spBCDecoded;
+static _Atomic unsigned long long spBCStagingReserved, spBCReservedPeak, spBCDecodeTicks, spBCMaxTicks;
+static _Atomic unsigned long long spBCStagingLive, spBCStagingPeak;
+static _Atomic unsigned long long spBCStagingFailures, spBCTextureFailures;
+static NSHashTable<id<MTLHeap>> *spBCHeaps;
+static _Atomic unsigned long long spBCSizingQueries;
 
 static void spBCMax(_Atomic unsigned long long *maximum, unsigned long long value) {
     unsigned long long previous = atomic_load(maximum);
     while (previous < value && !atomic_compare_exchange_weak(maximum, &previous, value)) {}
 }
 
-static void spBCSummary(void) {
-    unsigned long long event = atomic_fetch_add(&spBCEvents, 1) + 1;
-    if (event & (event - 1)) return;
+// The existing texture metadata doubles as a lifetime sentinel. It owns no
+// Metal objects. Views count as objects, with their backing charged to the root.
+@interface SPBCTextureInfo : NSObject
+@property (nonatomic) MTLPixelFormat requested;
+@property (nonatomic) SPBCKind kind;
+@property (nonatomic) size_t trackedBytes;
+@end
+
+typedef struct {
+    unsigned long long allocated, freed, liveBytes;
+} SPBCTextureStats;
+static SPBCTextureStats spBCTextureStats;
+
+@implementation SPBCTextureInfo
+- (void)dealloc {
+    @synchronized ([SPBCTextureInfo class]) {
+        spBCTextureStats.freed++;
+        spBCTextureStats.liveBytes -= _trackedBytes;
+    }
+}
+@end
+
+static void spBCSummary(id<MTLDevice> device) {
+    SPBCTextureStats textures;
+    @synchronized ([SPBCTextureInfo class]) { textures = spBCTextureStats; }
+    // Take a short-lived snapshot, then query Metal without the registry lock.
+    NSArray<id<MTLHeap>> *heaps;
+    @synchronized (spBCHeaps) { heaps = spBCHeaps.allObjects; }
+    unsigned long long heapBytes = 0, heapAllocated = 0, heapUsed = 0;
+    NSUInteger allocatedSamples = 0, usedSamples = 0;
+    for (id<MTLHeap> heap in heaps) {
+        heapBytes += heap.size;
+        if ([heap respondsToSelector:@selector(currentAllocatedSize)]) {
+            heapAllocated += heap.currentAllocatedSize;
+            allocatedSamples++;
+        }
+        if ([heap respondsToSelector:@selector(usedSize)]) {
+            heapUsed += heap.usedSize;
+            usedSamples++;
+        }
+    }
+
+    task_vm_info_data_t vm = {0};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    bool haveFootprint = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS &&
+        count * sizeof(natural_t) >= offsetof(task_vm_info_data_t, phys_footprint) + sizeof(vm.phys_footprint);
+    bool haveDeviceSize = [device respondsToSelector:@selector(currentAllocatedSize)];
     NSMutableString *formats = [NSMutableString string];
     NSMutableString *unsupported = [NSMutableString string];
     for (unsigned i = 0; i < sizeof spBCFormats / sizeof *spBCFormats; i++) {
@@ -75,19 +127,42 @@ static void spBCSummary(void) {
         unsigned long long n = atomic_load(&spBCUnsupported[i]);
         if (n) [unsupported appendFormat:@"%u=%llu,", i, n];
     }
-    spBCLog(@"SP_BC_FALLBACK summary textures=%llu formats=%@ compressed=%llu decoded=%llu "
-            @"staging=%llu peak=%llu decodeTicks=%llu maxDecodeTicks=%llu unsupported=%@ "
-            @"stagingFailures=%llu textureFailures=%llu", atomic_load(&spBCTextures), formats,
-            atomic_load(&spBCCompressed), atomic_load(&spBCDecoded), atomic_load(&spBCStaging),
-            atomic_load(&spBCPeak), atomic_load(&spBCDecodeTicks), atomic_load(&spBCMaxTicks),
-            unsupported, atomic_load(&spBCStagingFailures), atomic_load(&spBCTextureFailures));
+    spBCLog(@"SP_BC_FALLBACK summary textures=%llu textureFrees=%llu textureLive=%llu textureLiveBytes=%llu "
+            @"sizingQueries=%llu formats=%@ compressed=%llu decoded=%llu stagingLiveBytes=%llu stagingPeakBytes=%llu "
+            @"stagingReserved=%llu stagingReservedPeak=%llu decodeTicks=%llu maxDecodeTicks=%llu unsupported=%@ "
+            @"stagingFailures=%llu textureFailures=%llu heaps=%lu heapBytes=%llu "
+            @"heapCurrentAllocatedSize=%llu heapAllocatedSamples=%lu heapUsedSize=%llu heapUsedSamples=%lu "
+            @"deviceCurrentAllocatedSize=%@ phys_footprint=%@ os_proc_available_memory=%zu",
+            textures.allocated, textures.freed, textures.allocated - textures.freed, textures.liveBytes,
+            atomic_load(&spBCSizingQueries), formats, atomic_load(&spBCCompressed), atomic_load(&spBCDecoded),
+            atomic_load(&spBCStagingLive),
+            atomic_load(&spBCStagingPeak), atomic_load(&spBCStagingReserved), atomic_load(&spBCReservedPeak),
+            atomic_load(&spBCDecodeTicks), atomic_load(&spBCMaxTicks), unsupported,
+            atomic_load(&spBCStagingFailures), atomic_load(&spBCTextureFailures), (unsigned long)heaps.count,
+            heapBytes, heapAllocated, (unsigned long)allocatedSamples, heapUsed, (unsigned long)usedSamples,
+            haveDeviceSize ? @(device.currentAllocatedSize) : @"n/a",
+            haveFootprint ? @(vm.phys_footprint) : @"n/a", os_proc_available_memory());
+}
+
+static void spBCStartSummary(id<MTLDevice> device) {
+    // One default device is installed by the generated shim. Keep the timer for
+    // the process lifetime so an idle period still reports releases.
+    static dispatch_source_t timer;
+    __weak id<MTLDevice> weakDevice = device;
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    uint64_t interval = 5 * NSEC_PER_SEC;
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, interval), interval, NSEC_PER_SEC);
+    dispatch_source_set_event_handler(timer, ^{
+        @autoreleasepool { spBCSummary(weakDevice); }
+    });
+    dispatch_resume(timer);
 }
 
 static void spBCReject(SPBCUnsupported operation, SEL selector, MTLPixelFormat format, const char *reason) {
     if (atomic_fetch_add(&spBCUnsupported[operation], 1) == 0)
         spBCLog(@"SP_BC_FALLBACK unsupported op=%u selector=%s format=%lu reason=%s",
                 (unsigned)operation, sel_getName(selector), (unsigned long)format, reason);
-    spBCSummary();
 }
 
 static void spBCRecordDecode(SPBCKind kind, SPBCTile tile, uint64_t ticks) {
@@ -122,12 +197,6 @@ static bool calledBySystem(void *returnAddress) {
 }
 
 // --- Which textures are converted --------------------------------------------
-
-@interface SPBCTextureInfo : NSObject
-@property (nonatomic) MTLPixelFormat requested;   // what the guest asked for and sees
-@property (nonatomic) SPBCKind kind;
-@end
-@implementation SPBCTextureInfo @end
 
 static char infoKey;
 enum { MaxSubclasses = 32 };
@@ -187,17 +256,18 @@ static bool spBCRegion(id<MTLTexture> texture, NSUInteger level, NSUInteger slic
 enum { SPBCTileLimit = 4 * 1024 * 1024, SPBCStagingLimit = 128 * 1024 * 1024 };
 
 static bool spBCReserve(size_t bytes) {
-    unsigned long long live = atomic_load(&spBCStaging);
+    unsigned long long live = atomic_load(&spBCStagingReserved);
     do {
         if (bytes > SPBCStagingLimit - live) return false;
-    } while (!atomic_compare_exchange_weak(&spBCStaging, &live, live + bytes));
-    spBCMax(&spBCPeak, live + bytes);
+    } while (!atomic_compare_exchange_weak(&spBCStagingReserved, &live, live + bytes));
+    spBCMax(&spBCReservedPeak, live + bytes);
     return true;
 }
 
 static void spBCStagingFailure(void) {
-    atomic_fetch_add(&spBCStagingFailures, 1);
-    spBCSummary();
+    unsigned long long count = atomic_fetch_add(&spBCStagingFailures, 1) + 1;
+    if (!(count & (count - 1)))
+        spBCLog(@"SP_BC_FALLBACK staging allocation or reservation failed count=%llu", count);
 }
 
 static bool spBCDecodeTile(SPBCKind kind, const uint8_t *source, SPBCLayout layout,
@@ -239,7 +309,7 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
     if (!spBCReserve(capacity)) { spBCStagingFailure(); return; }
     uint8_t *decoded = malloc(capacity);
     if (!decoded) {
-        atomic_fetch_sub(&spBCStaging, capacity);
+        atomic_fetch_sub(&spBCStagingReserved, capacity);
         spBCStagingFailure();
         return;
     }
@@ -253,8 +323,7 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
         insideTexture--;
     } while (SPBCNextTile(info.kind, layout.size, 1, SPBCTileLimit, &cursor, &tile));
     free(decoded);
-    atomic_fetch_sub(&spBCStaging, capacity);
-    spBCSummary();
+    atomic_fetch_sub(&spBCStagingReserved, capacity);
 }
 
 static void textureReplaceSlice(id self, SEL selector, MTLRegion region, NSUInteger level, NSUInteger slice,
@@ -263,7 +332,9 @@ static void textureReplaceSlice(id self, SEL selector, MTLRegion region, NSUInte
         ((ReplaceRegion)superIMP(self, selector))(self, selector, region, level, slice, bytes, row, image);
         return;
     }
-    uploadDecoded(self, selector, infoOf(self), region, level, slice, bytes, row, image, false);
+    @autoreleasepool {
+        uploadDecoded(self, selector, infoOf(self), region, level, slice, bytes, row, image, false);
+    }
 }
 static void textureReplace(id self, SEL selector, MTLRegion region, NSUInteger level, const void *bytes, NSUInteger row) {
     if (insideTexture || calledBySystem(__builtin_return_address(0))) {
@@ -271,7 +342,9 @@ static void textureReplace(id self, SEL selector, MTLRegion region, NSUInteger l
             (self, selector, region, level, bytes, row);
         return;
     }
-    uploadDecoded(self, selector, infoOf(self), region, level, 0, bytes, row, 0, true);
+    @autoreleasepool {
+        uploadDecoded(self, selector, infoOf(self), region, level, 0, bytes, row, 0, true);
+    }
 }
 
 static void textureGetSlice(id self, SEL selector, void *bytes, NSUInteger row, NSUInteger image,
@@ -292,7 +365,7 @@ static void textureGet(id self, SEL selector, void *bytes, NSUInteger row, MTLRe
     spBCReject(SPBCRead, selector, infoOf(self).requested, "BC readback needs an encoder");
 }
 
-static id converted(id texture, MTLPixelFormat requested);
+static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view);
 typedef id (*ViewFormat)(id, SEL, MTLPixelFormat) RETAINED;
 typedef id (*ViewRange)(id, SEL, MTLPixelFormat, MTLTextureType, NSRange, NSRange) RETAINED;
 typedef id (*ViewSwizzle)(id, SEL, MTLPixelFormat, MTLTextureType, NSRange, NSRange, MTLTextureSwizzleChannels) RETAINED;
@@ -316,7 +389,7 @@ static id textureView(id self, SEL selector, MTLPixelFormat format) {
     if (!spBCViewAllowed(self, selector, format, SPBCView)) return nil;
     MTLPixelFormat stored = (MTLPixelFormat)SPBCDecodedPixelFormat(format);
     insideTexture++; id view = real(self, selector, (MTLPixelFormat)stored); insideTexture--;
-    return converted(view, format);
+    return converted(view, format, true);
 }
 static id textureViewRange(id self, SEL selector, MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices) RETAINED;
 static id textureViewRange(id self, SEL selector, MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices) {
@@ -325,7 +398,7 @@ static id textureViewRange(id self, SEL selector, MTLPixelFormat format, MTLText
     if (!spBCViewAllowed(self, selector, format, SPBCViewRange)) return nil;
     MTLPixelFormat stored = (MTLPixelFormat)SPBCDecodedPixelFormat(format);
     insideTexture++; id view = real(self, selector, (MTLPixelFormat)stored, type, levels, slices); insideTexture--;
-    return converted(view, format);
+    return converted(view, format, true);
 }
 static id textureViewSwizzle(id self, SEL selector, MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices,
                              MTLTextureSwizzleChannels swizzle) RETAINED;
@@ -336,7 +409,7 @@ static id textureViewSwizzle(id self, SEL selector, MTLPixelFormat format, MTLTe
     if (!spBCViewAllowed(self, selector, format, SPBCViewSwizzle)) return nil;
     MTLPixelFormat stored = (MTLPixelFormat)SPBCDecodedPixelFormat(format);
     insideTexture++; id view = real(self, selector, (MTLPixelFormat)stored, type, levels, slices, swizzle); insideTexture--;
-    return converted(view, format);
+    return converted(view, format, true);
 }
 static id textureViewDescriptor(id self, SEL selector, id descriptor) RETAINED;
 static id textureViewDescriptor(id self, SEL selector, id descriptor) {
@@ -354,7 +427,7 @@ static id textureViewDescriptor(id self, SEL selector, id descriptor) {
     insideTexture++;
     id result = real(self, selector, copy);
     insideTexture--;
-    return converted(result, format);
+    return converted(result, format, true);
 }
 
 static Class subclassFor(Class base) {
@@ -391,21 +464,36 @@ static Class subclassFor(Class base) {
     }
 }
 
-static id converted(id texture, MTLPixelFormat requested) {
+static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view) {
     Class cls = texture ? subclassFor(object_getClass(texture)) : Nil;
     if (!cls) {
-        atomic_fetch_add(&spBCTextureFailures, 1);
-        spBCSummary();
+        unsigned long long count = atomic_fetch_add(&spBCTextureFailures, 1) + 1;
+        if (!(count & (count - 1)))
+            spBCLog(@"SP_BC_FALLBACK texture failed format=%lu view=%d metalReturnedNil=%d count=%llu",
+                    (unsigned long)requested, view, texture == nil, count);
         return nil;
     }
+    if (infoOf(texture)) return texture;
     SPBCTextureInfo *info = [SPBCTextureInfo new];
     info.requested = requested;
     info.kind = SPBCKindOfPixelFormat(requested);
-    objc_setAssociatedObject(texture, &infoKey, info, OBJC_ASSOCIATION_RETAIN);
+    if (!view)
+        info.trackedBytes = SPBCTextureBytes(info.kind, (SPBCSize){texture.width, texture.height, texture.depth},
+                                             texture.textureType, texture.mipmapLevelCount, texture.arrayLength,
+                                             texture.sampleCount);
+    @synchronized ([SPBCTextureInfo class]) {
+        spBCTextureStats.allocated++;
+        spBCTextureStats.liveBytes += info.trackedBytes;
+    }
+    // Immutable after publication. Avoid the atomic association getter's
+    // autorelease, which could keep the sentinel alive past the texture.
+    objc_setAssociatedObject(texture, &infoKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     object_setClass(texture, cls);
-    atomic_fetch_add(&spBCTextures, 1);
     atomic_fetch_add(&spBCFormats[requested - 130], 1);
-    spBCSummary();
+    if (spBCVerbose)
+        spBCLog(@"SP_BC_FALLBACK texture format=%lu view=%d size=%lux%lux%lu mips=%lu bytes=%zu",
+                (unsigned long)requested, view, (unsigned long)texture.width, (unsigned long)texture.height,
+                (unsigned long)texture.depth, (unsigned long)texture.mipmapLevelCount, info.trackedBytes);
     return texture;
 }
 
@@ -466,9 +554,13 @@ static MTLTextureDescriptor *spBCStoredDescriptor(MTLTextureDescriptor *descript
 static MTLSizeAndAlign spBCHeapSize(id device, SEL selector, MTLTextureDescriptor *descriptor,
                                   MTLSizeAndAlign (*real)(id, SEL, MTLTextureDescriptor *),
                                   MTLPixelFormat *physicalFormat) {
-    MTLTextureDescriptor *stored = spBCActive(device) ? spBCStoredDescriptor(descriptor) : nil;
-    if (physicalFormat) *physicalFormat = (stored ?: descriptor).pixelFormat;
-    return real(device, selector, stored ?: descriptor);
+    @autoreleasepool {
+        bool active = spBCActive(device);
+        if (active) atomic_fetch_add(&spBCSizingQueries, 1);
+        MTLTextureDescriptor *stored = active ? spBCStoredDescriptor(descriptor) : nil;
+        if (physicalFormat) *physicalFormat = (stored ?: descriptor).pixelFormat;
+        return real(device, selector, stored ?: descriptor);
+    }
 }
 
 #if !SP_METAL_DIAG
@@ -488,11 +580,13 @@ static id newTexture(id owner, SEL selector, MTLTextureDescriptor *descriptor) {
     if (!spBCActive(owner) && !([owner respondsToSelector:@selector(device)] &&
                                 spBCActive([(id<MTLHeap>)owner device])))
         return real(owner, selector, descriptor);
-    MTLTextureDescriptor *stored = spBCStoredDescriptor(descriptor);
-    spBCCreating++;
-    id texture = real(owner, selector, stored);
-    spBCCreating--;
-    return converted(texture, descriptor.pixelFormat);
+    @autoreleasepool {
+        MTLTextureDescriptor *stored = spBCStoredDescriptor(descriptor);
+        spBCCreating++;
+        id texture = real(owner, selector, stored);
+        spBCCreating--;
+        return converted(texture, descriptor.pixelFormat, false);
+    }
 }
 
 static id newTextureAtOffset(id<MTLHeap> heap, SEL selector, MTLTextureDescriptor *descriptor,
@@ -501,11 +595,13 @@ static id newTextureAtOffset(id<MTLHeap> heap, SEL selector, MTLTextureDescripto
     CreateAtOffset real = (CreateAtOffset)original(heap, selector);
     if (spBCCreating || !SPBCKindOfPixelFormat(descriptor.pixelFormat) || !spBCActive(heap.device))
         return real(heap, selector, descriptor, offset);
-    MTLTextureDescriptor *stored = spBCStoredDescriptor(descriptor);
-    spBCCreating++;
-    id texture = real(heap, selector, stored, offset);
-    spBCCreating--;
-    return converted(texture, descriptor.pixelFormat);
+    @autoreleasepool {
+        MTLTextureDescriptor *stored = spBCStoredDescriptor(descriptor);
+        spBCCreating++;
+        id texture = real(heap, selector, stored, offset);
+        spBCCreating--;
+        return converted(texture, descriptor.pixelFormat, false);
+    }
 }
 
 static id spBCSurfaceTexture(id device, SEL selector, MTLTextureDescriptor *descriptor,
@@ -571,6 +667,7 @@ static id newHeap(id device, SEL selector, MTLHeapDescriptor *descriptor) RETAIN
 static id newHeap(id device, SEL selector, MTLHeapDescriptor *descriptor) {
     id heap = ((CreateWith)original(device, selector))(device, selector, descriptor);
     if (heap && spBCActive(device)) {
+        @synchronized (spBCHeaps) { [spBCHeaps addObject:heap]; }
         Class cls = object_getClass(heap);
         hook(cls, @selector(newTextureWithDescriptor:), (IMP)newTexture);
         hook(cls, @selector(newTextureWithDescriptor:offset:), (IMP)newTextureAtOffset);
@@ -578,6 +675,26 @@ static id newHeap(id device, SEL selector, MTLHeapDescriptor *descriptor) {
         hook(cls, @selector(newBufferWithLength:options:offset:), (IMP)spBCNewBufferAt);
     }
     return heap;
+}
+
+// Count the buffer until Metal releases it too. The reservation separately
+// follows the shim upload and still governs the existing scratch/staging cap.
+static char spBCStagingKey;
+@interface SPBCStagingInfo : NSObject {
+@public
+    size_t bytes;
+}
+@end
+@implementation SPBCStagingInfo
+- (void)dealloc { atomic_fetch_sub(&spBCStagingLive, bytes); }
+@end
+
+static void spBCTrackStaging(id<MTLBuffer> buffer) {
+    SPBCStagingInfo *info = [SPBCStagingInfo new];
+    info->bytes = buffer.length;
+    unsigned long long live = atomic_fetch_add(&spBCStagingLive, info->bytes) + info->bytes;
+    spBCMax(&spBCStagingPeak, live);
+    objc_setAssociatedObject(buffer, &spBCStagingKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 @interface SPBCUpload : NSObject {
@@ -599,7 +716,7 @@ static id newHeap(id device, SEL selector, MTLHeapDescriptor *descriptor) {
 - (void)dealloc {
     size_t bytes = tile.bytes;
     staging = nil;
-    if (bytes) atomic_fetch_sub(&spBCStaging, bytes);
+    if (bytes) atomic_fetch_sub(&spBCStagingReserved, bytes);
 }
 @end
 
@@ -641,7 +758,6 @@ static void commitCommandBuffer(id<MTLCommandBuffer> commandBuffer, SEL selector
             (void)retained;
             retained = nil;
         }];
-        spBCSummary();
     }
     ((void (*)(id, SEL))original(commandBuffer, selector))(commandBuffer, selector);
 }
@@ -681,6 +797,7 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
         upload->tile = tile;
         upload->staging = [texture.device newBufferWithLength:tile.bytes options:MTLResourceStorageModeShared];
         if (!upload->staging) { spBCStagingFailure(); return; }
+        spBCTrackStaging(upload->staging);
         upload->source = source;
         upload->destination = texture;
         upload->layout = layout;
@@ -713,16 +830,22 @@ static void copyBufferToTexture(id encoder, SEL selector, id<MTLBuffer> source, 
                                 NSUInteger image, MTLSize size, id<MTLTexture> texture, NSUInteger slice,
                                 NSUInteger level, MTLOrigin origin) {
     SPBCTextureInfo *info = insideTexture ? nil : infoOf(texture);
-    if (info) stageUpload(encoder, selector, source, offset, row, image, size, texture, slice, level, origin, 0, false, info);
-    else ((BufferToTexture)original(encoder, selector))(encoder, selector, source, offset, row, image, size,
+    if (info) {
+        @autoreleasepool {
+            stageUpload(encoder, selector, source, offset, row, image, size, texture, slice, level, origin, 0, false, info);
+        }
+    } else ((BufferToTexture)original(encoder, selector))(encoder, selector, source, offset, row, image, size,
                                                          texture, slice, level, origin);
 }
 static void copyBufferToTextureOptions(id encoder, SEL selector, id<MTLBuffer> source, NSUInteger offset, NSUInteger row,
                                        NSUInteger image, MTLSize size, id<MTLTexture> texture, NSUInteger slice,
                                        NSUInteger level, MTLOrigin origin, MTLBlitOption options) {
     SPBCTextureInfo *info = insideTexture ? nil : infoOf(texture);
-    if (info) stageUpload(encoder, selector, source, offset, row, image, size, texture, slice, level, origin, options, true, info);
-    else ((BufferToTextureOptions)original(encoder, selector))(encoder, selector, source, offset, row, image, size,
+    if (info) {
+        @autoreleasepool {
+            stageUpload(encoder, selector, source, offset, row, image, size, texture, slice, level, origin, options, true, info);
+        }
+    } else ((BufferToTextureOptions)original(encoder, selector))(encoder, selector, source, offset, row, image, size,
                                                                 texture, slice, level, origin, options);
 }
 
@@ -857,6 +980,10 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
             enabled ? "no-native-BC" : haveProperty ? "native-BC" : "capability-unavailable");
     if (!enabled) return;
     findSharedCache();
+    const char *verbose = getenv("SP_BC_VERBOSE");
+    spBCVerbose = verbose && strcmp(verbose, "1") == 0;
+    spBCHeaps = [[NSHashTable alloc] initWithOptions:NSPointerFunctionsWeakMemory |
+                                                    NSPointerFunctionsObjectPointerPersonality capacity:0];
     objc_setAssociatedObject(device, &spBCActiveKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 #if !SP_METAL_DIAG
     hook(cls, @selector(heapTextureSizeAndAlignWithDescriptor:), (IMP)spBCHeapSizeHook);
@@ -871,4 +998,5 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
     hook(cls, @selector(newCommandQueue), (IMP)spBCNewQueue);
     hook(cls, @selector(newCommandQueueWithMaxCommandBufferCount:), (IMP)spBCNewQueueCount);
     hook(cls, sel_registerName("newCommandQueueWithDescriptor:"), (IMP)spBCNewQueueDescriptor);
+    spBCStartSummary(device);
 }

@@ -77,6 +77,25 @@ static void test_volume_and_tiles(void) {
             for (size_t x = 0; x < 63; x++) assert(coverage[z][y][x] == 1);
 }
 
+static void test_texture_bytes(void) {
+    const SPBCSize image = {7, 5, 1};
+    const SPBCSize volume = {7, 5, 3};
+    const SPBCSize cube = {8, 8, 1};
+    assert(SPBCTextureBytes(SPBC1, image, 2, 3, 1, 1) == 4 * (35 + 6 + 1));
+    assert(SPBCTextureBytes(SPBC3, image, 3, 3, 2, 1) == 8 * (35 + 6 + 1));
+    assert(SPBCTextureBytes(SPBC4S, volume, 7, 3, 1, 1) == 105 + 6 + 1);
+    assert(SPBCTextureBytes(SPBC5, cube, 5, 4, 1, 1) == 2 * 6 * (64 + 16 + 4 + 1));
+    assert(SPBCTextureBytes(SPBC5S, cube, 6, 4, 3, 1) == 2 * 18 * (64 + 16 + 4 + 1));
+    assert(SPBCTextureBytes(SPBC6H, image, 8, 1, 2, 4) == 35 * 8 * 2 * 4);
+    assert(!SPBCTextureBytes(SPBCNone, image, 2, 1, 1, 1));
+    assert(!SPBCTextureBytes(SPBC1, image, 2, 0, 1, 1));
+    assert(!SPBCTextureBytes(SPBC1, (SPBCSize){SIZE_MAX, 2, 1}, 2, 1, 1, 1));
+    assert(!SPBCTextureBytes(SPBC1, (SPBCSize){SIZE_MAX, 1, 1}, 2, 2, 1, 1));
+    assert(!SPBCTextureBytes(SPBC1, (SPBCSize){SIZE_MAX, 1, 1}, 2, 1, 1, 1));
+    assert(!SPBCTextureBytes(SPBC1, cube, 6, 1, SIZE_MAX, 1));
+    puts("BC texture bytes: packed formats, mip chains, arrays, cubes, volumes, and overflow: PASS");
+}
+
 int main(void) {
     test_descriptor(130, 64, 5, (size_t[]){2048, 512, 128, 32, 8},
                     (size_t[]){16384, 4096, 1024, 256, 64});
@@ -84,5 +103,6 @@ int main(void) {
     assert(SPBCPhysicalDescriptor((SPBCDescriptor){.format = 131}).format == 71);
     assert(SPBCMipSize((SPBCSize){5, 3, 9}, 1000).depth == 1);
     test_volume_and_tiles();
+    test_texture_bytes();
     puts("BC layout: A/B descriptors, mip sizes, source offset and pitches, clipping, slices, and bounded tiles: PASS");
 }
