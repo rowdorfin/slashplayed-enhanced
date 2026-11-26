@@ -60,6 +60,7 @@ jobs:
               "app_sha": os.environ["GITHUB_SHA"],
               "upstream_sha": os.environ["SP_UPSTREAM_SHA"],
               "SP_METAL_DIAG": 1,
+              "SP_BC_FALLBACK": 1,
           }
           path = Path(os.environ["RUNNER_TEMP"]) / "kit" / "metadata.json"
           path.write_text(json.dumps(metadata, indent=2) + "\n")
@@ -70,13 +71,26 @@ jobs:
       - name: Fetch the start screen's font
         run: scripts/fetch-font.sh
 
+      - name: Test the BC decoder and layout with sanitizers
+        run: CC=clang shims/metal/tests/run.sh
+
       - name: Build and hash the diagnostic kit
         run: |
           set -euo pipefail
           sh apps/companion/bundle-resources.sh --build "$RUNNER_TEMP/stage"
           scripts/release/device-kit.sh "$RUNNER_TEMP/stage" "$RUNNER_TEMP/kit/slashplayed-device-kit.zip"
+          cp shims/metal/LICENSE.tolkara "$RUNNER_TEMP/kit/LICENSE.tolkara"
           cd "$RUNNER_TEMP/kit"
           shasum -a 256 slashplayed-device-kit.zip > SHA256SUMS
+
+      - name: Verify BC fallback in both packaged Metal shims
+        run: |
+          set -euo pipefail
+          for platform in ios xros; do
+            unzip -p "$RUNNER_TEMP/kit/slashplayed-device-kit.zip" \
+              "$platform/Slashplayed.app/Frameworks/libspMetal.dylib" |
+              strings -a | grep -F 'SP_BC_FALLBACK' >/dev/null
+          done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -85,5 +99,6 @@ jobs:
             ${{ runner.temp }}/kit/slashplayed-device-kit.zip
             ${{ runner.temp }}/kit/SHA256SUMS
             ${{ runner.temp }}/kit/metadata.json
+            ${{ runner.temp }}/kit/LICENSE.tolkara
           if-no-files-found: error
           retention-days: 7
