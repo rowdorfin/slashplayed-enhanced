@@ -168,13 +168,21 @@ static CGFloat sp_native_scale(void) {
 // long-edge IDs name fixed presets. An old availability toggle must never hide a valid game choice.
 enum { SPResolutionFullDetail = 1, SPResolutionLowerPower = 2, SPResolutionNative = 3 };
 
+static NSInteger sp_session_resolution = -1;
+
 static NSInteger sp_optimized_resolution(void) {
-    if (sp_scale_overridden()) return 0;
+    if (sp_session_resolution >= 0) return sp_session_resolution;
     NSInteger saved = [NSUserDefaults.standardUserDefaults integerForKey:@"sp_optimized_resolution"];
     switch (saved) {
         case 1280: case 1600: case 1688: case SPResolutionNative: return saved;
         default: return 0;
     }
+}
+
+// Snapshot the start screen's choice after Settings closes, before entering the guest.
+__attribute__((visibility("default"))) NSInteger sp_lock_optimized_resolution(void) {
+    sp_session_resolution = sp_optimized_resolution();
+    return sp_session_resolution;
 }
 
 static NSArray<NSNumber *> *sp_resolution_catalog(void) {
@@ -469,6 +477,14 @@ static void sp_set_rect(id obj, void *key, CGRect r) {
 // off screen.
 static CALayer *sp_resolution_layer;
 static void (*sp_drawable_size_orig)(id, SEL, CGSize);
+static void sp_resolution_log(NSString *line) {
+    sp_stub_log(line.UTF8String);
+    static void (*append)(const char *);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ append = (void (*)(const char *))dlsym(RTLD_DEFAULT, "sp_launch_metal_log"); });
+    if (append) append(line.UTF8String);
+}
+
 static void sp_log_resolution(CAMetalLayer *layer) {
     if (!layer) return;
     CGRect game = sp_game_rect();
@@ -513,29 +529,50 @@ static void sp_log_resolution(CAMetalLayer *layer) {
         requested, physical.width, physical.height, game.size.width, game.size.height,
         drawable.width, drawable.height, render ?: "unknown", ui ?: "unknown",
         (unsigned)(rt >> 32), (unsigned)rt, useUI ?: "unknown"];
-    sp_stub_log(line.UTF8String);
+    sp_resolution_log(line);
 }
 
 static void sp_drawable_size(id layer, SEL selector, CGSize size) {
-    if (layer == sp_resolution_layer && sp_window) {
+    if (layer == sp_resolution_layer) {
         NSInteger optimized = sp_optimized_resolution();
-        if (optimized && size.width > 0 && size.height > 0) size = sp_mode_pixels(optimized);
-        else if (!optimized) sp_select_pixel_size(size);
+        if (optimized) {
+            CGSize fixed = sp_mode_pixels(optimized);
+            if (!CGSizeEqualToSize(size, fixed)) {
+                static atomic_uint overrides;
+                if (atomic_fetch_add_explicit(&overrides, 1, memory_order_relaxed) < 12)
+                    sp_resolution_log([NSString stringWithFormat:@"SP_RESOLUTION override wanted=%gx%g kept=%gx%g",
+                                       size.width, size.height, fixed.width, fixed.height]);
+                size = fixed;
+            }
+        } else if (sp_window) {
+            sp_select_pixel_size(size);
+        }
     }
     sp_drawable_size_orig(layer, selector, size);
 }
 
-static void sp_layer_show(CALayer *l) {
-    sp_resolution_layer = l;
+static void sp_track_resolution_layer(CALayer *layer) {
+    sp_resolution_layer = layer;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         Method method = class_getInstanceMethod(NSClassFromString(@"CAMetalLayer"), sel_registerName("setDrawableSize:"));
         if (method) sp_drawable_size_orig = (void *)method_setImplementation(method, (IMP)sp_drawable_size);
     });
+}
+
+static void sp_enforce_drawable_size(CALayer *layer) {
+    NSInteger optimized = sp_optimized_resolution();
+    if (!optimized || ![layer isKindOfClass:NSClassFromString(@"CAMetalLayer")]) return;
+    CAMetalLayer *metal = (CAMetalLayer *)layer;
+    CGSize fixed = sp_mode_pixels(optimized);
+    if (!CGSizeEqualToSize(metal.drawableSize, fixed)) metal.drawableSize = fixed;
+}
+
+static void sp_layer_show(CALayer *l) {
+    sp_track_resolution_layer(l);
     l.frame = sp_game_rect();
     l.contentsScale = sp_scale;
-    if ([l isKindOfClass:NSClassFromString(@"CAMetalLayer")] && sp_optimized_resolution())
-        ((CAMetalLayer *)l).drawableSize = sp_mode_pixels(sp_resolution_now());
+    sp_enforce_drawable_size(l);
     [sp_window.rootViewController.view.layer addSublayer:l];
     sp_hover_attach(l);
 }
@@ -636,11 +673,16 @@ static void sp_scene_connect_late(void) {
     if (old != layer && [old isKindOfClass:NSClassFromString(@"CALayer")]) [old removeFromSuperlayer];
     objc_setAssociatedObject(self, &sp_layer_key, layer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (old != layer && old == sp_layer_waiting) sp_layer_waiting = nil;
+    if (old && old != layer && old == sp_resolution_layer && sp_optimized_resolution()) sp_resolution_layer = nil;
     if (![layer isKindOfClass:NSClassFromString(@"CALayer")]) return;
     if (sp_window) {
         sp_layer_show(layer);
     } else {
         sp_layer_waiting = layer;
+        if (sp_optimized_resolution()) {
+            sp_track_resolution_layer(layer);
+            sp_enforce_drawable_size(layer);
+        }
         sp_stub_log("client's layer set before the scene connected: it goes on screen when the scene does");
     }
 }
@@ -705,10 +747,7 @@ static void sp_window_track_scene(void) {
     BOOL display_changed = !CGRectEqualToRect(screen, sp_told_screen);
     BOOL scale_changed = scale != sp_told_scale;
     CAMetalLayer *metal = [layer isKindOfClass:NSClassFromString(@"CAMetalLayer")] ? (CAMetalLayer *)layer : nil;
-    if (metal && sp_optimized_resolution()) {
-        CGSize wanted = sp_mode_pixels(sp_resolution_now());
-        if (!CGSizeEqualToSize(metal.drawableSize, wanted)) metal.drawableSize = wanted;
-    }
+    sp_enforce_drawable_size(metal);
     if (!resized && !moved && !layer_off && !display_changed && !scale_changed) {
         sp_log_resolution(metal);
         return;
@@ -739,6 +778,7 @@ static void sp_window_track_scene(void) {
     if (layer) {
         sp_set_layer_frame(layer, game);
         layer.contentsScale = scale;
+        sp_enforce_drawable_size(layer);
     }
     sp_game_moved(game);
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;

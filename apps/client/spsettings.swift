@@ -873,6 +873,7 @@ struct SettingsView: View {
                     Text("Balanceado").tag(2)
                     Text("Qualidade").tag(3)
                     Text("A16 Performance").tag(4)
+                    Text("A16 Low Memory").tag(5)
                 }
                 Button("Restaurar configuração anterior") {
                     if sp_graphics_restore() {

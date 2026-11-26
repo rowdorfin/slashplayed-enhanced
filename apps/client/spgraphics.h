@@ -8,7 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum SPGraphicsPreset { SP_GRAPHICS_KEEP, SP_GRAPHICS_PERFORMANCE, SP_GRAPHICS_BALANCED, SP_GRAPHICS_QUALITY, SP_GRAPHICS_A16 };
+enum SPGraphicsPreset {
+    SP_GRAPHICS_KEEP, SP_GRAPHICS_PERFORMANCE, SP_GRAPHICS_BALANCED, SP_GRAPHICS_QUALITY,
+    SP_GRAPHICS_A16, SP_GRAPHICS_A16_LOW_MEMORY
+};
+
+static bool sp_graphics_is_a16(enum SPGraphicsPreset preset) {
+    return preset == SP_GRAPHICS_A16 || preset == SP_GRAPHICS_A16_LOW_MEMORY;
+}
 
 typedef struct {
     const char *name;
@@ -130,31 +137,34 @@ static char *sp_wtf_edit(const char *text, SPWTFEdit *edits, size_t count) {
     return output;
 }
 
-// Gethe/wow-ui-source tag 1.60.1, Interface/AddOns. G = Blizzard_SettingsDefinitions_Shared/Graphics.lua.
-// The launcher already seeds 0.5 on iPhone. Graphics.lua queries GetMinRenderScale()
-// at runtime, so the client's accepted minimum still needs readback.
-static const struct { const char *name, *values[4]; } sp_graphics_cvars[] = {
-    {"RenderScale",               {"0.75", "0.85", NULL, "0.5"}}, // G:875-899
-    {"graphicsShadowQuality",     {"0",    "2",    NULL, "0"}}, // G:109,134-142
-    {"graphicsParticleDensity",   {"1",    "2",    NULL, "1"}}, // G:115,179-196; keeps combat cues
-    {"graphicsSSAO",              {"0",    "1",    NULL, "0"}}, // G:116,201-208
-    {"graphicsGroundClutter",     {"0",    "4",    NULL, "0"}}, // G:132,441-443,491
-    {"graphicsTextureResolution", {"0",    "1",    NULL, "0"}}, // G:120,473; GraphicsOverrides.lua:67-74 (0 low, 1 fair, 2 high)
-    {"useMaxFPS",                 {"1",    "1",    NULL, "1"}}, // G:1466-1469
-    {"maxFPS",                    {"30",   "45",   "60", "30"}}, // G:1471-1477
-    {"graphicsLiquidDetail",      {NULL, NULL, NULL, "0"}},
-    {"graphicsDepthEffects",      {NULL, NULL, NULL, "0"}},
-    {"graphicsComputeEffects",    {NULL, NULL, NULL, "0"}},
-    {"graphicsPBRLiquidDetail",   {NULL, NULL, NULL, "0"}},
-    {"graphicsProjectedTextures", {NULL, NULL, NULL, "0"}},
-    {"graphicsViewDistance",      {NULL, NULL, NULL, "0"}},
-    {"graphicsEnvironmentDetail", {NULL, NULL, NULL, "0"}},
-    {"textureFilteringMode",      {NULL, NULL, NULL, "0"}},
-    {"ffxAntiAliasingMode",        {NULL, NULL, NULL, "0"}},
-    {"MSAAQuality",                {NULL, NULL, NULL, "0"}},
-    {"RAIDsettingsEnabled",       {NULL, NULL, NULL, "0"}},
+// Gethe/wow-ui-source 1.60.1: G = Blizzard_SettingsDefinitions_Shared/Graphics.lua;
+// O = Blizzard_Settings_Shared/Mainline/GraphicsOverrides.lua (both under Interface/AddOns).
+// GetMinRenderScale() is a runtime query; use the existing iPhone seed of 0.5.
+// G:1292-1305 exposes shadowrt only on non-Mac clients without secondary lighting.
+// Neither UI file exposes shadowTextureSize or shadowMode.
+static const struct { const char *name, *values[SP_GRAPHICS_A16_LOW_MEMORY]; } sp_graphics_cvars[] = {
+    {"RenderScale",                 {"0.75", "0.85", NULL, "0.5", "0.5"}}, // G:877,895-899
+    {"graphicsShadowQuality",       {"0", "2", NULL, "0", "0"}}, // O:7; G:137
+    {"graphicsParticleDensity",     {"1", "2", NULL, "1", "1"}}, // O:12; G:179-196
+    {"graphicsSSAO",                {"0", "1", NULL, "0", "0"}}, // O:13; G:201-208
+    {"graphicsGroundClutter",       {"0", "4", NULL, "0", "0"}}, // O:29; G:441-443,491
+    {"graphicsTextureResolution",   {"0", "1", NULL, "0", "0"}}, // O:19,67-74
+    {"useMaxFPS",                   {"1", "1", NULL, "1", "1"}}, // G:1466-1469
+    {"maxFPS",                      {"30", "45", "60", "30", "30"}}, // G:1471-1477
+    {"graphicsLiquidDetail",        {NULL, NULL, NULL, "0", "0"}}, // O:8; G:161
+    {"graphicsDepthEffects",        {NULL, NULL, NULL, "0", "0"}}, // O:14; G:216
+    {"graphicsComputeEffects",      {NULL, NULL, NULL, "0", "0"}}, // O:15; G:227
+    {"graphicsPBRLiquidDetail",     {NULL, NULL, NULL, "0", "0"}}, // O:9-11; G:172
+    {"graphicsProjectedTextures",   {NULL, NULL, NULL, "0", "0"}}, // O:23; G:261
+    {"graphicsViewDistance",        {NULL, NULL, NULL, "0", "0"}}, // O:27; G:441-443,489
+    {"graphicsEnvironmentDetail",   {NULL, NULL, NULL, "0", "0"}}, // O:28; G:441-443,490
+    {"textureFilteringMode",        {NULL, NULL, NULL, "0", "0"}}, // G:1275-1279
+    {"ffxAntiAliasingMode",         {NULL, NULL, NULL, "0", "0"}}, // G:1032-1035,1085
+    {"MSAAQuality",                 {NULL, NULL, NULL, "0", "0"}}, // G:1032-1035,1110
+    {"RAIDsettingsEnabled",         {NULL, NULL, NULL, "0", "0"}}, // G:1,444-447
+    {"useHighResTextures",          {NULL, NULL, NULL, NULL, "0"}}, // O:89-103
 };
-enum { SP_GRAPHICS_LEGACY_COUNT = 8 };
+enum { SP_GRAPHICS_LEGACY_COUNT = 8, SP_GRAPHICS_ORIGINAL_A16_COUNT = 19 };
 #define SP_GRAPHICS_COUNT (sizeof sp_graphics_cvars / sizeof sp_graphics_cvars[0])
 #define SP_GRAPHICS_BACKUP_HEADER "# Slashplayed graphics backup v1\n"
 
@@ -193,7 +203,7 @@ static size_t sp_graphics_read_backup(const char *backup, SPWTFEdit *edits) {
     if (!backup || strncmp(backup, SP_GRAPHICS_BACKUP_HEADER, header)) return false;
     backup += header;
     for (size_t i = 0; i < SP_GRAPHICS_COUNT; i++) {
-        if (!*backup && i == SP_GRAPHICS_LEGACY_COUNT) return i;
+        if (!*backup && (i == SP_GRAPHICS_LEGACY_COUNT || i == SP_GRAPHICS_ORIGINAL_A16_COUNT)) return i;
         SPWTFEdit *edit = &edits[i];
         size_t name = strlen(edit->name);
         if (strncmp(backup, edit->name, name) || backup[name] != '\t') return false;
@@ -217,16 +227,16 @@ static size_t sp_graphics_read_backup(const char *backup, SPWTFEdit *edits) {
     return *backup ? 0 : SP_GRAPHICS_COUNT;
 }
 
-// Old backups cover the original eight keys. Capture the additional keys from
-// the current config before an A16 preset first edits them.
+// Append keys added since the snapshot, keeping the original saved values.
 static char *sp_graphics_expand_backup(const char *backup, const char *text) {
     SPWTFEdit edits[SP_GRAPHICS_COUNT] = {0};
     sp_graphics_keys(edits);
-    if (sp_graphics_read_backup(backup, edits) != SP_GRAPHICS_LEGACY_COUNT) return NULL;
+    size_t count = sp_graphics_read_backup(backup, edits);
+    if (!count || count == SP_GRAPHICS_COUNT) return NULL;
     char *full = sp_graphics_backup(text, SP_GRAPHICS_COUNT);
     if (!full) return NULL;
     const char *suffix = full + sizeof SP_GRAPHICS_BACKUP_HEADER - 1;
-    for (size_t i = 0; i < SP_GRAPHICS_LEGACY_COUNT; i++) suffix = strchr(suffix, '\n') + 1;
+    for (size_t i = 0; i < count; i++) suffix = strchr(suffix, '\n') + 1;
     char *expanded = malloc(strlen(backup) + strlen(suffix) + 1);
     if (expanded) sprintf(expanded, "%s%s", backup, suffix);
     free(full);
@@ -238,7 +248,8 @@ static char *sp_graphics_edit(const char *text, const char *backup, enum SPGraph
     SPWTFEdit edits[SP_GRAPHICS_COUNT] = {0};
     sp_graphics_keys(edits);
     size_t count = sp_graphics_read_backup(backup, edits);
-    if (!count || (preset == SP_GRAPHICS_A16 && count != SP_GRAPHICS_COUNT)) return NULL;
+    if (!count || (sp_graphics_is_a16(preset) && count <
+                   (preset == SP_GRAPHICS_A16 ? SP_GRAPHICS_ORIGINAL_A16_COUNT : SP_GRAPHICS_COUNT))) return NULL;
     for (size_t i = 0; i < count && preset != SP_GRAPHICS_KEEP; i++) {
         const char *value = sp_graphics_cvars[i].values[preset - 1];
         if (value || !(i < SP_GRAPHICS_LEGACY_COUNT ? restoreBaseline : restoreA16)) {

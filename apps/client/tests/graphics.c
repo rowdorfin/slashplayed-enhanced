@@ -86,6 +86,27 @@ int main(void) {
     performance = sp_graphics_edit(a16, expanded, SP_GRAPHICS_PERFORMANCE, false, true, &applied, &unchanged);
     assert(performance && strstr(performance, "SET graphicsViewDistance \"7\"") && !strstr(performance, "MSAAQuality"));
     free(performance);
+    const char *lowOriginal = "SET graphicsViewDistance \"7\"\nSET graphicsTextureResolution \"2\"\nSET useHighResTextures \"1\"\n";
+    char *oldA16Backup = sp_graphics_backup(a16Original, SP_GRAPHICS_ORIGINAL_A16_COUNT);
+    char *newA16Backup = sp_graphics_expand_backup(oldA16Backup, lowOriginal);
+    assert(newA16Backup && strstr(newA16Backup, "useHighResTextures\t+1\n"));
+    char *a16WithHighRes = malloc(strlen(a16) + sizeof "SET useHighResTextures \"1\"\n");
+    assert(a16WithHighRes);
+    sprintf(a16WithHighRes, "%sSET useHighResTextures \"1\"\n", a16);
+    char *low = sp_graphics_edit(a16WithHighRes, newA16Backup, SP_GRAPHICS_A16_LOW_MEMORY, false, true, &applied, &unchanged);
+    assert(low && strstr(low, "SET RenderScale \"0.5\"") && strstr(low, "SET useHighResTextures \"0\""));
+    assert(strstr(low, "SET graphicsParticleDensity \"1\"") && strstr(low, "SET graphicsProjectedTextures \"0\""));
+    assert(strstr(low, "SET ffxAntiAliasingMode \"0\"") && strstr(low, "SET MSAAQuality \"0\""));
+    restored = sp_graphics_edit(low, newA16Backup, SP_GRAPHICS_KEEP, false, false, &applied, &unchanged);
+    assert(restored && !strcmp(restored, lowOriginal));
+    free(restored);
+    char *backToA16 = sp_graphics_edit(low, newA16Backup, SP_GRAPHICS_A16, false, true, &applied, &unchanged);
+    assert(backToA16 && strstr(backToA16, "SET useHighResTextures \"1\""));
+    free(backToA16);
+    free(low);
+    free(a16WithHighRes);
+    free(newA16Backup);
+    free(oldA16Backup);
     free(a16);
     free(expanded);
     free(backup);
@@ -98,5 +119,5 @@ int main(void) {
     seeded = sp_wtf_edit("set playintromovie \"1\"\r\n", &seed, 1);
     assert(seeded && !seed.changed && !strcmp(seeded, "set playintromovie \"1\"\r\n"));
     free(seeded);
-    puts("graphics: presets, legacy backup expansion, FPS gating, exact restore, invalid backup and intro seeding passed");
+    puts("graphics: presets including A16 Low Memory, both legacy backup expansions, FPS gating, exact restore, invalid backup and intro seeding passed");
 }

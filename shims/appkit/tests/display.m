@@ -176,8 +176,13 @@ static void sp_test_run(void) {
             sp_test_check(fabs(pixels.width - logical.width * scale) <= 1 &&
                           fabs(pixels.height - logical.height * scale) <= 1,
                           @"Both axes use the same scale before rounding to even pixels.");
+            sp_test_check(!sp_select_resolution(2560), @"WoW cannot select its old 2560 display mode.");
             layer.drawableSize = CGSizeMake(2560, 1238);
-            sp_test_check(CGSizeEqualToSize(layer.drawableSize, pixels), @"An oversized drawable request respects the selected ceiling.");
+            sp_test_check(CGSizeEqualToSize(layer.drawableSize, pixels), @"A later 2560 drawable request keeps the fixed dimensions immediately.");
+            layer.drawableSize = CGSizeZero;
+            sp_test_check(CGSizeEqualToSize(layer.drawableSize, pixels), @"A zero-sized request cannot clear the fixed drawable.");
+            sp_window_track_scene();
+            sp_test_check(CGSizeEqualToSize(layer.drawableSize, pixels), @"Scene tracking keeps the fixed drawable.");
             if (layer.device) {
                 @autoreleasepool {
                     id<CAMetalDrawable> drawable = [layer nextDrawable];
@@ -197,8 +202,24 @@ static void sp_test_run(void) {
         }
         [defaults removeObjectForKey:@"sp_optimized_resolution"];
         sp_window_track_scene();
-        sp_test_check(sp_resolution_now() == resolution, @"Removing the override restores the previously selected mode.");
+        sp_test_check(sp_resolution_now() == resolution, @"Game-controlled mode restores the previous selection.");
+        CGSize wanted = sp_mode_pixels(2560);
+        layer.drawableSize = wanted;
+        sp_test_check(CGSizeEqualToSize(layer.drawableSize, wanted) && sp_resolution_now() == 2560,
+                      @"Game-controlled mode still accepts a later 2560 drawable request.");
     }
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setInteger:1280 forKey:@"sp_optimized_resolution"];
+    sp_test_check(sp_lock_optimized_resolution() == 1280, @"An explicit width takes precedence over SP_SCALE.");
+    [defaults removeObjectForKey:@"sp_optimized_resolution"];
+    CAMetalLayer *replacement = [CAMetalLayer layer];
+    replacement.device = layer.device;
+    replacement.drawableSize = CGSizeMake(2560, 1238);
+    [view setLayer:replacement];
+    replacement.drawableSize = CGSizeMake(2560, 1238);
+    sp_test_check(sp_resolution_now() == 1280 && CGSizeEqualToSize(replacement.drawableSize, sp_mode_pixels(1280)),
+                  @"The fixed session width survives a later preference change and layer replacement.");
+
     sp_test_check(sp_test_resizes >= 3, @"Orientation and resolution changes send resize notifications.");
     sp_test_check(sp_CGDisplaySetDisplayMode(2, snapshot, NULL) == 1001, @"Invalid display selections are rejected.");
     CFRelease(snapshot);
@@ -245,6 +266,7 @@ int main(int argc, char **argv) {
         [defaults setInteger:argc > 1 ? atoi(argv[1]) : 0 forKey:@"sp_resolution"];
         [defaults setInteger:argc > 2 ? atoi(argv[2]) : 0 forKey:@"sp_scale"];
         [defaults removeObjectForKey:@"sp_resolutions"];
+        [defaults removeObjectForKey:@"sp_optimized_resolution"];
         if (argc > 4) [defaults setObject:strcmp(argv[4], "nativeonly") == 0 ? @[] : @[@1920] forKey:@"sp_resolutions"];
         unsetenv("SP_SCALE");
         if (argc > 3) setenv("SP_SCALE", argv[3], 1);
