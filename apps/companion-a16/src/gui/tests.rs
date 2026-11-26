@@ -52,6 +52,8 @@ fn sign_in(h: &mut Harness<'_, App>) {
 fn sign_in_with(h: &mut Harness<'_, App>, password: &str) {
     wait_for(h, "Sign in with your Apple ID");
     type_into(h, "Apple ID", "x@example.com");
+    h.get_by_label("Continuar").click();
+    wait_for(h, "Digite a senha do Apple ID");
     type_into(h, "Password", password);
     h.get_by_label("Install").click();
 }
@@ -69,6 +71,8 @@ fn undo_doesnt_bring_the_password_back() {
     let mut h = window(|| Fake { two_factor: false, ..Default::default() });
     wait_for(&mut h, "Sign in with your Apple ID");
     type_into(&mut h, "Apple ID", "x@example.com");
+    h.get_by_label("Continuar").click();
+    wait_for(&mut h, "Digite a senha do Apple ID");
     type_into(&mut h, "Password", "wrong-one");
     // egui's undo keeps text that has stood still a while (a second), as a person's pause before Install.
     for _ in 0..90 {
@@ -78,6 +82,8 @@ fn undo_doesnt_bring_the_password_back() {
     wait_for(&mut h, "Apple didn't accept the sign-in");
     h.get_by_label("Try Again").click();
     wait_for(&mut h, "Sign in with your Apple ID");
+    h.get_by_label("Continuar").click();
+    wait_for(&mut h, "Digite a senha do Apple ID");
     h.get_by(|n| n.role() == eframe::egui::accesskit::Role::PasswordInput).focus();
     h.run_steps(2);
     h.key_press_modifiers(eframe::egui::Modifiers::COMMAND, eframe::egui::Key::Z);
@@ -117,7 +123,7 @@ fn text_me_instead() {
     wait_for(&mut h, "All set");
     let calls = log.lock().unwrap().clone();
     assert!(calls.contains(&"sms 3".to_string()), "{calls:?}");
-    assert!(calls.contains(&"code 123456 sms=true".to_string()), "{calls:?}");
+    assert!(calls.contains(&"code sms=true".to_string()), "{calls:?}");
 }
 
 #[test]
@@ -151,23 +157,11 @@ fn team_screen_only_with_several_teams() {
 }
 
 #[test]
-fn certificate_limit_cancel_or_revoke() {
-    for (button, revoked) in [("Cancel", false), ("Revoke", true)] {
-        let log = Fake::default().calls;
-        let shared = log.clone();
-        let mut h = window(move || Fake { two_factor: false, cert_limit: true, calls: shared.clone(), ..Default::default() });
-        sign_in(&mut h);
-        wait_for(&mut h, "The team has all its certificates");
-        h.get_by_label(button).click();
-        if revoked {
-            wait_for(&mut h, "All set");
-        } else {
-            wait_for(&mut h, "Nothing was revoked");
-            assert!(h.query_by_label("Try Again").is_some());
-            assert!(h.query_by_label("Copy Details").is_some());
-        }
-        assert_eq!(log.lock().unwrap().contains(&"revoked".to_string()), revoked, "{button}");
-    }
+fn certificate_limit_requires_manual_action() {
+    let mut h = window(|| Fake { two_factor: false, cert_limit: true, ..Default::default() });
+    sign_in(&mut h);
+    wait_for(&mut h, "A cota de certificados");
+    assert!(h.query_by_label("Try Again").is_some());
 }
 
 #[test]
@@ -182,9 +176,9 @@ fn every_drill_state_opens() {
             "sign-in" => "Sign in with your Apple ID",
             "code" => "Enter the code",
             "team" => "Pick a team",
-            "installing" | "cert-limit" => "Installing",
+            "installing" => "Installing",
             "done" => "All set",
-            "error" => "Something went wrong",
+            "error" | "cert-limit" => "Something went wrong",
             other => panic!("no title for the drill state {other}"),
         };
         assert!(h.query_by_label(title).is_some(), "{state}: not the {title:?} screen");

@@ -16,6 +16,8 @@ use isideload::{
 use rootcause::prelude::*;
 use zeroize::Zeroizing;
 
+use crate::session::{SessionStore, StoredSession};
+
 /// A Frontend's answer, to come: boxed, so the trait stays usable as `&dyn Frontend`, and Send, because the
 /// sign-in's 2FA callback must be.
 pub type Ask<'a, T> = Pin<Box<dyn Future<Output = Result<T, Report>> + Send + 'a>>;
@@ -132,15 +134,6 @@ pub struct SignIn {
     pub pair_again: bool,
 }
 
-/// The team's certificate limit, reached with no credential store to keep this computer's key in (so it
-/// can't reuse a certificate): whether to revoke the oldest one a Slashplayed tool made.
-pub struct CertLimit {
-    /// The team's certificates by name and end date (provision::describe).
-    pub certificates: String,
-    /// The one that would be revoked, by name and end date. Only asked when there is one.
-    pub oldest: String,
-}
-
 /// The person's side of a run.
 pub trait Frontend: Sync {
     fn report(&self, event: Event);
@@ -166,8 +159,7 @@ pub trait Frontend: Sync {
     /// Which of the Apple ID's teams signs Slashplayed, when it has several and none was named.
     fn choose_team<'a>(&'a self, teams: &'a [DeveloperTeam]) -> Ask<'a, usize>;
 
-    /// Ok to revoke, an error (saying what to do instead) not to.
-    fn confirm_revoke<'a>(&'a self, limit: &'a CertLimit) -> Ask<'a, ()>;
+
 }
 
 /// What the person can't choose, set on the command line only.
@@ -178,11 +170,13 @@ pub struct Options<'a> {
     pub team: Option<&'a str>,
     /// The app's bundle ID (--bundle-id); default <team>.slashplayed.
     pub bundle_id: Option<&'a str>,
-    pub anisette: &'a str,
+    pub anisette: Option<&'a str>,
     pub server_client_info: bool,
+    pub remember_session: bool,
+    pub remember_password: bool,
 }
 
-/// The device and Apple, for the flow. live.rs's talks to them; tests fake them.
+/// The device, Apple, and local session storage for the flow.
 #[allow(async_fn_in_trait)]
 pub trait Backend {
     /// 1. The device kit, downloaded (or read from `path`), checked, and unpacked: its version and where it
@@ -195,9 +189,12 @@ pub trait Backend {
     /// Whether Developer Mode is on (waiting for its unlock); when it's off, its setting is shown in
     /// Settings.
     async fn developer_mode(&mut self, d: &DeviceInfo, ui: &dyn Frontend) -> Result<bool, Report>;
-    /// 3. Signs in (the Frontend gives the password and the 2FA answers) and keeps the session.
-    async fn sign_in(&mut self, apple_id: &str, anisette: &str, server_client_info: bool, ui: &dyn Frontend)
-    -> Result<(), Report>;
+    fn session_store(&self) -> &dyn SessionStore;
+    async fn resume(&mut self, stored: &mut StoredSession) -> Result<bool, Report>;
+    async fn sign_in(
+        &mut self, apple_id: &str, opts: &Options<'_>,
+        remembered_password: Option<Zeroizing<String>>, ui: &dyn Frontend,
+    ) -> Result<(StoredSession, Option<Zeroizing<String>>), Report>;
     async fn teams(&mut self) -> Result<Vec<DeveloperTeam>, Report>;
     /// 4. Everything on the team; whether the team is free.
     async fn provision(
@@ -230,6 +227,89 @@ pub fn only_team(teams: &[DeveloperTeam]) -> Result<Option<usize>, Report> {
         1 => Ok(Some(0)),
         _ => Ok(None),
     }
+}
+
+async fn select_team(
+    teams: &[DeveloperTeam], explicit: Option<&str>, preferred: Option<&str>, ui: &dyn Frontend,
+) -> Result<usize, Report> {
+    if let Some(id) = explicit.or(preferred) {
+        return teams.iter().position(|t| t.team_id == id)
+            .ok_or_else(|| report!("this Apple ID has no team {id}").into_dynamic());
+    }
+    let i = match only_team(teams)? {
+        Some(i) => i,
+        None => ui.choose_team(teams).await?,
+    };
+    if i >= teams.len() {
+        bail!("not a number from the list");
+    }
+    Ok(i)
+}
+
+async fn authenticate(
+    b: &mut impl Backend, ui: &dyn Frontend, opts: &Options<'_>, apple_id: &str,
+) -> Result<(Vec<DeveloperTeam>, StoredSession, bool), Report> {
+    let mut preferred_team = None;
+    if opts.remember_session {
+        let stored = match b.session_store().load(apple_id) {
+            Ok(stored) => stored,
+            Err(e) => {
+                ui.say(&format!("Falha ao ler a sessão Apple ({})", crate::secret::safe_error(&e)));
+                None
+            }
+        };
+        if let Some(mut stored) = stored {
+            if let Some(date) = stored.valid_until()
+                && opts.anisette.is_none_or(|url| url == stored.anisette_url)
+                && (!opts.server_client_info || stored.server_client_info)
+            {
+                let validation = match b.resume(&mut stored).await {
+                    Ok(changed) => b.teams().await.map(|teams| (teams, changed)),
+                    Err(e) => Err(e),
+                };
+                match validation {
+                    Ok((teams, changed)) => {
+                        ui.say(&format!("sessão reutilizada (válida até {date})"));
+                        return Ok((teams, stored, changed));
+                    }
+                    Err(e) if crate::account::authentication_rejected(&e) => {
+                        b.session_store().delete(apple_id)?;
+                        ui.say("A Apple rejeitou a sessão guardada. É preciso entrar novamente.");
+                    }
+                    Err(e) => return Err(e).context("Falha ao validar a sessão Apple guardada")?,
+                }
+            }
+            preferred_team = stored.team_id;
+        }
+    }
+
+    ui.say("Iniciando login na Apple.");
+    let remembered = if opts.remember_password {
+        match b.session_store().load_password(apple_id) {
+            Ok(password) => password,
+            Err(e) => {
+                ui.say(&format!("Falha ao ler a senha guardada ({})", crate::secret::safe_error(&e)));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let used_remembered = remembered.is_some();
+    let (mut stored, password) = match b.sign_in(apple_id, opts, remembered, ui).await {
+        Err(e) if used_remembered && crate::account::authentication_rejected(&e) => {
+            b.sign_in(apple_id, opts, None, ui).await?
+        }
+        result => result?,
+    };
+    let teams = b.teams().await?;
+    stored.team_id = preferred_team;
+    if opts.remember_password && let Some(password) = password
+        && let Err(e) = b.session_store().save_password(apple_id, &password)
+    {
+        ui.say(&format!("Falha ao guardar a senha ({})", crate::secret::safe_error(&e)));
+    }
+    Ok((teams, stored, true))
 }
 
 /// How often a wait looks at the device again.
@@ -313,24 +393,24 @@ pub async fn install(b: &mut impl Backend, ui: &dyn Frontend, opts: &Options<'_>
     // 3. The Apple ID and team.
     ui.report(Event::Step(Step::SignIn));
     let SignIn { apple_id, pair_again } = ui.sign_in().await?;
+    let apple_id = apple_id.trim();
     if apple_id.is_empty() {
         bail!("no Apple ID given");
     }
-    ui.say(&format!("signing in, with anisette from {}", opts.anisette));
-    b.sign_in(&apple_id, opts.anisette, opts.server_client_info, ui).await?;
-    let mut teams = b.teams().await?;
-    let i = match opts.team {
-        Some(id) => teams.iter().position(|t| t.team_id == id).ok_or_else(|| report!("this Apple ID has no team {id}"))?,
-        None => match only_team(&teams)? {
-            Some(i) => i,
-            None => ui.choose_team(&teams).await?,
-        },
-    };
-    if i >= teams.len() {
-        bail!("not a number from the list");
+    let (mut teams, mut stored, needs_save) = authenticate(b, ui, opts, apple_id).await?;
+    let saved_team = stored.team_id.as_ref().filter(|id| teams.iter().any(|t| &t.team_id == *id));
+    let selection = select_team(&teams, opts.team, saved_team.map(String::as_str), ui).await;
+    let team_id = selection.as_ref().ok().map(|&i| teams[i].team_id.clone()).or_else(|| saved_team.cloned());
+    if opts.remember_session && (needs_save || stored.team_id != team_id) {
+        stored.team_id = team_id;
+        stored.saved_at = crate::session::now_ms();
+        if let Err(e) = b.session_store().save(&stored) {
+            ui.say(&format!("Falha ao guardar a sessão Apple ({})", crate::secret::safe_error(&e)));
+        }
     }
-    let team = teams.remove(i);
-    ui.say(&format!("team {} ({})", team.name.as_deref().unwrap_or("?"), team.team_id));
+    drop(stored);
+    let team = teams.remove(selection?);
+    ui.say(&crate::secret::sanitize(&format!("team {} ({})", team.name.as_deref().unwrap_or("?"), team.team_id)));
     let bundle_id = opts.bundle_id.map(str::to_string).unwrap_or_else(|| format!("{}.slashplayed", team.team_id));
     if !crate::kit::valid_bundle_id(&bundle_id) {
         bail!("{bundle_id} isn't a valid bundle ID (letters, digits, and hyphens, separated by dots)");
@@ -338,7 +418,7 @@ pub async fn install(b: &mut impl Backend, ui: &dyn Frontend, opts: &Options<'_>
 
     // 4. Provisioning.
     ui.report(Event::Step(Step::Provision));
-    let free = b.provision(&team, &d, &bundle_id, &apple_id, ui).await?;
+    let free = b.provision(&team, &d, &bundle_id, apple_id, ui).await?;
 
     // 5. Sign and install.
     ui.report(Event::Step(Step::Install));
@@ -404,8 +484,11 @@ pub(crate) mod fake {
         pub token: bool,
         /// The person must answer Apple's two-factor step (a text, then the code).
         pub two_factor: bool,
-        /// The team's certificate limit is hit, with no store for the key: the revoke is asked.
+        /// The team's certificate limit is hit.
         pub cert_limit: bool,
+        pub store: Box<dyn SessionStore>,
+        pub validation_error: Option<&'static str>,
+        pub reject_password: bool,
         /// The first code is wrong: Apple asks again, with its error.
         pub wrong_code: bool,
         /// What the backend was asked, in order.
@@ -424,6 +507,9 @@ pub(crate) mod fake {
                 token: true,
                 two_factor: true,
                 cert_limit: false,
+                store: Box::new(crate::session::test_store::memory_store()),
+                validation_error: None,
+                reject_password: false,
                 wrong_code: false,
                 calls: Arc::default(),
             }
@@ -463,15 +549,28 @@ pub(crate) mod fake {
             }
             next(&mut self.dev_mode).map_err(|e| report!("{e}"))
         }
+        fn session_store(&self) -> &dyn SessionStore {
+            self.store.as_ref()
+        }
+        async fn resume(&mut self, _: &mut StoredSession) -> Result<bool, Report> {
+            self.log("resume".into());
+            Ok(false)
+        }
         /// As account::sign_in asks: the password once, then the 2FA step until it's answered with a code.
-        async fn sign_in(&mut self, apple_id: &str, _: &str, _: bool, ui: &dyn Frontend) -> Result<(), Report> {
-            let password = ui.password(apple_id).await?;
+        async fn sign_in(
+            &mut self, apple_id: &str, opts: &Options<'_>, remembered: Option<Zeroizing<String>>, ui: &dyn Frontend,
+        ) -> Result<(StoredSession, Option<Zeroizing<String>>), Report> {
+            let password = match remembered {
+                Some(password) => password,
+                None => ui.password(apple_id).await?,
+            };
             // Compared without printing it, as a real password must never be.
-            if *password != fake::password() {
+            if self.reject_password || *password != fake::password() {
                 bail!("Apple didn't accept the sign-in");
             }
+            let signed_in = (crate::session::test_store::sample(apple_id), opts.remember_password.then_some(password));
             if !self.two_factor {
-                return Ok(());
+                return Ok(signed_in);
             }
             let numbers = vec![TrustedNumber {
                 number_with_dial_code: "+1 (•••) •••-••12".into(),
@@ -484,12 +583,13 @@ pub(crate) mod fake {
                 let params = TwoFactorCallbackParams { last_error: last_error.take(), unknown: false, sms, numbers: numbers.clone(), selected_number_id: None };
                 match ui.two_factor(params).await? {
                     TwoFactorCallbackResponse::SubmitCode(c) => {
-                        self.log(format!("code {c} sms={sms}"));
+                        self.log(format!("code sms={sms}"));
                         if std::mem::take(&mut wrong) {
                             last_error = Some("-21669 - Incorrect verification code".to_string());
                             continue;
                         }
-                        return Ok(());
+                        assert!(c == "123456");
+                        return Ok(signed_in);
                     }
                     TwoFactorCallbackResponse::SendSms(n) => {
                         self.log(format!("sms {n}"));
@@ -501,14 +601,16 @@ pub(crate) mod fake {
             }
         }
         async fn teams(&mut self) -> Result<Vec<DeveloperTeam>, Report> {
-            Ok(self.teams.clone())
+            match self.validation_error.take() {
+                Some("auth") => bail!(isideload::SideloadError::DeveloperError(1100, "invalid session".into())),
+                Some(error) => bail!("{error}"),
+                None => Ok(self.teams.clone()),
+            }
         }
-        async fn provision(&mut self, t: &DeveloperTeam, _: &DeviceInfo, bundle_id: &str, _: &str, ui: &dyn Frontend) -> Result<bool, Report> {
+        async fn provision(&mut self, t: &DeveloperTeam, _: &DeviceInfo, bundle_id: &str, _: &str, _: &dyn Frontend) -> Result<bool, Report> {
             self.log(format!("provision {} {bundle_id}", t.team_id));
             if self.cert_limit {
-                let oldest = "\"Slashplayed companion\", until 2026-12-01".to_string();
-                ui.confirm_revoke(&CertLimit { certificates: oldest.clone(), oldest }).await?;
-                self.log("revoked".into());
+                bail!(crate::provision::CERT_QUOTA);
             }
             Ok(self.free)
         }
@@ -548,7 +650,6 @@ mod tests {
         waits: bool,
         pair_again: bool,
         team: usize,
-        revoke: bool,
         events: Mutex<Vec<Event>>,
         asked: Mutex<Vec<String>>,
     }
@@ -589,14 +690,11 @@ mod tests {
             self.asked("team");
             Box::pin(async move { Ok(self.team) })
         }
-        fn confirm_revoke<'a>(&'a self, _: &'a CertLimit) -> Ask<'a, ()> {
-            self.asked("revoke");
-            Box::pin(async move { if self.revoke { Ok(()) } else { bail!("not revoked") } })
-        }
+
     }
 
     fn opts() -> Options<'static> {
-        Options { kit: None, team: None, bundle_id: None, anisette: "https://anisette.example", server_client_info: false }
+        Options { kit: None, team: None, bundle_id: None, anisette: None, server_client_info: false, remember_session: true, remember_password: false }
     }
 
     #[tokio::test(start_paused = true)]
@@ -608,7 +706,7 @@ mod tests {
         assert_eq!(
             b.calls(),
             [
-                "kit", "trust A", "devmode A", "sms 3", "code 123456 sms=true", "provision T1 T1.slashplayed", "install free=true",
+                "kit", "trust A", "devmode A", "sms 3", "code sms=true", "provision T1 T1.slashplayed", "install free=true",
                 "has pairing?", "pairing", "ddi", "token",
             ]
         );
@@ -706,6 +804,88 @@ mod tests {
         let mut b = Fake { has_pairing: true, ..Default::default() };
         install(&mut b, &Person { pair_again: true, ..Default::default() }, &opts()).await.unwrap();
         assert!(b.calls().contains(&"pairing".to_string()));
+    }
+
+    const ID: &str = "x@example.com";
+
+    fn with_session() -> Fake {
+        let b = Fake { teams: vec![team("T1"), team("T2")], ..Default::default() };
+        b.store.save(&crate::session::test_store::sample(ID)).unwrap();
+        b
+    }
+
+    #[tokio::test]
+    async fn valid_session_skips_password_and_reuses_team() {
+        let mut b = with_session();
+        let ui = Person::default();
+        install(&mut b, &ui, &opts()).await.unwrap();
+        assert!(ui.asked.lock().unwrap().is_empty());
+        assert!(b.calls().contains(&"resume".into()));
+        assert!(b.calls().contains(&"provision T2 T2.slashplayed".into()));
+        assert!(ui.events().iter().any(|e| matches!(e, Event::Say(s) if s.starts_with("sessão reutilizada (válida até "))));
+    }
+
+    #[tokio::test]
+    async fn expired_session_skips_resume() {
+        let mut b = with_session();
+        let mut stored = b.store.load(ID).unwrap().unwrap();
+        stored.expiry = 1;
+        b.store.save(&stored).unwrap();
+        let ui = Person::default();
+        install(&mut b, &ui, &opts()).await.unwrap();
+        assert!(!b.calls().contains(&"resume".into()));
+        assert!(ui.asked.lock().unwrap().contains(&"password".into()));
+    }
+
+    #[tokio::test]
+    async fn rejected_session_is_deleted_before_full_login() {
+        let mut b = with_session();
+        b.validation_error = Some("auth");
+        b.two_factor = false;
+        let ui = Person::default();
+        b.reject_password = true;
+        assert!(install(&mut b, &ui, &opts()).await.is_err());
+        assert!(b.store.load(ID).unwrap().is_none());
+        assert!(ui.asked.lock().unwrap().contains(&"password".into()));
+    }
+
+    #[tokio::test]
+    async fn transient_session_error_preserves_session() {
+        let mut b = with_session();
+        b.validation_error = Some("network timeout");
+        let ui = Person::default();
+        let error = install(&mut b, &ui, &opts()).await.unwrap_err();
+        assert!(crate::secret::safe_error(&error).contains("network timeout"));
+        assert!(b.store.load(ID).unwrap().is_some());
+        assert!(ui.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_opt_out_skips_existing_session_and_leaves_it_intact() {
+        let mut b = with_session();
+        let previous = b.store.load(ID).unwrap().unwrap();
+        let ui = Person::default();
+        let opts = Options { remember_session: false, ..opts() };
+        install(&mut b, &ui, &opts).await.unwrap();
+        assert!(!b.calls().contains(&"resume".into()));
+        assert!(ui.asked.lock().unwrap().contains(&"password".into()));
+        let current = b.store.load(ID).unwrap().unwrap();
+        assert_eq!(current.saved_at, previous.saved_at);
+        assert_eq!(current.team_id, previous.team_id);
+    }
+
+    #[tokio::test]
+    async fn storing_password_requires_opt_in() {
+        let mut b = Fake::default();
+        install(&mut b, &Person::default(), &opts()).await.unwrap();
+        assert!(b.store.load_password(ID).unwrap().is_none());
+        let opts = Options { remember_session: false, remember_password: true, ..opts() };
+        install(&mut b, &Person::default(), &opts).await.unwrap();
+        let ui = Person::default();
+        install(&mut b, &ui, &opts).await.unwrap();
+        assert!(b.store.load_password(ID).unwrap().is_some());
+        assert!(!ui.asked.lock().unwrap().contains(&"password".into()));
+        assert!(!b.calls().contains(&"resume".into()));
     }
 
     #[test]

@@ -7,8 +7,7 @@
 // The owner's rules, enforced here:
 // - App IDs are found and reused. One is made only when it's missing (the first run for a bundle ID) and the
 //   team has room (a free team gets 10 a week); nothing else is ever made, and nothing is deleted.
-// - No certificate this tool didn't make is ever revoked. Ours are found by our key; failing that, at the
-//   team's certificate limit, the one we may revoke is one named MACHINE_NAME, which only this tool makes.
+// - The signing key identifies a reusable certificate. At the team limit, the user frees a slot.
 // - The key is stored before Apple sees a request for it (keystore.rs): a certificate whose key is lost is a
 //   wasted slot.
 // - Free or paid is a profile question (listTeams has no flag): a free team's profile lasts 7 days and is
@@ -41,21 +40,19 @@ use x509_cert::{
 use zeroize::Zeroizing;
 
 use crate::{
-    flow::{CertLimit, Frontend},
+    flow::Frontend,
     keystore, profile,
 };
 
 /// The name Apple shows for this tool's certificate (the developer site, Xcode's Manage Certificates): how
 /// a person, and this tool at the certificate limit, tells it from Xcode's and other tools'.
 pub const MACHINE_NAME: &str = "Slashplayed companion";
-/// Every name this project's tools give their certificates: MACHINE_NAME, its name before the tool was
-/// renamed ("Slashplayed setup"), and research/isideload's spike ("Slashplayed spike"). Only these may be
-/// revoked at the limit. Xcode can't help free a slot taken by one: they're the older "iOS Development" kind, which Xcode's Manage Certificates doesn't list.
-pub const OUR_NAMES: &[&str] = &[MACHINE_NAME, "Slashplayed setup", "Slashplayed spike"];
 pub const IML: &str = "com.apple.developer.kernel.increased-memory-limit";
 pub const EVA: &str = "com.apple.developer.kernel.extended-virtual-addressing";
 /// submitDevelopmentCSR's result code when the team has all the development certificates it may.
 const MAX_CERTS: i64 = 7460;
+pub(crate) const CERT_QUOTA: &str =
+    "A cota de certificados de desenvolvimento da equipe está cheia. Libere uma vaga manualmente no portal Apple Developer e tente novamente.";
 
 pub fn developer_code(e: &Report) -> Option<i64> {
     e.iter_reports().find_map(|n| match n.downcast_current_context::<SideloadError>() {
@@ -242,34 +239,6 @@ pub fn is_ours(c: &DevelopmentCertificate, key: &RsaPrivateKey) -> Option<Certif
     (x.tbs_certificate.subject_public_key_info.subject_public_key.as_bytes() == Some(ours.as_bytes())).then_some(x)
 }
 
-/// The certificates at the limit that this tool may revoke: only ones this project made (OUR_NAMES), oldest
-/// first.
-pub fn revocable(certs: &[DevelopmentCertificate]) -> Vec<&DevelopmentCertificate> {
-    let mut v: Vec<_> = certs
-        .iter()
-        .filter(|c| c.machine_name.as_deref().is_some_and(|n| OUR_NAMES.contains(&n)) && c.serial_number.is_some())
-        .collect();
-    v.sort_by_key(|c| c.expiration_date.map(std::time::SystemTime::from));
-    v
-}
-
-/// The team's certificates as Apple names them (the machine each was made for) and when each runs out, for
-/// the person freeing a slot. Names only: nothing here identifies a key.
-pub fn describe(certs: &[DevelopmentCertificate]) -> String {
-    certs
-        .iter()
-        .map(|c| {
-            let name = c.machine_name.as_deref().or(c.name.as_deref()).unwrap_or("unnamed");
-            match c.expiration_date {
-                Some(d) => format!("\"{name}\", until {}", &d.to_xml_format()[..10]),
-                None => format!("\"{name}\""),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-/// At the certificate limit with no stored key, the Frontend confirms the revoke first (see below).
 pub async fn identity(
     session: &mut DeveloperSession,
     team: &DeveloperTeam,
@@ -303,34 +272,12 @@ pub async fn identity(
         return Ok(Identity { key, cert_der });
     }
     let request = csr(&key)?;
-    match session.submit_development_csr(team, request.clone(), MACHINE_NAME.into(), None).await {
-        Ok(r) => r,
-        Err(e) if developer_code(&e) == Some(MAX_CERTS) => {
-            // Without a stored key, this computer can't find its certificate again next run, so it would hit
-            // the limit every run and keep revoking: possibly another computer's certificate, which stops
-            // Slashplayed opening on that one's device. So it asks first. With a stored key this happens at
-            // most once, since the certificate is reused after.
-            // Asked only when there's one to revoke: with none of Slashplayed's, the error below says what to
-            // do, and there's nothing to choose.
-            let Some(old) = revocable(&certs).into_iter().next() else {
-                bail!(
-                    "the team has all the development certificates Apple allows ({}), and none of them is Slashplayed's. Nothing was revoked: this tool never revokes a certificate it didn't make. Free a slot yourself, then run this again: in Xcode on a Mac (Settings > Apple Accounts > Manage Certificates, which lists only Apple Development ones), on developer.apple.com (paid teams), or in the sideloading app that made an iOS Development one",
-                    describe(&certs)
-                );
-            };
-            if !stored {
-                let oldest = describe(std::slice::from_ref(old));
-                ui.confirm_revoke(&CertLimit { certificates: describe(&certs), oldest }).await?;
-            }
-            ui.say(&format!(
-                "the team has all the certificates it may: revoking \"{}\" (made by Slashplayed's tools, on this or another computer)",
-                old.machine_name.as_deref().unwrap_or_default()
-            ));
-            session.revoke_development_cert(team, old.serial_number.as_deref().unwrap_or_default(), None).await?;
-            session.submit_development_csr(team, request, MACHINE_NAME.into(), None).await?
+    if let Err(e) = session.submit_development_csr(team, request, MACHINE_NAME.into(), None).await {
+        if developer_code(&e) == Some(MAX_CERTS) {
+            bail!(CERT_QUOTA);
         }
-        Err(e) => return Err(e),
-    };
+        return Err(e);
+    }
     ui.say(if stored { "made a Slashplayed certificate for this computer" } else { "made a Slashplayed certificate for this run" });
     let certs = session.list_ios_certs(team).await?;
     let cert = certs
@@ -386,23 +333,6 @@ pub async fn profiles(
 mod tests {
     use super::*;
 
-    fn cert(name: Option<&str>, serial: Option<&str>, days: u64) -> DevelopmentCertificate {
-        let exp = std::time::SystemTime::now() + std::time::Duration::from_secs(days * 86400);
-        DevelopmentCertificate {
-            name: None,
-            certificate_id: None,
-            serial_number: serial.map(str::to_string),
-            machine_id: None,
-            machine_name: name.map(str::to_string),
-            cert_content: None,
-            certificate_platform: None,
-            certificate_type: None,
-            status: None,
-            status_code: None,
-            expiration_date: Some(exp.into()),
-        }
-    }
-
     #[test]
     fn only_a_403_means_a_free_team() {
         for s in [200, 201, 204] {
@@ -415,37 +345,13 @@ mod tests {
     }
 
     #[test]
-    fn only_our_certificates_are_revocable() {
-        let certs = vec![
-            cert(Some("Paul's MacBook Pro"), Some("1"), 10),
-            cert(Some(MACHINE_NAME), Some("2"), 300),
-            cert(Some("AltStore"), Some("3"), 5),
-            cert(Some(MACHINE_NAME), Some("4"), 100),
-            cert(None, Some("5"), 1),
-            cert(Some(MACHINE_NAME), None, 1),
-            cert(Some("Slashplayed companion "), Some("6"), 1),
-            cert(Some("Slashplayed setup"), Some("8"), 40),
-            cert(Some("Slashplayed spike"), Some("7"), 50),
-        ];
-        let r: Vec<_> = revocable(&certs).iter().map(|c| c.serial_number.clone().unwrap()).collect();
-        assert_eq!(r, vec!["8", "7", "4", "2"]);
-    }
-
-    #[test]
-    fn certificates_are_described_by_name() {
-        let d = describe(&[cert(Some("Paul's MacBook Pro"), Some("1"), 10), cert(None, None, 1)]);
-        assert!(d.starts_with("\"Paul's MacBook Pro\", until 20"), "{d}");
-        assert!(d.contains("; \"unnamed\", until "), "{d}");
-    }
-
-    #[test]
     fn our_certificate_is_found_by_key() {
         let key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
         let other = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
         let pem = Zeroizing::new(key.to_pkcs8_pem(LineEnding::LF).unwrap().to_string());
         let pair = KeyPair::from_pkcs8_pem_and_sign_algo(&pem, &PKCS_RSA_SHA256).unwrap();
         let der = CertificateParams::new(vec![]).unwrap().self_signed(&pair).unwrap().der().to_vec();
-        let mut c = cert(Some(MACHINE_NAME), Some("1"), 1);
+        let mut c: DevelopmentCertificate = serde_json::from_value(json!({"machineName": MACHINE_NAME})).unwrap();
         c.cert_content = Some(plist::Data::new(der));
         assert!(is_ours(&c, &key).is_some());
         assert!(is_ours(&c, &other).is_none());

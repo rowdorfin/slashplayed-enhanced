@@ -26,8 +26,8 @@ path = "src/main.rs"
 [dependencies]
 # Vendored at the spike's pinned commit (vendor/isideload/VENDORED.md), with its LGPL signer behind a
 # feature this crate leaves off: only what the build needs (install: lib.rs names idevice's error type
-# whatever is enabled; tokio-mt: anisette's provisioning websocket). keyring-storage off: nothing of the
-# login is stored.
+# whatever is enabled; tokio-mt: anisette's provisioning websocket). keyring-storage off: the Companion manages
+# session storage.
 isideload = { path = "vendor/isideload", default-features = false, features = ["install", "tokio-mt"] }
 # zsign and OpenSSL, the app's signer (src/sign.rs): a crate of its own so a version bump here doesn't
 # rebuild them (zsign/Cargo.toml says why).
@@ -73,7 +73,7 @@ skrifa = { version = "0.44", default-features = false }
 
 # A window that can't open says why (window.rs): with no console, a message box is all there is.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Security_Cryptography", "Win32_Foundation"] }
 
 [build-dependencies]
 # The Windows programs' icon and version resource (icons/slashplayed.ico), compiled with the SDK's rc.exe.

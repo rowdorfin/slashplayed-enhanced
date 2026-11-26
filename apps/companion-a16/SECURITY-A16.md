@@ -1,0 +1,13 @@
+# Sessão Apple no Companion A16
+
+O Companion tenta reutilizar a sessão Apple na próxima instalação para o mesmo Apple ID. A sessão contém o token `xcode.auth`, o ADSID, a duração e a data de expiração fornecidas pela Apple, a URL e o estado anisette/ADI, a identidade do cliente, a última equipe selecionada e a data de gravação. O registro JSON tem uma versão. Registros com JSON inválido ou versão desconhecida são descartados.
+
+- **Windows:** o arquivo fica em `%LOCALAPPDATA%\SlashplayedA16\sessions\<sha256-hex-do-apple-id-em-minúsculas>.bin`. A DPAPI cifra os dados com proteção vinculada à conta do Windows e a gravação substitui o arquivo de uma vez. O arquivo evita o limite de 2.560 bytes por credencial do Credential Manager.
+- **macOS e Linux:** o registro usa o Keychain ou o Secret Service, no serviço `com.rowdorfin.slashplayed-a16.session`. Se o gerenciador de credenciais estiver indisponível, o Companion informa a falha de armazenamento.
+- **Senha:** o CLI só guarda e usa a senha guardada quando se passa `--remember-password`. O serviço `com.rowdorfin.slashplayed-a16.password` usa o gerenciador de credenciais do sistema. Códigos de 2FA e o token GrandSlam usado para cunhar o token de desenvolvimento nunca são guardados. O Companion oculta credenciais em mensagens de erro e omite os corpos das respostas da Apple.
+
+Antes de pedir senha, o Companion verifica a validade local e consulta `listTeams` com a sessão reconstruída. Uma rejeição clara de autenticação elimina a sessão guardada e inicia o login completo. Uma falha transitória interrompe a instalação e preserva a sessão para outra tentativa. A Apple decide quando pedir 2FA. Use `--no-remember-session` para ignorar a sessão existente e impedir a gravação de uma nova durante aquela execução. A opção de senha é independente.
+
+Use `slashplayed-cli logout <apple-id>` para apagar a sessão e a senha deste computador. `forget --apple-id <id>` faz a mesma limpeza. Acrescente `--forget-key` para apagar também a chave RSA local. O serviço da chave continua sendo `com.strawdynamics.slashplayed.companion-rs`, com o Apple ID digitado e o mesmo formato de chave da versão oficial. Esses comandos operam localmente. Se a cota de certificados da equipe estiver cheia, libere uma vaga manualmente no portal Apple Developer.
+
+A validade declarada do token pode chegar a 365 dias. A reutilização em serviços de desenvolvimento foi observada por cerca de 1,1 dia. O prazo real além disso ainda não foi comprovado. A DPAPI protege contra outros usuários do Windows, mas malware executado na mesma conta pode acessar as credenciais dessa conta. O logout local deixa intacto o token que uma instalação já enviou ao dispositivo para renovar perfis.

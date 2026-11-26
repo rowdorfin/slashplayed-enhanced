@@ -143,6 +143,7 @@ impl eframe::App for App {
                 (Some(Ok(_)), _) => self.done(ui, &mut s),
                 (Some(Err(_)), _) => self.steps(ui, &mut s, "Something went wrong"),
                 (None, Some(Question::SignIn(_))) => self.sign_in(ui, &mut s),
+                (None, Some(Question::Password(_))) => self.ask_password(ui, &mut s),
                 (None, Some(Question::TwoFactor { .. })) => self.two_factor(ui, &mut s),
                 (None, Some(Question::Team { .. })) => self.team(ui, &mut s),
                 (None, _) if s.step.is_none() || s.step == Some(Step::Kit) || s.step == Some(Step::Device) => {
@@ -151,9 +152,6 @@ impl eframe::App for App {
                 (None, _) => self.steps(ui, &mut s, "Installing"),
             }
         });
-        if matches!(s.question, Some(Question::Revoke { .. })) {
-            self.revoke(&ctx, &mut s);
-        }
         let retry = s.outcome.as_ref().is_some_and(|o| o.is_err()) && ctx.data(|d| d.get_temp::<bool>(retry_id())) == Some(true);
         drop(s);
         if retry {
@@ -329,26 +327,35 @@ impl App {
             ui.add_space(8.0);
         }
         let id_label = ui.label("Apple ID");
-        ui.add(TextEdit::singleline(&mut self.apple_id).hint_text("name@example.com").desired_width(f32::INFINITY))
+        let id = ui.add(TextEdit::singleline(&mut self.apple_id).hint_text("name@example.com").desired_width(f32::INFINITY))
             .labelled_by(id_label.id);
-        ui.add_space(4.0);
+        ui.add_space(16.0);
+        let ready = !self.apple_id.trim().is_empty();
+        let enter = id.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (self.main_button(ui, "Continuar", ready) || (enter && ready))
+            && let Some(Question::SignIn(reply)) = s.question.take()
+        {
+            let sign_in = SignIn { apple_id: self.apple_id.trim().to_string(), pair_again: false };
+            let _ = reply.send(sign_in);
+        }
+    }
+
+    fn ask_password(&mut self, ui: &mut egui::Ui, s: &mut Shared) {
+        self.header(ui, "Digite a senha do Apple ID");
         let pw_label = ui.label("Password");
         let pw = ui
             .add(TextEdit::singleline(&mut *self.password).id(password_id()).password(true).desired_width(f32::INFINITY))
             .labelled_by(pw_label.id);
         small(ui, "Your password is used once, for this sign-in, and never stored.");
         ui.add_space(16.0);
-        let ready = !self.apple_id.trim().is_empty() && !self.password.is_empty();
+        let ready = !self.password.is_empty();
         let enter = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if (self.main_button(ui, "Install", ready) || (enter && ready))
-            && let Some(Question::SignIn(reply)) = s.question.take()
+            && let Some(Question::Password(reply)) = s.question.take()
         {
             let password = Zeroizing::new(std::mem::take(&mut *self.password));
             forget_typing(ui.ctx());
-            // No pair-again here: a record the device refuses, the app deletes itself (apps/client/spjit.m), and
-            // the next run sends a new one. slashplayed-cli keeps --pair-again for the rare rest.
-            let sign_in = SignIn { apple_id: self.apple_id.trim().to_string(), pair_again: false };
-            let _ = reply.send((sign_in, password));
+            let _ = reply.send(password);
         }
     }
 
@@ -532,39 +539,6 @@ impl App {
         }
         ui.add_space(12.0);
         details(ui, s);
-    }
-
-    /// At the team's certificate limit: Revoke the oldest of Slashplayed's, or Cancel and revoke nothing.
-    fn revoke(&mut self, ctx: &egui::Context, s: &mut Shared) {
-        let Some(Question::Revoke { certificates, oldest, .. }) = &s.question else { return };
-        let (certificates, oldest) = (certificates.clone(), oldest.clone());
-        let mut answer = None;
-        egui::Modal::new(egui::Id::unique("sp-revoke")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.label(RichText::new("The team has all its certificates").family(theme::family(self.face)).size(22.0).color(GOLD));
-            ui.add_space(8.0);
-            ui.label(format!(
-                "Apple allows only so many development certificates, and the team has them all: {certificates}. This computer has no credential store to keep a signing key in, so it can't reuse one."
-            ));
-            ui.add_space(4.0);
-            ui.label(format!(
-                "Slashplayed can revoke {oldest}, the oldest one a Slashplayed tool made, on this or another computer. A device signed with it needs its own run again before Slashplayed opens there."
-            ));
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if self.main_button(ui, "Revoke", true) {
-                    answer = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    answer = Some(false);
-                }
-            });
-        });
-        if let Some(a) = answer
-            && let Some(Question::Revoke { reply, .. }) = s.question.take()
-        {
-            let _ = reply.send(a);
-        }
     }
 
     fn forget_dialog(&mut self, ctx: &egui::Context) {

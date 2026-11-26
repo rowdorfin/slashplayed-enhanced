@@ -4,7 +4,7 @@
 //
 //   1. the device kit (the device app, unsigned: kit.rs), downloaded and checked, before anything else;
 //   2. the device over USB: trusted by this computer, Developer Mode on (device.rs);
-//   3. the Apple ID sign-in, held in memory only, and the team (account.rs);
+//   3. the Apple ID sign-in, or a saved session, and the team (account.rs);
 //   4. the device, App IDs, capabilities, certificate, and profiles (provision.rs);
 //   5. the app signed with zsign (sign.rs) and installed over USB;
 //   6. the RemotePairing record and the developer disk image (ddi.rs) into its container, for the JIT helper,
@@ -22,9 +22,9 @@ use isideload::{
 };
 use rootcause::prelude::*;
 use slashplayed_companion::{
-    account, device,
-    flow::{self, Ask, CertLimit, DeviceInfo, Event, Frontend, SignIn, Wait},
-    keystore, kit, live, secret,
+    device,
+    flow::{self, Ask, DeviceInfo, Event, Frontend, SignIn, Wait},
+    keystore, kit, live, secret, session,
 };
 use zeroize::Zeroizing;
 
@@ -34,8 +34,10 @@ slashplayed-cli: set up Slashplayed on an iPhone or iPad without a Mac.
 Usage:
   slashplayed-cli [install] [options]         install or re-sign Slashplayed on the device on USB
   slashplayed-cli devices                     list the iPhones and iPads on USB
-  slashplayed-cli forget --apple-id <id>
-                                          delete this computer's signing key for that Apple ID
+  slashplayed-cli logout <apple-id> [--forget-key]
+                                          apaga a sessão e a senha locais
+  slashplayed-cli forget --apple-id <id> [--forget-key]
+                                          mesmo que logout
   slashplayed-cli --version
 
 Options for install:
@@ -47,12 +49,13 @@ Options for install:
   --server-client-info  send the anisette server's own client identity rather than iloader's fixed one
   --kit <zip>           a device kit to use instead of this release's
   --pair-again          make a new pairing record even if the app has one
-  --revoke-oldest       with no credential store, at the team's certificate limit: revoke the oldest
-                        certificate a Slashplayed tool made, even another computer's
+  --no-remember-session  ignora a sessão guardada e desativa a gravação nesta execução
+  --remember-password    usa a senha guardada e permite guardá-la no gerenciador de credenciais
+  --forget-key           com logout ou forget, também apaga a chave de assinatura local
 
 Slashplayed renews its own signing on the device when a game starts near its end. Run this again if
 its start screen says it can't.
-Your Apple ID password is used once for the sign-in and never stored.";
+A senha só é guardada com --remember-password.";
 
 struct Args {
     command: String,
@@ -61,7 +64,7 @@ struct Args {
 }
 
 const VALUED: &[&str] = &["--apple-id", "--team", "--udid", "--bundle-id", "--anisette", "--kit"];
-const FLAGS: &[&str] = &["--server-client-info", "--pair-again", "--revoke-oldest"];
+const FLAGS: &[&str] = &["--server-client-info", "--pair-again", "--no-remember-session", "--remember-password", "--forget-key"];
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Args, Report> {
     let mut it = args.into_iter().peekable();
@@ -70,6 +73,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Args, Report> {
         _ => "install".to_string(),
     };
     let (mut values, mut flags) = (HashMap::new(), Vec::new());
+    if command == "logout" && it.peek().is_some_and(|a| !a.starts_with('-')) {
+        values.insert("--apple-id".into(), it.next().unwrap());
+    }
     while let Some(a) = it.next() {
         if VALUED.contains(&a.as_str()) {
             let v = it.next().ok_or_else(|| report!("{a} needs a value"))?;
@@ -77,7 +83,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Args, Report> {
         } else if FLAGS.contains(&a.as_str()) || a == "--help" || a == "-h" || a == "--version" {
             flags.push(a);
         } else {
-            bail!("unknown argument {a} (see --help)");
+            bail!("Argumento desconhecido. Consulte --help.");
         }
     }
     Ok(Args { command, values, flags })
@@ -129,13 +135,14 @@ async fn run(args: &Args) -> Result<(), Report> {
             }
             Ok(())
         }
-        "forget" => {
-            let id = args.opt("--apple-id").ok_or_else(|| report!("forget needs --apple-id"))?;
-            let had = keystore::forget(id)?;
-            println!("{}", if had { "Deleted this computer's signing key for that Apple ID." } else { "This computer has no signing key for that Apple ID." });
+        "logout" | "forget" => {
+            let id = args.opt("--apple-id").filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| report!("Informe o Apple ID para sair."))?;
+            session::logout(&session::system_store(), id.trim(), args.flag("--forget-key"), keystore::forget)?;
+            println!("Sessão e senha locais removidas.");
             Ok(())
         }
-        other => bail!("unknown command {other} (see --help)"),
+        _ => bail!("Comando desconhecido. Consulte --help."),
     }
 }
 
@@ -144,8 +151,10 @@ async fn install(args: &Args) -> Result<(), Report> {
         kit: args.opt("--kit").map(std::path::Path::new),
         team: args.opt("--team"),
         bundle_id: args.opt("--bundle-id"),
-        anisette: args.opt("--anisette").unwrap_or(account::DEFAULT_ANISETTE),
+        anisette: args.opt("--anisette"),
         server_client_info: args.flag("--server-client-info"),
+        remember_session: !args.flag("--no-remember-session"),
+        remember_password: args.flag("--remember-password"),
     };
     flow::install(&mut live::Live::new()?, &Cli(args), &opts).await?;
     Ok(())
@@ -221,10 +230,10 @@ impl Frontend for Cli<'_> {
         })
     }
 
-    fn password<'a>(&'a self, apple_id: &'a str) -> Ask<'a, Zeroizing<String>> {
+    fn password<'a>(&'a self, _: &'a str) -> Ask<'a, Zeroizing<String>> {
         Box::pin(async move {
             Ok(Zeroizing::new(
-                rpassword::prompt_password(format!("Apple ID password for {apple_id} (not shown as you type): "))
+                rpassword::prompt_password("Apple ID password (not shown as you type): ")
                     .map_err(|_| report!("couldn't read the password: run this in a terminal"))?,
             ))
         })
@@ -269,17 +278,7 @@ impl Frontend for Cli<'_> {
         })
     }
 
-    fn confirm_revoke<'a>(&'a self, limit: &'a CertLimit) -> Ask<'a, ()> {
-        Box::pin(async move {
-            if self.0.flag("--revoke-oldest") {
-                return Ok(());
-            }
-            bail!(
-                "the team has all the development certificates Apple allows ({}), and this computer has no credential store to keep its signing key in, so it can't reuse a certificate. Nothing was revoked. Free a slot yourself, or run this again with --revoke-oldest to revoke the oldest certificate a Slashplayed tool made, on this or another computer (that computer's device then needs its own run before Slashplayed opens again)",
-                limit.certificates
-            )
-        })
-    }
+
 }
 
 #[cfg(test)]
@@ -311,16 +310,22 @@ mod tests {
         assert_eq!(cli.choose_device(&phones()).await.unwrap(), Some(1));
         let s = cli.sign_in().await.unwrap();
         assert_eq!((s.apple_id.as_str(), s.pair_again), ("x@example.com", true));
-        let limit = CertLimit { certificates: "c".into(), oldest: "o".into() };
-        assert!(cli.confirm_revoke(&limit).await.is_err(), "no revoke without --revoke-oldest");
-
-        let a = p(&["--apple-id", "x@example.com", "--revoke-oldest"]).unwrap();
+        let a = p(&["--apple-id", "x@example.com"]).unwrap();
         let cli = Cli(&a);
         assert!(!cli.sign_in().await.unwrap().pair_again);
-        assert!(cli.confirm_revoke(&limit).await.is_ok());
         assert!(cli.choose_device(&phones()).await.is_err(), "several devices and no --udid");
         let a = p(&["--udid", "C"]).unwrap();
         assert!(Cli(&a).choose_device(&phones()).await.is_err());
+    }
+
+    #[test]
+    fn logout_and_storage_flags() {
+        let args = p(&["logout", "x@example.com", "--forget-key"]).unwrap();
+        assert_eq!(args.opt("--apple-id"), Some("x@example.com"));
+        assert!(args.flag("--forget-key"));
+        let args = p(&["--no-remember-session", "--remember-password"]).unwrap();
+        assert!(args.flag("--no-remember-session"));
+        assert!(args.flag("--remember-password"));
     }
 
     #[test]

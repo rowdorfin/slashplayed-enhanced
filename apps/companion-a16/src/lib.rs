@@ -12,6 +12,7 @@ pub mod live;
 pub mod profile;
 pub mod provision;
 pub mod secret;
+pub mod session;
 pub mod sign;
 
 /// What every program does before anything else, before any thread exists: isideload reads

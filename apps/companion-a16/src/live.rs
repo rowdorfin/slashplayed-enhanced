@@ -13,11 +13,12 @@ use zeroize::Zeroizing;
 use crate::{
     account, ddi, device,
     flow::{Backend, DeviceInfo, Frontend},
-    kit, provision, secret, sign,
+    kit, provision, secret, session::{self, SessionStore, StoredSession}, sign,
 };
 
 pub struct Live {
     scratch: secret::Scratch,
+    store: Box<dyn SessionStore>,
     kit: Option<kit::Kit>,
     /// The devices of the last list, for their usbmuxd handles.
     devices: Vec<device::Device>,
@@ -32,6 +33,7 @@ impl Live {
     pub fn new() -> Result<Self, Report> {
         Ok(Self {
             scratch: secret::Scratch::new("companion")?,
+            store: Box::new(session::system_store()),
             kit: None,
             devices: Vec::new(),
             session: None,
@@ -76,11 +78,28 @@ impl Backend for Live {
         device::developer_mode(self.device(d)?, ui).await
     }
 
-    async fn sign_in(&mut self, apple_id: &str, anisette: &str, server_client_info: bool, ui: &dyn Frontend) -> Result<(), Report> {
-        let (session, token) = account::sign_in(apple_id, anisette, server_client_info, ui).await?;
-        self.session = Some(session);
-        self.device_token = token;
-        Ok(())
+    fn session_store(&self) -> &dyn SessionStore {
+        self.store.as_ref()
+    }
+
+    async fn resume(&mut self, stored: &mut StoredSession) -> Result<bool, Report> {
+        let resumed = account::resume(stored).await?;
+        self.session = Some(resumed.session);
+        self.device_token = resumed.device_token;
+        Ok(resumed.anisette_changed)
+    }
+
+    async fn sign_in(
+        &mut self, apple_id: &str, opts: &crate::flow::Options<'_>,
+        remembered_password: Option<Zeroizing<String>>, ui: &dyn Frontend,
+    ) -> Result<(StoredSession, Option<Zeroizing<String>>), Report> {
+        let signed_in = account::sign_in(
+            apple_id, opts.anisette.unwrap_or(account::DEFAULT_ANISETTE), opts.server_client_info,
+            remembered_password, opts.remember_password, ui,
+        ).await?;
+        self.session = Some(signed_in.session);
+        self.device_token = signed_in.device_token;
+        Ok((signed_in.stored, signed_in.password))
     }
 
     async fn teams(&mut self) -> Result<Vec<DeveloperTeam>, Report> {

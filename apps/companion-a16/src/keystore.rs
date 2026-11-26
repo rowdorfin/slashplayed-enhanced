@@ -2,11 +2,8 @@
 // certificate instead of making another (free teams get few). In the OS's own credential store, never a
 // file: the macOS Keychain, Windows Credential Manager, or the Secret Service on Linux (GNOME Keyring,
 // KWallet). One item per Apple ID, as the spike kept it: a key can back a certificate on each of its teams.
-// Nothing of the Apple ID's login is ever stored (owner decision: the host holds it in memory only).
-//
-// Where there's no store (a Linux box with no Secret Service running, say), the run still works: a fresh
-// key, a new certificate, and the previous Slashplayed certificate revoked if the team is full
-// (provision.rs). The key is never printed or logged, and leaves this process only for the store.
+// Where there is no credential store, the run can still sign with a fresh key if the team has room.
+// The key leaves this process only for the credential store.
 
 use rootcause::prelude::*;
 use rsa::{
@@ -26,7 +23,7 @@ pub enum Loaded {
 
 /// keyring's calls block, and its Secret Service backend runs its own async runtime, which can't start
 /// inside this tool's: so each call gets a plain thread.
-fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+pub(crate) fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::spawn(f).join().expect("keystore thread panicked")
 }
 

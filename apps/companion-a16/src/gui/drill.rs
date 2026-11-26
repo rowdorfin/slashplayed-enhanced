@@ -81,11 +81,7 @@ pub fn fill(app: &mut App, state: &str) {
         "cert-limit" => {
             s.step = Some(Step::Provision);
             s.lines = lines[..6].iter().map(|l| l.to_string()).collect();
-            s.question = Some(Question::Revoke {
-                certificates: "\"Alex's MacBook Pro\", until 2027-03-02; \"Slashplayed companion\", until 2026-11-30".into(),
-                oldest: "\"Slashplayed companion\", until 2026-11-30".into(),
-                reply: oneshot::channel().0,
-            });
+            s.outcome = Some(Err(crate::provision::CERT_QUOTA.into()));
         }
         other => {
             drop(s);

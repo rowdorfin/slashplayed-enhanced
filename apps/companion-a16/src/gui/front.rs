@@ -16,12 +16,12 @@ use rootcause::prelude::*;
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
-use crate::flow::{self, Ask, Backend, CertLimit, DeviceInfo, Done, Event, Frontend, SignIn, Step, Wait};
+use crate::flow::{self, Ask, Backend, DeviceInfo, Done, Event, Frontend, SignIn, Step, Wait};
 
 /// What the flow waits for the person to answer.
 pub enum Question {
-    /// The Apple ID, and the password (kept by Gui until the sign-in asks).
-    SignIn(oneshot::Sender<(SignIn, Zeroizing<String>)>),
+    SignIn(oneshot::Sender<SignIn>),
+    Password(oneshot::Sender<Zeroizing<String>>),
     TwoFactor {
         /// The code came by text message (else to the person's Apple devices).
         sms: bool,
@@ -38,11 +38,7 @@ pub enum Question {
         teams: Vec<(String, String)>,
         reply: oneshot::Sender<usize>,
     },
-    Revoke {
-        certificates: String,
-        oldest: String,
-        reply: oneshot::Sender<bool>,
-    },
+
 }
 
 #[derive(Default)]
@@ -106,13 +102,15 @@ pub fn starter<B: Backend + 'static>(
     Arc::new(move |shared: Handle, ctx: egui::Context| {
         let (backend, kit) = (backend.clone(), kit.clone());
         std::thread::spawn(move || {
-            let gui = Gui { shared: shared.clone(), ctx: ctx.clone(), password: Mutex::new(None) };
+            let gui = Gui { shared: shared.clone(), ctx: ctx.clone() };
             let opts = flow::Options {
                 kit: kit.as_deref(),
                 team: None,
                 bundle_id: None,
-                anisette: crate::account::DEFAULT_ANISETTE,
+                anisette: None,
                 server_client_info: false,
+                remember_session: true,
+                remember_password: false,
             };
             let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
             // A panic in the run (an unwrap in a dependency, a keystore thread's) would leave the screen
@@ -132,8 +130,6 @@ pub fn starter<B: Backend + 'static>(
 struct Gui {
     shared: Handle,
     ctx: egui::Context,
-    /// The password from the sign-in screen until the sign-in takes it.
-    password: Mutex<Option<Zeroizing<String>>>,
 }
 
 impl Gui {
@@ -190,16 +186,11 @@ impl Frontend for Gui {
     }
 
     fn sign_in(&self) -> Ask<'_, SignIn> {
-        Box::pin(async move {
-            let (sign_in, password) = self.ask(Question::SignIn).await?;
-            *self.password.lock().unwrap_or_else(|p| p.into_inner()) = Some(password);
-            Ok(sign_in)
-        })
+        Box::pin(async move { self.ask(Question::SignIn).await })
     }
 
     fn password<'a>(&'a self, _: &'a str) -> Ask<'a, Zeroizing<String>> {
-        let p = self.password.lock().unwrap_or_else(|p| p.into_inner()).take();
-        Box::pin(async move { p.ok_or_else(|| report!("no password typed")) })
+        Box::pin(async move { self.ask(Question::Password).await })
     }
 
     fn two_factor(&self, p: TwoFactorCallbackParams) -> Ask<'_, TwoFactorCallbackResponse> {
@@ -218,17 +209,4 @@ impl Frontend for Gui {
         Box::pin(async move { self.ask(|reply| Question::Team { teams, reply }).await })
     }
 
-    fn confirm_revoke<'a>(&'a self, limit: &'a CertLimit) -> Ask<'a, ()> {
-        Box::pin(async move {
-            let oldest = limit.oldest.clone();
-            let certificates = limit.certificates.clone();
-            if self.ask(|reply| Question::Revoke { certificates, oldest, reply }).await? {
-                Ok(())
-            } else {
-                bail!(
-                    "the team has all the development certificates Apple allows, and this computer has no credential store to keep its signing key in. Nothing was revoked. Free a slot yourself, then try again: in Xcode on a Mac (Settings > Apple Accounts > Manage Certificates), on developer.apple.com (paid teams), or in the sideloading app that made it"
-                )
-            }
-        })
-    }
 }
