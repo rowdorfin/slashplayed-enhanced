@@ -66,6 +66,19 @@ NSString *const sp_MTLDeviceWasRemovedNotification = @"MTLDeviceWasRemovedNotifi
 #import <Metal/Metal.h>
 #import <objc/message.h>
 
+#ifndef SP_METAL_DIAG
+#define SP_METAL_DIAG 1
+#endif
+#if SP_METAL_DIAG
+#include <errno.h>
+#include <fcntl.h>
+#include <os/lock.h>
+#include <pthread.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#endif
+
 CFArrayRef sp_MTLCopyAllDevicesWithObserver(void **observer, id handler) __asm__("_MTLCopyAllDevicesWithObserver");
 // MTLDevice properties that only macOS has, added to the device's class with the values of a
 // built-in, always-on GPU. Each logs its first use.
@@ -136,10 +149,188 @@ static id sp_nextDrawable(id self, SEL _cmd) {
     return d;
 }
 
+#if SP_METAL_DIAG
+enum { SP_METAL_DIAG_LIMIT = 1024 * 1024 };
+static int sp_metal_diag_fds[2] = {-1, -1};
+static unsigned sp_metal_diag_slot;
+static size_t sp_metal_diag_bytes;
+static char sp_metal_diag_device[384];
+static os_unfair_lock sp_metal_diag_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic uint64_t sp_metal_diag_sequence;
+
+// The caller holds the rotation lock. Roll back a short write before appending another line.
+static BOOL sp_metal_diag_append(int fd, const char *line, size_t len) {
+    ssize_t written;
+    do { written = write(fd, line, len); } while (written < 0 && errno == EINTR);
+    if (written == (ssize_t)len) {
+        sp_metal_diag_bytes += len;
+        return YES;
+    }
+    if (written > 0 && ftruncate(fd, (off_t)sp_metal_diag_bytes) != 0)
+        sp_metal_diag_bytes = SP_METAL_DIAG_LIMIT;  // force rotation after a partial line
+    return NO;
+}
+
+static void sp_metal_diag_write(const char *line) {
+    size_t len = strlen(line);
+    if (!len || line[len - 1] != '\n') return;
+    os_unfair_lock_lock(&sp_metal_diag_lock);
+    int fd = sp_metal_diag_fds[sp_metal_diag_slot];
+    if (sp_metal_diag_bytes + len > SP_METAL_DIAG_LIMIT) {
+        unsigned next = sp_metal_diag_slot ^ 1;
+        int next_fd = sp_metal_diag_fds[next];
+        if (next_fd >= 0 && ftruncate(next_fd, 0) == 0) {
+            fd = next_fd;
+            sp_metal_diag_slot = next;
+            sp_metal_diag_bytes = 0;
+            sp_metal_diag_append(fd, sp_metal_diag_device, strlen(sp_metal_diag_device));
+        }
+    }
+    // Each complete record reaches the kernel before Metal can abort this thread.
+    BOOL saved = fd >= 0 && sp_metal_diag_bytes + len <= SP_METAL_DIAG_LIMIT
+        && sp_metal_diag_append(fd, line, len);
+    os_unfair_lock_unlock(&sp_metal_diag_lock);
+    if (!saved) SP_LOG_ONCE("Metal diagnostic file write failed; see stderr/os_log");
+    os_log(OS_LOG_DEFAULT, "[sp:Metal diag] %{public}s", line);
+    (void)write(STDERR_FILENO, line, len);
+}
+
+static const char *sp_metal_diag_format(MTLPixelFormat format) {
+#define SP_FORMAT(name) case MTLPixelFormat##name: return #name
+    switch (format) {
+        SP_FORMAT(Invalid);
+        SP_FORMAT(R8Unorm);
+        SP_FORMAT(RG8Unorm);
+        SP_FORMAT(RGBA8Unorm);
+        SP_FORMAT(RGBA8Unorm_sRGB);
+        SP_FORMAT(BGRA8Unorm);
+        SP_FORMAT(BGRA8Unorm_sRGB);
+        SP_FORMAT(RGBA16Float);
+        SP_FORMAT(Depth32Float);
+        case 255: return "Depth24Unorm_Stencil8";  // macOS-only enum name
+        SP_FORMAT(Depth32Float_Stencil8);
+        SP_FORMAT(BC1_RGBA);
+        SP_FORMAT(BC1_RGBA_sRGB);
+        SP_FORMAT(BC2_RGBA);
+        SP_FORMAT(BC2_RGBA_sRGB);
+        SP_FORMAT(BC3_RGBA);
+        SP_FORMAT(BC3_RGBA_sRGB);
+        SP_FORMAT(BC4_RUnorm);
+        SP_FORMAT(BC4_RSnorm);
+        SP_FORMAT(BC5_RGUnorm);
+        SP_FORMAT(BC5_RGSnorm);
+        SP_FORMAT(BC6H_RGBFloat);
+        SP_FORMAT(BC6H_RGBUfloat);
+        SP_FORMAT(BC7_RGBAUnorm);
+        SP_FORMAT(BC7_RGBAUnorm_sRGB);
+        default: return "unknown";
+    }
+#undef SP_FORMAT
+}
+
+static uint64_t sp_metal_diag_begin(SEL sel, MTLTextureDescriptor *d) {
+    uint64_t seq = atomic_fetch_add_explicit(&sp_metal_diag_sequence, 1, memory_order_relaxed) + 1;
+    uint64_t tid = 0;
+    char thread[64] = "";
+    pthread_threadid_np(NULL, &tid);
+    pthread_getname_np(pthread_self(), thread, sizeof thread);
+    thread[strcspn(thread, "\r\n")] = '\0';
+    struct timespec now = {0};
+    clock_gettime(CLOCK_REALTIME, &now);
+    char line[896];
+    int prefix = snprintf(line, sizeof line,
+                          "seq=%llu phase=before time=%lld.%09ld op=%s tid=%llu thread=\"%s\"",
+                          (unsigned long long)seq, (long long)now.tv_sec, now.tv_nsec,
+                          sel_getName(sel), (unsigned long long)tid, thread);
+    if (prefix < 0 || (size_t)prefix >= sizeof line) return seq;
+    if (d) {
+        MTLPixelFormat format = d.pixelFormat;
+        MTLTextureSwizzleChannels swizzle = d.swizzle;
+        char compression[24] = "n/a";
+        if ([d respondsToSelector:@selector(compressionType)])
+            snprintf(compression, sizeof compression, "%lu", (unsigned long)d.compressionType);
+        snprintf(line + prefix, sizeof line - (size_t)prefix,
+                 " pixelFormat=%lu(%s) textureType=%lu width=%lu height=%lu depth=%lu"
+                 " mipmapLevelCount=%lu arrayLength=%lu sampleCount=%lu storageMode=%lu"
+                 " cpuCacheMode=%lu hazardTrackingMode=%lu resourceOptions=0x%lx usage=0x%lx"
+                 " allowGPUOptimizedContents=%d compressionType=%s swizzle=%u,%u,%u,%u\n",
+                 (unsigned long)format, sp_metal_diag_format(format), (unsigned long)d.textureType,
+                 d.width, d.height, d.depth, d.mipmapLevelCount, d.arrayLength, d.sampleCount,
+                 (unsigned long)d.storageMode, (unsigned long)d.cpuCacheMode,
+                 (unsigned long)d.hazardTrackingMode, (unsigned long)d.resourceOptions,
+                 (unsigned long)d.usage, d.allowGPUOptimizedContents, compression,
+                 (unsigned)swizzle.red, (unsigned)swizzle.green,
+                 (unsigned)swizzle.blue, (unsigned)swizzle.alpha);
+    } else {
+        snprintf(line + prefix, sizeof line - (size_t)prefix, " descriptor=nil\n");
+    }
+    sp_metal_diag_write(line);
+    return seq;
+}
+
+// Called inside sp_add_device_props' dispatch_once, before the device is returned to the client.
+static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
+    NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (documents) {
+        NSArray<NSString *> *names = @[@"sp-metal-diag.log", @"sp-metal-diag.1.log"];
+        NSArray<NSString *> *previous = @[@"sp-metal-diag.prev.log", @"sp-metal-diag.prev.1.log"];
+        for (unsigned i = 0; i < 2; ++i) {
+            NSString *path = [documents stringByAppendingPathComponent:names[i]];
+            NSString *backup = [documents stringByAppendingPathComponent:previous[i]];
+            if (rename(path.fileSystemRepresentation, backup.fileSystemRepresentation) != 0 && errno != ENOENT) {
+                SP_LOG_ONCE("Metal diagnostic log could not be archived; preserving the existing file");
+                continue;
+            }
+            sp_metal_diag_fds[i] = open(path.fileSystemRepresentation,
+                                      O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0600);
+        }
+    }
+
+    if (sp_metal_diag_fds[0] < 0) sp_metal_diag_slot = 1;
+
+    SEL selector = @selector(heapTextureSizeAndAlignWithDescriptor:);
+    Method method = class_getInstanceMethod(cls, selector);
+    const char *bc = "n/a";
+    if ([dev respondsToSelector:@selector(supportsBCTextureCompression)])
+        bc = dev.supportsBCTextureCompression ? "yes" : "no";
+    NSString *name = dev.name;
+    snprintf(sp_metal_diag_device, sizeof sp_metal_diag_device,
+             "SP_METAL_DIAG=1 device=\"%.96s\" class=%.96s Apple7=%d Apple8=%d Apple9=%d Mac2=%d"
+             " supportsBCTextureCompression=%s selector=%s hook=%s\n",
+             name.UTF8String ?: "n/a", class_getName(cls),
+             [dev supportsFamily:MTLGPUFamilyApple7], [dev supportsFamily:MTLGPUFamilyApple8],
+             [dev supportsFamily:MTLGPUFamilyApple9], [dev supportsFamily:MTLGPUFamilyMac2], bc,
+             sel_getName(selector), method ? "installed" : "missing");
+    sp_metal_diag_write(sp_metal_diag_device);
+    if (!method) return;
+
+    // Install on the concrete class even when the original method is inherited.
+    MTLSizeAndAlign (*original)(id, SEL, MTLTextureDescriptor *) =
+        (MTLSizeAndAlign (*)(id, SEL, MTLTextureDescriptor *))method_getImplementation(method);
+    IMP hook = imp_implementationWithBlock(^MTLSizeAndAlign(id self, MTLTextureDescriptor *descriptor) {
+        int saved_errno = errno;
+        uint64_t seq = sp_metal_diag_begin(selector, descriptor);
+        errno = saved_errno;
+        MTLSizeAndAlign result = original(self, selector, descriptor);
+        saved_errno = errno;
+        char line[128];
+        snprintf(line, sizeof line, "seq=%llu phase=after size=%lu align=%lu\n",
+                 (unsigned long long)seq, result.size, result.align);
+        sp_metal_diag_write(line);
+        errno = saved_errno;
+        return result;
+    });
+    class_replaceMethod(cls, selector, hook, method_getTypeEncoding(method));
+}
+#endif
+
 static void sp_add_device_props(id dev) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         Class c = object_getClass(dev);
+#if SP_METAL_DIAG
+        sp_install_metal_diag(dev, c);
+#endif
         Method m = class_getInstanceMethod(c, @selector(newLibraryWithData:error:));
         sp_newLibraryWithData_orig = (void *)method_setImplementation(m, (IMP)sp_newLibraryWithData);
         Method nd = class_getInstanceMethod(NSClassFromString(@"CAMetalLayer"), sel_registerName("nextDrawable"));

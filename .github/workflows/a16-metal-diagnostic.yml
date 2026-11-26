@@ -1,0 +1,89 @@
+name: A16 Metal diagnostic kit
+
+'on':
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: Full SHA of the upstream Enhanced base used by this branch
+        required: true
+        default: f731434765d724e6f5d91fee2b67b7e6aab45a28
+
+permissions:
+  contents: read
+
+env:
+  # The companion-deps action's pins, as in ci.yml (see the comments there).
+  XCODE_APP: /Applications/Xcode_27.1.app
+  XCODEGEN_VERSION: 2.46.0
+  XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+  RUSTUP_VERSION: 1.29.2
+  RUSTUP_SHA256: f7c7e11eb2e07f006e532a8aaac77b32f4527d305ac386c0c633ca6133d35ca9
+  IDEVICE_CACHE_PATHS: |
+    work/idevice/BUILD.txt
+    work/idevice/include
+    work/idevice/ios
+    work/idevice/xros
+    work/idevice/macos
+  ZSIGN_CACHE_PATHS: |
+    work/zsign/BUILD.txt
+    work/zsign/licenses
+    work/zsign/src/zsign/src
+    work/zsign/ios
+    work/zsign/xros
+    work/zsign/macos
+
+jobs:
+  kit:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify generated Metal source and record provenance
+        env:
+          SP_UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/recon/verify_metal_shim.py
+          [[ "$SP_UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$SP_UPSTREAM_SHA" HEAD
+          mkdir -p "$RUNNER_TEMP/kit"
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = {
+              "app_sha": os.environ["GITHUB_SHA"],
+              "upstream_sha": os.environ["SP_UPSTREAM_SHA"],
+              "SP_METAL_DIAG": 1,
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "kit" / "metadata.json"
+          path.write_text(json.dumps(metadata, indent=2) + "\n")
+          PYTHON
+
+      - uses: ./.github/actions/companion-deps
+
+      - name: Fetch the start screen's font
+        run: scripts/fetch-font.sh
+
+      - name: Build and hash the diagnostic kit
+        run: |
+          set -euo pipefail
+          sh apps/companion/bundle-resources.sh --build "$RUNNER_TEMP/stage"
+          scripts/release/device-kit.sh "$RUNNER_TEMP/stage" "$RUNNER_TEMP/kit/slashplayed-device-kit.zip"
+          cd "$RUNNER_TEMP/kit"
+          shasum -a 256 slashplayed-device-kit.zip > SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: a16-metal-diagnostic-kit-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/kit/slashplayed-device-kit.zip
+            ${{ runner.temp }}/kit/SHA256SUMS
+            ${{ runner.temp }}/kit/metadata.json
+          if-no-files-found: error
+          retention-days: 7
