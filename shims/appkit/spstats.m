@@ -47,7 +47,7 @@ static void sp_stats_commit(id<MTLCommandBuffer> cb, SEL _cmd) {
         os_unfair_lock_lock(&sp_stats_lock);
         sp_stats_cbs++;
         sp_stats_bc_cbs += hasBC;
-        if (startTime > 0 && endTime > startTime && endTime < 1.8e10)  // seconds that still fit in uint64_t nanoseconds {
+        if (startTime > 0 && endTime > startTime && endTime < 1.8e10) {  // seconds that fit in uint64_t ns
             uint64_t start = (uint64_t)(startTime * 1e9), end = (uint64_t)(endTime * 1e9);
             if (end - start < 10000000000ULL) {
                 sp_stats_gpu_sum += end - start;
