@@ -1,0 +1,207 @@
+name: Build Companion A16 for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [t007-companion]
+    paths:
+      - 'apps/companion-a16/**'
+      - '.github/workflows/companion-a16-windows.yml'
+      - 'LICENSE'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      RUSTUP_VERSION: 1.29.2
+      OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+      PYTHON: python
+      # Keep the ZIP portable without a separate redistributable. Verify both PE files below.
+      RUSTFLAGS: '-C target-feature=+crt-static'
+    steps:
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use the official Companion 1.7.0 build scripts
+        env:
+          UPSTREAM_COMMIT: 0e68bb83766c0a47aae4980fdab78e09ddcc91f1
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth 1 https://github.com/paulstraw/slashplayed.git "$UPSTREAM_COMMIT"
+          if [[ $(git rev-parse FETCH_HEAD) != "$UPSTREAM_COMMIT" ]]; then
+            echo "The fetched Companion 1.7.0 commit does not match the pin" >&2
+            exit 1
+          fi
+          # The branch predates the 1.7.0 build inputs and its crate license notices.
+          git checkout FETCH_HEAD -- scripts/crate-notices.py scripts/crate-licenses \
+            scripts/build-zsign.sh scripts/zsign.patch scripts/fetch-font.sh
+
+      - name: Install rustup
+        env:
+          RUSTUP_SHA: 00f139da614dced87d3c3d4121c43eebdac3c1bf8a5ee86b9d80dfd71c8d70fd
+        run: |
+          set -euo pipefail
+          init="$RUNNER_TEMP/rustup-init.exe"
+          curl -fsSL -o "$init" "https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/$TARGET/rustup-init.exe"
+          echo "$RUSTUP_SHA  $init" | sha256sum -c -
+          chmod +x "$init"
+          "$init" -y --profile minimal --default-toolchain none --no-modify-path
+          cygpath -w "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install the pinned toolchain and lint components
+        working-directory: apps/companion-a16
+        run: |
+          set -euo pipefail
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Fetch zsign source
+        run: scripts/build-zsign.sh source
+
+      - name: Fetch the font
+        run: scripts/fetch-font.sh
+
+      - name: Check signing key compatibility with the official Companion
+        working-directory: apps/companion-a16
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          normalize() {
+            sed -E '/^[[:space:]]*\/\//d; s/^pub\(crate\) fn off_runtime/fn off_runtime/' "$1" |
+              rustfmt --edition 2024 --emit stdout
+          }
+          normalize src/keystore.rs > "$tmp/a16.rs"
+          git show FETCH_HEAD:apps/companion-rs/src/keystore.rs > "$tmp/upstream.rs"
+          normalize "$tmp/upstream.rs" > "$tmp/official.rs"
+          diff -u "$tmp/official.rs" "$tmp/a16.rs"
+          "$PYTHON" -I - <<'PY'
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          def backend(read):
+              manifest = tomllib.loads(read("Cargo.toml"))
+              lock = tomllib.loads(read("Cargo.lock"))
+              package, = [pkg for pkg in lock["package"] if pkg["name"] == "keyring"]
+              return (
+                  manifest["dependencies"]["keyring"],
+                  tuple(package[key] for key in ("version", "source", "checksum")),
+              )
+
+          def local(name):
+              return Path(name).read_text(encoding="utf-8")
+
+          def upstream(name):
+              return subprocess.check_output(
+                  ["git", "show", f"FETCH_HEAD:apps/companion-rs/{name}"], encoding="utf-8"
+              )
+
+          if backend(local) != backend(upstream):
+              raise SystemExit("The keyring dependency differs from the official Companion")
+          PY
+
+      - name: Check formatting
+        working-directory: apps/companion-a16
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: apps/companion-a16
+        run: cargo clippy --locked --target "$TARGET" --all-targets -- -D warnings
+
+      - name: Test on Windows
+        working-directory: apps/companion-a16
+        run: cargo test --locked --target "$TARGET"
+
+      - name: Build Windows executables
+        working-directory: apps/companion-a16
+        # build.rs accepts no SP_KIT_SHA256. This build installs using a local --kit ZIP.
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Verify Windows runtime imports
+        shell: pwsh
+        working-directory: apps/companion-a16
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio C++ tools are missing' }
+          $tools = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt").Trim()
+          $dumpbin = "$vs\VC\Tools\MSVC\$tools\bin\Hostx64\x64\dumpbin.exe"
+          foreach ($name in 'slashplayed-companion.exe', 'slashplayed-cli.exe') {
+            $imports = & $dumpbin /nologo /dependents "target/$env:TARGET/release/$name"
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $name" }
+            $imports | Write-Host
+            if ($imports -match '^\s*(vcruntime|msvcp|msvcr|msvcm|concrt|vcomp|vcamp|ucrtbase|api-ms-win-crt).*\.dll\s*$') {
+              throw "Unexpected dynamic CRT import in $name"
+            }
+          }
+          'SP_WINDOWS_CRT=static' >> $env:GITHUB_ENV
+
+      - name: Package the portable ZIP
+        run: apps/companion-a16/package.sh "$TARGET" "$RUNNER_TEMP/companion-a16"
+
+      - name: Write checksums and metadata
+        run: |
+          set -euo pipefail
+          "$PYTHON" -I - "$RUNNER_TEMP/companion-a16" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          import tomllib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          out = Path(sys.argv[1])
+          crate = Path("apps/companion-a16")
+          toolchain = tomllib.loads((crate / "rust-toolchain.toml").read_text(encoding="utf-8"))
+          manifest = tomllib.loads((crate / "Cargo.toml").read_text(encoding="utf-8"))
+
+          def describe(path):
+              with path.open("rb") as stream:
+                  return {"name": path.name, "sha256": hashlib.file_digest(stream, "sha256").hexdigest()}
+
+          archive = describe(out / "slashplayed-companion-windows-x86_64.zip")
+          sums = out / "SHA256SUMS"
+          sums.write_text(f"{archive['sha256']}  {archive['name']}\n", encoding="ascii", newline="\n")
+          metadata = {
+              "commit_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "target": os.environ["TARGET"],
+              "toolchain": toolchain["toolchain"]["channel"],
+              "crate_version": manifest["package"]["version"],
+              "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "files": [archive, describe(sums)],
+          }
+          (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8", newline="\n")
+          PY
+
+      - name: Scan the extracted ZIP for secrets
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          "$PYTHON" -I -m zipfile -e "$RUNNER_TEMP/companion-a16/slashplayed-companion-windows-x86_64.zip" "$tmp"
+          apps/companion-a16/scripts/check-secrets.sh "$tmp"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: companion-a16-windows-x86_64
+          path: |
+            ${{ runner.temp }}/companion-a16/slashplayed-companion-windows-x86_64.zip
+            ${{ runner.temp }}/companion-a16/SHA256SUMS
+            ${{ runner.temp }}/companion-a16/metadata.json
+          if-no-files-found: error
+          retention-days: 14

@@ -134,6 +134,42 @@ Vision Pro still needs a Mac with the Slashplayed Companion.
 Third-party notices are in licenses/.
 EOF
 
+if [ "$os" = windows ]; then
+  if [ "${SP_WINDOWS_CRT:-}" = static ]; then
+    runtime='Os executáveis usam CRT estático e dispensam o Visual C++ Redistributable.'
+  else
+    runtime='Se este build usar o CRT dinâmico, instale o Microsoft Visual C++ Redistributable x64.'
+  fi
+  cat > "$PKG/LEIA-ME.txt" <<EOF
+Companion A16 para Windows x64
+
+Extraia a pasta inteira do ZIP. Use Windows 10 ou 11 x64 e instale
+iTunes, Apple Devices ou os drivers Apple Mobile Device para que o
+Companion acesse seu iPhone ou iPad via USB (usbmuxd).
+$runtime
+
+Abra "Slashplayed Companion.exe" com um duplo clique. Mantenha a fonte
+Goodmountain-Regular.otf na mesma pasta. Na seção "ZIP do kit", selecione
+o arquivo local slashplayed-device-kit.zip ou arraste-o para a janela.
+
+Para usar a CLI, abra o PowerShell nesta pasta:
+
+  .\slashplayed-cli.exe --help
+  .\slashplayed-cli.exe install --kit "C:\caminho\slashplayed-device-kit.zip"
+
+A sessão Apple fica em %LOCALAPPDATA%\SlashplayedA16\sessions, protegida
+pelo DPAPI da sua conta do Windows. Se você optar por guardar a senha,
+ela fica no Gerenciador de Credenciais do Windows.
+
+Para sair, selecione "Desconectar conta" na janela ou execute:
+
+  .\slashplayed-cli.exe logout "<Apple ID>"
+
+O logout apaga a sessão e a senha guardada. A chave de assinatura é
+preservada por padrão. Adicione --forget-key para apagá-la também.
+EOF
+fi
+
 rm -f "$OUTDIR/$NAME".zip "$OUTDIR/$NAME".tar.gz
 if [ "$os" = windows ]; then
   # Git Bash has no zip. Windows' own tar.exe (bsdtar) writes one from the suffix, with forward slashes and

@@ -133,11 +133,11 @@ impl<S: BlobStore, P: BlobStore> SessionStore for Store<S, P> {
 
 pub fn system_store() -> impl SessionStore {
     #[cfg(windows)]
-    let sessions = Directory {
-        root: std::env::var_os("LOCALAPPDATA").map(|p| std::path::PathBuf::from(p).join("SlashplayedA16").join("sessions")),
-        protect: |bytes| dpapi(bytes, true),
-        unprotect: |bytes| dpapi(bytes, false),
-    };
+    let sessions = Directory::dpapi(std::env::var_os("LOCALAPPDATA").map(|path| {
+        std::path::PathBuf::from(path)
+            .join("SlashplayedA16")
+            .join("sessions")
+    }));
     #[cfg(not(windows))]
     let sessions = Keyring(SESSION_SERVICE);
     Store { sessions, passwords: Keyring(PASSWORD_SERVICE) }
@@ -205,6 +205,15 @@ struct Directory {
 
 #[cfg(any(windows, test))]
 impl Directory {
+    #[cfg(windows)]
+    fn dpapi(root: Option<std::path::PathBuf>) -> Self {
+        Self {
+            root,
+            protect: |bytes| dpapi(bytes, true),
+            unprotect: |bytes| dpapi(bytes, false),
+        }
+    }
+
     fn path(&self, id: &str) -> Result<std::path::PathBuf, Report> {
         use sha2::{Digest, Sha256};
         let root = self.root.as_ref().ok_or_else(|| report!("LOCALAPPDATA indisponível."))?;
@@ -216,7 +225,14 @@ impl Directory {
 impl BlobStore for Directory {
     fn read(&self, id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, Report> {
         match std::fs::read(self.path(id)?) {
-            Ok(bytes) => (self.unprotect)(&bytes).map(Some),
+            Ok(bytes) => match (self.unprotect)(&bytes) {
+                Ok(plain) => Ok(Some(plain)),
+                Err(_) => {
+                    // A blob rejected by DPAPI cannot restore this session.
+                    self.remove(id)?;
+                    Ok(None)
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -372,6 +388,18 @@ pub(crate) mod test_store {
     }
 
     #[test]
+    fn directory_discards_blobs_rejected_by_unprotect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "x@example.com";
+        let mut store = directory(tmp.path());
+        store.save(&sample(id)).unwrap();
+        store.sessions.unprotect = |_| Err(report!("simulated decryption failure"));
+
+        assert!(store.load(id).unwrap().is_none());
+        assert!(!store.sessions.path(id).unwrap().exists());
+    }
+
+    #[test]
     fn debug_redacts_credentials() {
         let stored = sample("x@example.com");
         let text = format!("{stored:?}");
@@ -399,11 +427,90 @@ pub(crate) mod test_store {
     }
 
     #[cfg(windows)]
+    fn windows_store(root: &std::path::Path) -> Store<Directory, Keyring> {
+        Store {
+            sessions: Directory::dpapi(Some(root.into())),
+            passwords: Keyring(PASSWORD_SERVICE),
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
-    fn dpapi_round_trip() {
-        let data = vec![42; 4096];
-        let encrypted = dpapi(&data, true).unwrap();
-        assert!(*encrypted != data);
-        assert!(*dpapi(&encrypted, false).unwrap() == data);
+    fn dpapi_directory_persists_an_encrypted_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "x@example.com";
+        let original = sample(id);
+        let store = windows_store(tmp.path());
+        store.save(&original).unwrap();
+
+        let encrypted = std::fs::read(store.sessions.path(id).unwrap()).unwrap();
+        for secret in [&original.token, &original.adsid] {
+            let secret = secret.as_bytes();
+            assert!(!encrypted.windows(secret.len()).any(|part| part == secret));
+        }
+
+        let reopened = windows_store(tmp.path());
+        let loaded = reopened.load(id).unwrap().unwrap();
+        let expected = Zeroizing::new(serde_json::to_vec(&original).unwrap());
+        let actual = Zeroizing::new(serde_json::to_vec(&loaded).unwrap());
+        assert!(*actual == *expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_directory_discards_corrupt_blobs_and_unknown_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "x@example.com";
+        let store = windows_store(tmp.path());
+        let path = store.sessions.path(id).unwrap();
+        let mut session = sample(id);
+        store.save(&session).unwrap();
+        std::fs::write(&path, b"invalid DPAPI blob").unwrap();
+        assert!(store.load(id).unwrap().is_none());
+        assert!(!path.exists());
+
+        session.version += 1;
+        store.save(&session).unwrap();
+        assert!(store.load(id).unwrap().is_none());
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_logout_removes_session_and_password() {
+        struct PasswordCleanup(String);
+
+        impl Drop for PasswordCleanup {
+            fn drop(&mut self) {
+                let _ = Keyring(PASSWORD_SERVICE).remove(&self.0);
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let account = PasswordCleanup(format!(
+            "a16-test-{:032x}@example.com",
+            rand::random::<u128>()
+        ));
+        let id = account.0.as_str();
+        let store = windows_store(tmp.path());
+        let path = store.sessions.path(id).unwrap();
+
+        for forget_key in [false, true] {
+            store.save(&sample(id)).unwrap();
+            store.save_password(id, &crate::flow::fake::password()).unwrap();
+            assert!(path.is_file());
+            assert!(store.load_password(id).unwrap().is_some());
+            let mut called = false;
+            logout(&store, id, forget_key, |key_id| {
+                assert_eq!(key_id, id);
+                called = true;
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(called, forget_key);
+            assert!(!path.exists());
+            assert!(store.load(id).unwrap().is_none());
+            assert!(store.load_password(id).unwrap().is_none());
+        }
     }
 }
