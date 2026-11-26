@@ -287,6 +287,26 @@ static void sp_test_pencil(SPInputView *view, SPThumbButton *thumb) {
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
     sp_window = self.window;
     UIViewController *controller = [UIViewController new];
+    unsetenv("SP_GAME_TOUCH");
+    SPInputView *physicalView = [[SPInputView alloc] initWithFrame:self.window.bounds];
+    @try {
+        for (UIView *child in physicalView.subviews) {
+            sp_test_check(![child isKindOfClass:SPThumbButton.class] &&
+                          ![child isKindOfClass:SPJoystick.class] &&
+                          ![child isKindOfClass:SPKeyboardButton.class], @"Default input has no virtual controls.");
+        }
+        SPTestTouch *finger = sp_test_touch(physicalView, CGPointZero);
+        SPTestTouch *pointer = sp_test_touch(physicalView, CGPointZero);
+        pointer.testType = UITouchTypeIndirectPointer;
+        sp_test_check([[physicalView sp_game_touches:[NSSet setWithArray:@[finger, pointer]]]
+                       isEqualToSet:[NSSet setWithObject:pointer]], @"Default input accepts the physical pointer only.");
+    } @catch (NSException *exception) {
+        controller.view = physicalView; self.window.rootViewController = controller;
+        [self.window makeKeyAndVisible];
+        [self finish:exception.reason inView:physicalView];
+        return;
+    }
+    setenv("SP_GAME_TOUCH", "1", 1);
     SPInputView *view = [[SPInputView alloc] initWithFrame:self.window.bounds];
     controller.view = view; self.window.rootViewController = controller;
     view.backgroundColor = [UIColor colorWithRed:0.06 green:0.1 blue:0.085 alpha:1];

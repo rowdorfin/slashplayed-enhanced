@@ -14,6 +14,7 @@
 #import "spcdn.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <stdatomic.h>
+#include <unistd.h>
 #include <zlib.h>
 
 NSString *const SPCDNNotFound = @"HTTP 404";
@@ -934,16 +935,47 @@ NSString *sp_flavor_info(NSString *product) {
     return [NSString stringWithFormat:@"Product Flavor!STRING:0\n%@\n", product];
 }
 
+// Fingerprints of the files shipped by the Enhanced build. Earlier installs have no receipt.
+static NSArray<NSString *> *sp_retire_touch_bars(NSString *game) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *folder = game;
+    if (![[fm attributesOfItemAtPath:folder error:nil][NSFileType] isEqual:NSFileTypeDirectory]) return @[];
+    for (NSString *component in @[@"Interface", @"AddOns", @"SPTouchBars"]) {
+        folder = [folder stringByAppendingPathComponent:component];
+        if (![[fm attributesOfItemAtPath:folder error:nil][NSFileType] isEqual:NSFileTypeDirectory]) return @[];
+    }
+
+    const struct { __unsafe_unretained NSString *name; NSUInteger size; __unsafe_unretained NSString *sha256; } shipped[] = {
+        { @"SPTouchBars.toc", 302, @"a08d415998a062d9070d3c939f1dec3dbb33dfcbc200d82495e87043e1be8473" },
+        { @"SPTouchBars.lua", 72334, @"1df930b39f3b2605aa1cc1afa31d2c3618973ef0b7f30f2378dd80996f56aa9b" },
+        { @"SPTouchBars.tga", 1048620, @"c1ff43928d13e89412027a738cae50e62cf91abf33e9f90d9b3ace1435aa0558" },
+    };
+    NSMutableArray<NSString *> *removed = [NSMutableArray array];
+    for (NSUInteger i = 0; i < sizeof shipped / sizeof shipped[0]; i++) {
+        NSString *path = [folder stringByAppendingPathComponent:shipped[i].name];
+        NSDictionary *attributes = [fm attributesOfItemAtPath:path error:nil];
+        if (![attributes[NSFileType] isEqual:NSFileTypeRegular] || [attributes[NSFileSize] unsignedLongLongValue] != shipped[i].size) continue;
+        NSData *bytes = [NSData dataWithContentsOfFile:path];
+        if (bytes.length != shipped[i].size) continue;
+        uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, digest);
+        if ([hex([NSData dataWithBytes:digest length:sizeof digest]) isEqual:shipped[i].sha256] &&
+            unlink(path.fileSystemRepresentation) == 0)
+            [removed addObject:shipped[i].name];
+    }
+    rmdir(folder.fileSystemRepresentation);  // Only succeeds for an empty directory.
+    return removed;
+}
+
 BOOL sp_addons_place(NSString *addons, NSString *game, NSString *flavor, BOOL hover, NSString **line) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSMutableArray<NSString *> *written = [NSMutableArray array], *failed = [NSMutableArray array];
     NSUInteger same = 0;
     NSMutableArray<NSString *> *names = [NSMutableArray arrayWithObject:@"SPMovie"];
     if (hover) [names addObject:@"SPHover"];
-    // Touch bars use Forever's API and TOC, so carrying them in the app doesn't install them into other games.
-    if ([flavor isEqualToString:@"forever"]) [names addObject:@"SPTouchBars"];
+    NSArray<NSString *> *removed = [flavor isEqualToString:@"forever"] ? sp_retire_touch_bars(game) : @[];
     for (NSString *name in names)
-        for (NSString *ext in ([name isEqualToString:@"SPTouchBars"] ? @[@"toc", @"lua", @"tga"] : @[@"toc", @"lua"])) {
+        for (NSString *ext in @[@"toc", @"lua"]) {
             NSString *file = [NSString stringWithFormat:@"%@/%@.%@", name, name, ext];
             NSData *bytes = [NSData dataWithContentsOfFile:[addons stringByAppendingPathComponent:file]];
             if (!bytes) {
@@ -960,6 +992,7 @@ BOOL sp_addons_place(NSString *addons, NSString *game, NSString *flavor, BOOL ho
             else [failed addObject:[file stringByAppendingString:@" (couldn't be written)"]];
         }
     NSMutableString *text = [NSMutableString stringWithFormat:@"addons: %lu up to date", (unsigned long)same];
+    if (removed.count) [text appendFormat:@", removed %@", [removed componentsJoinedByString:@" "]];
     if (written.count) [text appendFormat:@", wrote %@", [written componentsJoinedByString:@" "]];
     if (failed.count) [text appendFormat:@"; FAILED %@", [failed componentsJoinedByString:@", "]];
     *line = text;

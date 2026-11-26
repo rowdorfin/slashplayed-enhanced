@@ -173,11 +173,9 @@ NSString *sp_flavor_info(NSString *product);
 // The addons the app carries (`addons`: the app's addons/, each <name>/<name>.toc and .lua as addon/ has
 // them; apps/client/build.sh and the companion's ClientAssembly put them there) into a game's folder
 // (`game`: Documents/_<flavor>_), at Interface/AddOns/<name>/, as the companion used to copy them: SPMovie
-// on every device, SPHover with `hover` (the headset: the iPad and iPhone have a real pointer), and SPTouchBars
-// only when `flavor` is "forever". Each file is written when the game's copy is missing or its bytes differ,
-// and left alone otherwise. SPMovie and SPHover list every flavor's Interface number; SPTouchBars lists
-// Forever's only. Saved variables in WTF are never touched. A line for the log; NO when one couldn't be
-// read or written (*line says which).
+// on every device and SPHover with `hover` (the headset). Writes missing or changed bundled files
+// and retires matching copies of the legacy touch bars in Forever. Saved variables in WTF are kept.
+// Returns NO when a bundled file couldn't be read or written, with details in *line.
 BOOL sp_addons_place(NSString *addons, NSString *game, NSString *flavor, BOOL hover, NSString *_Nullable *_Nonnull line);
 
 NS_ASSUME_NONNULL_END

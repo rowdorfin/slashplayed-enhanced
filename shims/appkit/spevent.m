@@ -680,6 +680,12 @@ static double sp_chord_window(void) {
     return w;
 }
 
+// Developer opt-in for the legacy iOS touch controls. Physical input is always wired up.
+static BOOL sp_game_touch_enabled(void) {
+    const char *value = getenv("SP_GAME_TOUCH");
+    return value && strcmp(value, "1") == 0;
+}
+
 #include "spthumb.m"
 #include "spjoystick.m"
 #include "spkeys.m"
@@ -734,20 +740,22 @@ static double sp_chord_window(void) {
     sp_cursor_view.layer.zPosition = 2000;
     [self addSubview:sp_cursor_view];
 #if !TARGET_OS_VISION
-    _thumbButton = [[SPThumbButton alloc] initWithFrame:CGRectZero];
-    [self addSubview:_thumbButton];
-    _joystick = [[SPJoystick alloc] initWithFrame:CGRectZero];
-    [self addSubview:_joystick];
-    [self bringSubviewToFront:_thumbButton];  // R remains usable if its target overlaps the touch shield
-    _keyboardButtons = @[
-        [[SPKeyboardButton alloc] initWithName:@"ctrl" label:@"Ctrl" usage:0xE0 position:CGPointMake(0.32, 1)],
-        [[SPKeyboardButton alloc] initWithName:@"shift" label:@"Shift" usage:0xE1 position:CGPointMake(0.44, 1)],
-        [[SPKeyboardButton alloc] initWithName:@"alt" label:@"Alt" usage:0xE2 position:CGPointMake(0.56, 1)],
-        [[SPKeyboardButton alloc] initWithName:@"space" label:@"Space" usage:0x2C position:CGPointMake(1, 1)],
-    ];
-    // Put modifier targets and R above Space's invisible margin, as with the joystick shield.
-    for (SPKeyboardButton *button in _keyboardButtons.reverseObjectEnumerator) [self addSubview:button];
-    [self bringSubviewToFront:_thumbButton];
+    if (sp_game_touch_enabled()) {
+        _thumbButton = [[SPThumbButton alloc] initWithFrame:CGRectZero];
+        [self addSubview:_thumbButton];
+        _joystick = [[SPJoystick alloc] initWithFrame:CGRectZero];
+        [self addSubview:_joystick];
+        [self bringSubviewToFront:_thumbButton];  // R remains usable if its target overlaps the touch shield
+        _keyboardButtons = @[
+            [[SPKeyboardButton alloc] initWithName:@"ctrl" label:@"Ctrl" usage:0xE0 position:CGPointMake(0.32, 1)],
+            [[SPKeyboardButton alloc] initWithName:@"shift" label:@"Shift" usage:0xE1 position:CGPointMake(0.44, 1)],
+            [[SPKeyboardButton alloc] initWithName:@"alt" label:@"Alt" usage:0xE2 position:CGPointMake(0.56, 1)],
+            [[SPKeyboardButton alloc] initWithName:@"space" label:@"Space" usage:0x2C position:CGPointMake(1, 1)],
+        ];
+        // Put modifier targets and R above Space's invisible margin, as with the joystick shield.
+        for (SPKeyboardButton *button in _keyboardButtons.reverseObjectEnumerator) [self addSubview:button];
+        [self bringSubviewToFront:_thumbButton];
+    }
     NSNotificationCenter *notifications = NSNotificationCenter.defaultCenter;
     [notifications addObserver:self selector:@selector(sp_suspend_touch:) name:UIApplicationWillResignActiveNotification object:nil];
     [notifications addObserver:self selector:@selector(sp_suspend_touch:) name:UISceneWillDeactivateNotification object:nil];
@@ -952,8 +960,23 @@ static double sp_chord_window(void) {
     return sp_from_uikit([t locationInView:self]);
 }
 
+#if !TARGET_OS_VISION
+- (NSSet<UITouch *> *)sp_game_touches:(NSSet<UITouch *> *)touches {
+    if (sp_game_touch_enabled()) return touches;
+    NSMutableSet<UITouch *> *pointerTouches = [NSMutableSet set];
+    for (UITouch *touch in touches) {
+        if (touch.type == UITouchTypeIndirectPointer ||
+            (touch.type == UITouchTypeDirect && sp_assistive_mouse() && touch.majorRadiusTolerance == 0))
+            [pointerTouches addObject:touch];
+    }
+    return pointerTouches;
+}
+#endif
+
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
 #if !TARGET_OS_VISION
+    touches = [self sp_game_touches:touches];
+    if (!touches.count) return;
     // UIKit can deliver a simultaneous game tap before the modifier's own callback.
     for (SPKeyboardButton *button in _keyboardButtons) [button syncWithEvent:event];
 #endif
@@ -1066,6 +1089,8 @@ static double sp_chord_window(void) {
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
 #if !TARGET_OS_VISION
+    touches = [self sp_game_touches:touches];
+    if (!touches.count) return;
     for (SPKeyboardButton *button in _keyboardButtons) [button syncWithEvent:event];
 #endif
     if (!_touches.count || ![touches intersectsSet:[NSSet setWithArray:_touches]]) return;
@@ -1078,9 +1103,9 @@ static double sp_chord_window(void) {
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
 #if !TARGET_OS_VISION
+    touches = [self sp_game_touches:touches];
+    if (!touches.count) return;
     for (SPKeyboardButton *button in _keyboardButtons) [button syncWithEvent:event];
-#endif
-#if !TARGET_OS_VISION
     // A finger lifting in the window resolves the chord first, so a quick tap is a click.
     if ([touches intersectsSet:[NSSet setWithArray:_chord]]) [self sp_chord_resolve];
 #endif
@@ -1092,6 +1117,10 @@ static double sp_chord_window(void) {
 // When the last touch is cancelled, buttons it had down stay down while GCMouse says they're held (it
 // reports their ups): locking the pointer may cancel the touch mid-mouselook.
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+#if !TARGET_OS_VISION
+    touches = [self sp_game_touches:touches];
+    if (!touches.count) return;
+#endif
     CGPoint p = [self sp_location:[self sp_mover:touches]];
     [self sp_remove:touches];
     if (_touches.count) {

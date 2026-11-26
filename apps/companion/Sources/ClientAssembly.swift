@@ -207,10 +207,9 @@ enum ClientAssembly {
 
     /// The addons the device app carries, at addons/<name>/ (as addon/ has them), which its launcher puts
     /// in each game's folder before the client loads (apps/client/spcdn.m's sp_addons_place: SPMovie on every
-    /// device, SPHover on the headset, and SPTouchBars for Forever), as build.sh's app has them. All on both platforms: the launcher
+    /// device and SPHover on the headset), as build.sh's app has them. Both on both platforms: the launcher
     /// decides. bundle-resources.sh bundles them in Resources/addons/.
-    static let addonFiles = ["SPMovie/SPMovie.toc", "SPMovie/SPMovie.lua", "SPHover/SPHover.toc", "SPHover/SPHover.lua",
-                             "SPTouchBars/SPTouchBars.toc", "SPTouchBars/SPTouchBars.lua", "SPTouchBars/SPTouchBars.tga"]
+    static let addonFiles = ["SPMovie/SPMovie.toc", "SPMovie/SPMovie.lua", "SPHover/SPHover.toc", "SPHover/SPHover.lua"]
 
     /// Assembles an unsigned Slashplayed.app at `app` from the given clients (flavor raw value → the Mac
     /// client, universal or its arm64 slice, and the build it is, for its Stamp) and the companion's resources: `platformResources` (<platform>/: the shims, the
