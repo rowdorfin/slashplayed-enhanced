@@ -1,5 +1,11 @@
 // GitHub Actions metadata and verified extraction. Requests are only made by explicit commands.
-use std::{fmt, io::{Cursor, Read, Write}, path::Path, process::Command, time::Duration};
+use std::{
+    fmt,
+    io::{Cursor, Read, Write},
+    path::Path,
+    process::Command,
+    time::Duration,
+};
 
 use reqwest::{Client, Response, Url, header};
 use rootcause::prelude::*;
@@ -34,7 +40,9 @@ fn entry() -> Result<keyring::Entry, Report> {
 pub fn remember(token: &Token) -> Result<(), Report> {
     let value = token.0.clone();
     crate::keystore::off_runtime(move || {
-        entry()?.set_password(&value).map_err(|_| report!("Não foi possível guardar o token no gerenciador de credenciais."))
+        entry()?
+            .set_password(&value)
+            .map_err(|_| report!("Não foi possível guardar o token no gerenciador de credenciais."))
     })
 }
 
@@ -47,7 +55,10 @@ pub fn resolve(pasted: Option<Token>) -> Result<Option<Token>, Report> {
             }
         }
     }
-    if let Ok(output) = Command::new("gh").args(["auth", "token", "--hostname", "github.com"]).output() {
+    if let Ok(output) = Command::new("gh")
+        .args(["auth", "token", "--hostname", "github.com"])
+        .output()
+    {
         let stdout = Zeroizing::new(output.stdout);
         let _stderr = Zeroizing::new(output.stderr);
         if output.status.success()
@@ -59,12 +70,16 @@ pub fn resolve(pasted: Option<Token>) -> Result<Option<Token>, Report> {
     if pasted.is_some() {
         return Ok(pasted);
     }
-    crate::keystore::off_runtime(|| {
-        match entry()?.get_password() {
-            Ok(value) => Ok(Token::new(&Zeroizing::new(value))),
-            Err(keyring::Error::NoEntry | keyring::Error::NoStorageAccess(_) | keyring::Error::PlatformFailure(_)) => Ok(None),
-            Err(_) => Err(report!("Não foi possível ler o token no gerenciador de credenciais.")),
-        }
+    crate::keystore::off_runtime(|| match entry()?.get_password() {
+        Ok(value) => Ok(Token::new(&Zeroizing::new(value))),
+        Err(
+            keyring::Error::NoEntry
+            | keyring::Error::NoStorageAccess(_)
+            | keyring::Error::PlatformFailure(_),
+        ) => Ok(None),
+        Err(_) => Err(report!(
+            "Não foi possível ler o token no gerenciador de credenciais."
+        )),
     })
 }
 
@@ -86,13 +101,19 @@ struct Commit {
 impl Run {
     pub fn summary(&self) -> String {
         let sha: String = self.head_sha.chars().take(7).collect();
-        let message = self.head_commit.as_ref().map(|commit| crate::secret::sanitize(&commit.message)).unwrap_or_else(|| "Sem mensagem".into());
-        format!("{sha} — {message}\n{} · CI concluída com sucesso", self.created_at)
+        let message = self
+            .head_commit
+            .as_ref()
+            .map(|commit| crate::secret::sanitize(&commit.message))
+            .unwrap_or_else(|| "Sem mensagem".into());
+        format!(
+            "{sha} — {message}\n{} · CI concluída com sucesso",
+            self.created_at
+        )
     }
 }
 
-#[derive(Deserialize)]
-#[derive(Clone)]
+#[derive(Deserialize, Clone)]
 pub struct Artifact {
     pub id: u64,
     pub name: String,
@@ -102,31 +123,44 @@ pub struct Artifact {
 
 fn select_run(json: &[u8]) -> Result<Run, Report> {
     #[derive(Deserialize)]
-    struct Runs { workflow_runs: Vec<Run> }
-    serde_json::from_slice::<Runs>(json)?.workflow_runs.into_iter()
+    struct Runs {
+        workflow_runs: Vec<Run>,
+    }
+    serde_json::from_slice::<Runs>(json)?
+        .workflow_runs
+        .into_iter()
         .find(|run| run.conclusion.as_deref() == Some("success") && run.status == "completed")
         .ok_or_else(|| report!("Nenhuma execução bem-sucedida encontrada na branch a16-support."))
 }
 
 fn select_artifact(json: &[u8], sha: &str) -> Result<Artifact, Report> {
     #[derive(Deserialize)]
-    struct Artifacts { artifacts: Vec<Artifact> }
+    struct Artifacts {
+        artifacts: Vec<Artifact>,
+    }
     let name = format!("a16-metal-diagnostic-kit-{sha}");
-    serde_json::from_slice::<Artifacts>(json)?.artifacts.into_iter()
+    serde_json::from_slice::<Artifacts>(json)?
+        .artifacts
+        .into_iter()
         .find(|artifact| !artifact.expired && artifact.name == name)
         .ok_or_else(|| report!("O artefato do commit está ausente ou expirado."))
 }
 
 fn client() -> Result<Client, Report> {
-    Ok(Client::builder().redirect(reqwest::redirect::Policy::none())
-        .user_agent("Slashplayed-Companion-A16").timeout(Duration::from_secs(300)).build()?)
+    Ok(Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("Slashplayed-Companion-A16")
+        .timeout(Duration::from_secs(300))
+        .build()?)
 }
 
 async fn get(client: &Client, url: &str, token: Option<&Token>) -> Result<Response, Report> {
-    let mut request = client.get(url).header("X-GitHub-Api-Version", "2022-11-28")
+    let mut request = client
+        .get(url)
+        .header("X-GitHub-Api-Version", "2022-11-28")
         .header(header::ACCEPT, "application/vnd.github+json");
     if let Some(token) = token {
-        let bearer = Zeroizing::new(format!("Bearer {}", &*token.0));
+        let bearer = Zeroizing::new(format!("Bearer {}", *token.0));
         let mut value = header::HeaderValue::from_str(&bearer)
             .map_err(|_| report!("Token do GitHub inválido."))?;
         value.set_sensitive(true);
@@ -162,7 +196,10 @@ impl Download {
             for name in [KIT, "SHA256SUMS"] {
                 let mut source = File::open(self.scratch.path().join(name))?;
                 let path = dir.join(name);
-                let mut dest = OpenOptions::new().create_new(true).write(true).open(&path)?;
+                let mut dest = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&path)?;
                 created.push(path);
                 std::io::copy(&mut source, &mut dest)?;
                 dest.sync_all()?;
@@ -174,7 +211,8 @@ impl Download {
                 let _ = fs::remove_file(path);
             }
         }
-        result.context("Falha ao salvar o ZIP e o SHA256SUMS. Use um diretório sem esses arquivos")?;
+        result
+            .context("Falha ao salvar o ZIP e o SHA256SUMS. Use um diretório sem esses arquivos")?;
         Ok(())
     }
 }
@@ -198,7 +236,9 @@ fn extract(bytes: &[u8], dir: &Path) -> Result<Option<String>, Report> {
     let app_sha = match archive.by_name("metadata.json") {
         Ok(file) => {
             #[derive(Deserialize)]
-            struct Metadata { app_sha: Option<String> }
+            struct Metadata {
+                app_sha: Option<String>,
+            }
             serde_json::from_slice::<Metadata>(&read(file, 1024 * 1024)?)?.app_sha
         }
         Err(zip::result::ZipError::FileNotFound) => None,
@@ -211,16 +251,29 @@ fn extract(bytes: &[u8], dir: &Path) -> Result<Option<String>, Report> {
 
 pub async fn download(artifact: &Artifact, token: &Token) -> Result<Download, Report> {
     let client = client()?;
-    let mut response = get(&client, &format!("{API}/artifacts/{}/zip", artifact.id), Some(token)).await?;
+    let mut response = get(
+        &client,
+        &format!("{API}/artifacts/{}/zip", artifact.id),
+        Some(token),
+    )
+    .await?;
     if response.status().is_redirection() {
-        let url = response.headers().get(header::LOCATION)
-            .and_then(|value| value.to_str().ok()).and_then(|url| Url::parse(url).ok())
-            .filter(|url| url.scheme() == "https" && url.username().is_empty() && url.password().is_none())
+        let url = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|url| Url::parse(url).ok())
+            .filter(|url| {
+                url.scheme() == "https" && url.username().is_empty() && url.password().is_none()
+            })
             .ok_or_else(|| report!("Redirecionamento inválido no download do GitHub."))?;
         response = client.get(url).send().await?.error_for_status()?;
     }
     if !response.status().is_success() {
-        bail!("Download do GitHub retornou HTTP {}.", response.status().as_u16());
+        bail!(
+            "Download do GitHub retornou HTTP {}.",
+            response.status().as_u16()
+        );
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
@@ -256,10 +309,17 @@ mod tests {
             let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
             for (name, text) in [
                 (KIT, "kit".into()),
-                ("SHA256SUMS", format!("{}  {KIT}", checksum::digest(if valid { b"kit" } else { b"bad" }))),
+                (
+                    "SHA256SUMS",
+                    format!(
+                        "{}  {KIT}",
+                        checksum::digest(if valid { b"kit" } else { b"bad" })
+                    ),
+                ),
                 ("metadata.json", r#"{"app_sha":"abc"}"#.into()),
             ] {
-                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
                 zip.write_all(text.as_bytes()).unwrap();
             }
             let result = extract(&zip.finish().unwrap().into_inner(), dir.path());

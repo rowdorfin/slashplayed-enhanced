@@ -41,7 +41,9 @@ mod secret_string {
         serializer.serialize_str(value)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Zeroizing<String>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Zeroizing<String>, D::Error> {
         String::deserialize(deserializer).map(Zeroizing::new)
     }
 }
@@ -59,7 +61,10 @@ impl fmt::Debug for StoredSession {
 }
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl StoredSession {
@@ -98,7 +103,9 @@ impl<S: BlobStore, P: BlobStore> SessionStore for Store<S, P> {
             return Ok(None);
         };
         match serde_json::from_slice::<StoredSession>(&bytes) {
-            Ok(session) if session.version == VERSION && session.apple_id.to_lowercase() == id => Ok(Some(session)),
+            Ok(session) if session.version == VERSION && session.apple_id.to_lowercase() == id => {
+                Ok(Some(session))
+            }
             _ => {
                 self.sessions.remove(&id)?;
                 Ok(None)
@@ -108,7 +115,8 @@ impl<S: BlobStore, P: BlobStore> SessionStore for Store<S, P> {
 
     fn save(&self, session: &StoredSession) -> Result<(), Report> {
         let bytes = Zeroizing::new(serde_json::to_vec(session)?);
-        self.sessions.write(&session.apple_id.to_lowercase(), &bytes)
+        self.sessions
+            .write(&session.apple_id.to_lowercase(), &bytes)
     }
 
     fn delete(&self, apple_id: &str) -> Result<bool, Report> {
@@ -116,14 +124,19 @@ impl<S: BlobStore, P: BlobStore> SessionStore for Store<S, P> {
     }
 
     fn load_password(&self, apple_id: &str) -> Result<Option<Zeroizing<String>>, Report> {
-        self.passwords.read(&apple_id.to_lowercase())?.map(|bytes| {
-            std::str::from_utf8(&bytes).map(|s| Zeroizing::new(s.to_owned()))
-                .map_err(|_| report!("Senha guardada inválida."))
-        }).transpose()
+        self.passwords
+            .read(&apple_id.to_lowercase())?
+            .map(|bytes| {
+                std::str::from_utf8(&bytes)
+                    .map(|s| Zeroizing::new(s.to_owned()))
+                    .map_err(|_| report!("Senha guardada inválida."))
+            })
+            .transpose()
     }
 
     fn save_password(&self, apple_id: &str, password: &str) -> Result<(), Report> {
-        self.passwords.write(&apple_id.to_lowercase(), password.as_bytes())
+        self.passwords
+            .write(&apple_id.to_lowercase(), password.as_bytes())
     }
 
     fn delete_password(&self, apple_id: &str) -> Result<bool, Report> {
@@ -140,7 +153,10 @@ pub fn system_store() -> impl SessionStore {
     }));
     #[cfg(not(windows))]
     let sessions = Keyring(SESSION_SERVICE);
-    Store { sessions, passwords: Keyring(PASSWORD_SERVICE) }
+    Store {
+        sessions,
+        passwords: Keyring(PASSWORD_SERVICE),
+    }
 }
 
 pub fn logout(
@@ -151,7 +167,11 @@ pub fn logout(
 ) -> Result<(), Report> {
     let session = store.delete(apple_id);
     let password = store.delete_password(apple_id);
-    let key = if forget_key { delete_key(apple_id) } else { Ok(false) };
+    let key = if forget_key {
+        delete_key(apple_id)
+    } else {
+        Ok(false)
+    };
     session?;
     password?;
     key?;
@@ -162,7 +182,9 @@ struct Keyring(&'static str);
 
 impl Keyring {
     fn access<T: Send + 'static>(
-        &self, id: &str, action: impl FnOnce(keyring::Entry) -> Result<T, keyring::Error> + Send + 'static,
+        &self,
+        id: &str,
+        action: impl FnOnce(keyring::Entry) -> Result<T, keyring::Error> + Send + 'static,
     ) -> Result<T, Report> {
         let (id, service) = (id.to_owned(), self.0);
         crate::keystore::off_runtime(move || keyring::Entry::new(service, &id).and_then(action))
@@ -216,8 +238,14 @@ impl Directory {
 
     fn path(&self, id: &str) -> Result<std::path::PathBuf, Report> {
         use sha2::{Digest, Sha256};
-        let root = self.root.as_ref().ok_or_else(|| report!("LOCALAPPDATA indisponível."))?;
-        Ok(root.join(format!("{}.bin", hex::encode(Sha256::digest(id.as_bytes())))))
+        let root = self
+            .root
+            .as_ref()
+            .ok_or_else(|| report!("LOCALAPPDATA indisponível."))?;
+        Ok(root.join(format!(
+            "{}.bin",
+            hex::encode(Sha256::digest(id.as_bytes()))
+        )))
     }
 }
 
@@ -244,7 +272,10 @@ impl BlobStore for Directory {
         std::fs::create_dir_all(path.parent().unwrap())?;
         let encrypted = (self.protect)(bytes)?;
         let tmp = path.with_extension(format!("{:032x}.tmp", rand::random::<u128>()));
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         let result = file.write_all(&encrypted).and_then(|()| file.sync_all());
         drop(file);
         let result = result.and_then(|()| std::fs::rename(&tmp, path));
@@ -268,24 +299,49 @@ fn dpapi(bytes: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>, Report> {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::{
         Foundation::LocalFree,
-        Security::Cryptography::{CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData},
+        Security::Cryptography::{
+            CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+        },
     };
     use zeroize::Zeroize;
 
-    let input = CRYPT_INTEGER_BLOB { cbData: bytes.len().try_into()?, pbData: bytes.as_ptr().cast_mut() };
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len().try_into()?,
+        pbData: bytes.as_ptr().cast_mut(),
+    };
     let entropy = b"com.rowdorfin.slashplayed-a16.session.v1";
-    let entropy = CRYPT_INTEGER_BLOB { cbData: entropy.len() as u32, pbData: entropy.as_ptr().cast_mut() };
+    let entropy = CRYPT_INTEGER_BLOB {
+        cbData: entropy.len() as u32,
+        pbData: entropy.as_ptr().cast_mut(),
+    };
     let mut output = CRYPT_INTEGER_BLOB::default();
     // DPAPI reads the inputs and allocates the output with LocalAlloc.
     let ok = unsafe {
         if protect {
-            CryptProtectData(&input, null(), &entropy, null(), null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+            CryptProtectData(
+                &input,
+                null(),
+                &entropy,
+                null(),
+                null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
         } else {
-            CryptUnprotectData(&input, null_mut(), &entropy, null(), null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+            CryptUnprotectData(
+                &input,
+                null_mut(),
+                &entropy,
+                null(),
+                null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
         }
     };
     if ok == 0 {
-        return Err(std::io::Error::last_os_error()).context("Falha na proteção DPAPI da sessão")?;
+        return Err(std::io::Error::last_os_error())
+            .context("Falha na proteção DPAPI da sessão")?;
     }
     if output.pbData.is_null() {
         return Ok(Zeroizing::new(Vec::new()));
@@ -314,7 +370,10 @@ pub(crate) mod test_store {
         }
 
         fn write(&self, id: &str, bytes: &[u8]) -> Result<(), Report> {
-            self.0.lock().unwrap().insert(id.into(), Zeroizing::new(bytes.to_vec()));
+            self.0
+                .lock()
+                .unwrap()
+                .insert(id.into(), Zeroizing::new(bytes.to_vec()));
             Ok(())
         }
 
@@ -324,7 +383,10 @@ pub(crate) mod test_store {
     }
 
     pub fn memory_store() -> impl SessionStore {
-        Store { sessions: Memory::default(), passwords: Memory::default() }
+        Store {
+            sessions: Memory::default(),
+            passwords: Memory::default(),
+        }
     }
 
     pub fn sample(apple_id: &str) -> StoredSession {
@@ -414,7 +476,9 @@ pub(crate) mod test_store {
         let id = "x@example.com";
         let store = memory_store();
         store.save(&sample(id)).unwrap();
-        store.save_password(id, &crate::flow::fake::password()).unwrap();
+        store
+            .save_password(id, &crate::flow::fake::password())
+            .unwrap();
         logout(&store, id, false, |_| panic!("signing key must remain")).unwrap();
         assert!(store.load(id).unwrap().is_none());
         assert!(store.load_password(id).unwrap().is_none());
@@ -422,7 +486,8 @@ pub(crate) mod test_store {
         logout(&store, id, true, |key_id| {
             called = key_id == id;
             Ok(true)
-        }).unwrap();
+        })
+        .unwrap();
         assert!(called);
     }
 
@@ -497,7 +562,9 @@ pub(crate) mod test_store {
 
         for forget_key in [false, true] {
             store.save(&sample(id)).unwrap();
-            store.save_password(id, &crate::flow::fake::password()).unwrap();
+            store
+                .save_password(id, &crate::flow::fake::password())
+                .unwrap();
             assert!(path.is_file());
             assert!(store.load_password(id).unwrap().is_some());
             let mut called = false;

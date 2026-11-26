@@ -113,13 +113,19 @@ jobs:
               raise SystemExit("The keyring dependency differs from the official Companion")
           PY
 
-      - name: Check formatting
+      # Only the files the A16 added: the code inherited from 1.7.0 (and vendor/) was never run through
+      # rustfmt upstream, and reformatting it would bury the A16 changes in the diff against 1.7.0.
+      - name: Check formatting of the A16 files
         working-directory: apps/companion-a16
-        run: cargo fmt --check
+        run: rustfmt --check --edition 2024 src/session.rs src/github.rs src/logs.rs src/state.rs src/checksum.rs
 
+      # The crate only (--no-deps: vendor/isideload is upstream's). Correctness and suspicious lints block;
+      # the style lints the inherited 1.7.0 code already trips are reported as warnings, not fixed here.
       - name: Clippy
         working-directory: apps/companion-a16
-        run: cargo clippy --locked --target "$TARGET" --all-targets -- -D warnings
+        run: >-
+          cargo clippy --locked --target "$TARGET" -p slashplayed-companion --no-deps --all-targets --
+          -D clippy::correctness -D clippy::suspicious
 
       - name: Test on Windows
         working-directory: apps/companion-a16

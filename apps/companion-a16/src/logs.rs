@@ -20,15 +20,52 @@ pub struct Export {
 }
 
 fn safe_name(name: &str) -> bool {
-    !name.is_empty() && !name.ends_with(['.', ' '])
-        && !name.chars().any(|c| c.is_control() || "/\\:<>|\"?*".contains(c))
-        && !matches!(name.split('.').next().unwrap_or("").to_ascii_uppercase().as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" |
-            "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" | "COM¹" | "COM²" | "COM³" | "LPT¹" | "LPT²" | "LPT³")
+    !name.is_empty()
+        && !name.ends_with(['.', ' '])
+        && !name
+            .chars()
+            .any(|c| c.is_control() || "/\\:<>|\"?*".contains(c))
+        && !matches!(
+            name.split('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase()
+                .as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+                | "COM¹"
+                | "COM²"
+                | "COM³"
+                | "LPT¹"
+                | "LPT²"
+                | "LPT³"
+        )
 }
 
 fn document(name: &str) -> bool {
-    safe_name(name) && name.ends_with(".log") && (name.starts_with("spconsole") || name.starts_with("sp-metal-diag"))
+    safe_name(name)
+        && name.ends_with(".log")
+        && (name.starts_with("spconsole") || name.starts_with("sp-metal-diag"))
 }
 
 fn jetsam(name: &str) -> bool {
@@ -38,7 +75,9 @@ fn jetsam(name: &str) -> bool {
 fn crash(name: &str) -> bool {
     safe_name(name) && {
         let name = name.to_ascii_lowercase();
-        ["slashplayed", "wow", "world of warcraft", "spguest"].iter().any(|needle| name.contains(needle))
+        ["slashplayed", "wow", "world of warcraft", "spguest"]
+            .iter()
+            .any(|needle| name.contains(needle))
     }
 }
 
@@ -69,7 +108,10 @@ async fn copy(afc: &mut AfcClient, remote: &str, local: &Path) -> Result<(u64, S
     }
     let mut source = afc.open(remote, AfcFopenMode::RdOnly).await?;
     let result = async {
-        let mut target = fs::OpenOptions::new().write(true).create_new(true).open(local)?;
+        let mut target = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(local)?;
         let mut size = 0;
         let mut hash = Sha256::new();
         let copied = async {
@@ -85,35 +127,50 @@ async fn copy(afc: &mut AfcClient, remote: &str, local: &Path) -> Result<(u64, S
             }
             target.flush()?;
             Ok((size, hex::encode(hash.finalize())))
-        }.await;
+        }
+        .await;
         drop(target);
         if copied.is_err() {
             let _ = fs::remove_file(local);
         }
         copied
-    }.await;
+    }
+    .await;
     let _ = source.close().await;
     result
 }
 
 impl Export {
     fn limitation(&mut self, context: &str, error: Report) {
-        self.limitations.push(secret::sanitize(&format!("{context} ({})", secret::safe_error(&error))));
+        self.limitations.push(secret::sanitize(&format!(
+            "{context} ({})",
+            secret::safe_error(&error)
+        )));
     }
 
-    async fn collect(&mut self, afc: &mut AfcClient, root: &str, names: Vec<String>, out: &Path, group: &str, manifest: &mut fs::File) -> Result<(), Report> {
+    async fn collect(
+        &mut self,
+        afc: &mut AfcClient,
+        root: &str,
+        names: Vec<String>,
+        out: &Path,
+        group: &str,
+        manifest: &mut fs::File,
+    ) -> Result<(), Report> {
         if names.is_empty() {
             return Ok(());
         }
         let group_dir = out.join(group);
-        fs::create_dir(&group_dir).context("O diretório de saída do serviço precisa estar livre")?;
+        fs::create_dir(&group_dir)
+            .context("O diretório de saída do serviço precisa estar livre")?;
         for name in names {
             let relative = format!("{group}/{name}");
             let local = group_dir.join(&name);
             let copied = async {
                 fs::create_dir_all(local.parent().unwrap())?;
                 copy(afc, &format!("{root}/{name}"), &local).await
-            }.await;
+            }
+            .await;
             match copied {
                 Ok((size, hash)) => {
                     writeln!(manifest, "{relative}\t{size}\t{hash}")?;
@@ -126,10 +183,21 @@ impl Export {
     }
 }
 
-pub async fn export(out: &Path, bundle: Option<&str>, team: Option<&str>, udid: Option<&str>, limit: usize) -> Result<Export, Report> {
-    let devices = device::list().await.context("Falha ao listar dispositivos USB")?;
+pub async fn export(
+    out: &Path,
+    bundle: Option<&str>,
+    team: Option<&str>,
+    udid: Option<&str>,
+    limit: usize,
+) -> Result<Export, Report> {
+    let devices = device::list()
+        .await
+        .context("Falha ao listar dispositivos USB")?;
     let device = match udid {
-        Some(id) => devices.iter().find(|d| d.usb.udid == id).ok_or_else(|| report!("O dispositivo selecionado não está conectado por USB."))?,
+        Some(id) => devices
+            .iter()
+            .find(|d| d.usb.udid == id)
+            .ok_or_else(|| report!("O dispositivo selecionado não está conectado por USB."))?,
         None => match devices.as_slice() {
             [device] => device,
             [] => bail!("Nenhum dispositivo conectado por USB."),
@@ -145,11 +213,18 @@ pub async fn export(out: &Path, bundle: Option<&str>, team: Option<&str>, udid: 
                 None
             }
         }
-    } else { None };
-    let bundle = bundle.map(str::to_owned).or_else(|| installed.map(|s| s.bundle_id))
+    } else {
+        None
+    };
+    let bundle = bundle
+        .map(str::to_owned)
+        .or_else(|| installed.map(|s| s.bundle_id))
         .or_else(|| team.map(|t| format!("{t}.slashplayed")));
     fs::create_dir_all(out)?;
-    let mut manifest = fs::OpenOptions::new().write(true).create_new(true).open(out.join("manifest.txt"))
+    let mut manifest = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out.join("manifest.txt"))
         .context("Use um diretório de saída sem manifest.txt")?;
     writeln!(manifest, "arquivo\tbytes\tSHA-256")?;
     if let Some(bundle) = bundle {
@@ -169,33 +244,47 @@ pub async fn export(out: &Path, bundle: Option<&str>, team: Option<&str>, udid: 
         result.limitations.push("Logs do aplicativo ignorados. Informe o bundle ID ou a equipe, ou instale pelo Companion.".into());
     }
     let crashes = async {
-        let mut afc = CrashReportCopyMobileClient::connect(&device.provider()).await
-            .context("Falha ao abrir com.apple.crashreportcopymobile")?.to_afc_client();
+        let mut afc = CrashReportCopyMobileClient::connect(&device.provider())
+            .await
+            .context("Falha ao abrir com.apple.crashreportcopymobile")?
+            .to_afc_client();
         let mut folders = vec![String::new()];
         let mut files = Vec::new();
         while let Some(folder) = folders.pop() {
             let names = match afc.list_dir(format!("/{folder}")).await {
                 Ok(names) => names,
                 Err(e) => {
-                    result.limitation(&format!("Falha ao listar relatórios de falha em /{folder}"), e.into());
+                    result.limitation(
+                        &format!("Falha ao listar relatórios de falha em /{folder}"),
+                        e.into(),
+                    );
                     continue;
                 }
             };
             for name in names.into_iter().filter(|name| safe_name(name)) {
-                let relative = if folder.is_empty() { name.clone() } else { format!("{folder}/{name}") };
+                let relative = if folder.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{folder}/{name}")
+                };
                 match afc.get_file_info(format!("/{relative}")).await {
                     Ok(info) if info.st_ifmt == "S_IFDIR" => folders.push(relative),
                     Ok(info) if info.st_ifmt == "S_IFREG" && (crash(&name) || jetsam(&name)) => {
                         files.push((relative, info.modified));
                     }
                     Ok(_) => {}
-                    Err(e) => result.limitation(&format!("Falha ao consultar {relative}"), e.into()),
+                    Err(e) => {
+                        result.limitation(&format!("Falha ao consultar {relative}"), e.into())
+                    }
                 }
             }
         }
         let names = select_crashes(files, limit);
-        result.collect(&mut afc, "", names, out, "CrashReports", &mut manifest).await
-    }.await;
+        result
+            .collect(&mut afc, "", names, out, "CrashReports", &mut manifest)
+            .await
+    }
+    .await;
     if let Err(e) = crashes {
         result.limitation("Relatórios de falha indisponíveis", e);
     }
@@ -214,12 +303,27 @@ mod tests {
         assert!(!document("spconsole.json"));
         assert!(!document("spconsole/../a.log"));
         let files = [
-            ("JetsamEvent-old.ips", 1), ("Retired/JetsamEvent-new.ips", 2),
-            ("Slashplayed-1.ips", 1), ("spguest.ips", 2), ("WoW-1.ips", 2),
-            ("World of Warcraft.ips", 2), ("../slashplayed.ips", 3), ("other.ips", 3),
-        ].map(|(name, date)| (name.into(), date)).to_vec();
-        assert_eq!(select_crashes(files.clone(), 1),
-            ["Slashplayed-1.ips", "WoW-1.ips", "World of Warcraft.ips", "spguest.ips", "Retired/JetsamEvent-new.ips"]);
+            ("JetsamEvent-old.ips", 1),
+            ("Retired/JetsamEvent-new.ips", 2),
+            ("Slashplayed-1.ips", 1),
+            ("spguest.ips", 2),
+            ("WoW-1.ips", 2),
+            ("World of Warcraft.ips", 2),
+            ("../slashplayed.ips", 3),
+            ("other.ips", 3),
+        ]
+        .map(|(name, date)| (name.into(), date))
+        .to_vec();
+        assert_eq!(
+            select_crashes(files.clone(), 1),
+            [
+                "Slashplayed-1.ips",
+                "WoW-1.ips",
+                "World of Warcraft.ips",
+                "spguest.ips",
+                "Retired/JetsamEvent-new.ips"
+            ]
+        );
         assert_eq!(select_crashes(files, 0).len(), 4);
     }
 }
