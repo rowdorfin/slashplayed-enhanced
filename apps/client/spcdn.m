@@ -935,23 +935,23 @@ NSString *sp_flavor_info(NSString *product) {
     return [NSString stringWithFormat:@"Product Flavor!STRING:0\n%@\n", product];
 }
 
-// Fingerprints of the files shipped by the Enhanced build. Earlier installs have no receipt.
-static NSArray<NSString *> *sp_retire_touch_bars(NSString *game) {
+typedef struct {
+    __unsafe_unretained NSString *name;
+    NSUInteger size;
+    __unsafe_unretained NSString *sha256;
+} SPPackagedAddonFile;
+
+static NSArray<NSString *> *sp_remove_packaged_addon(NSString *game, NSString *name,
+                                                     const SPPackagedAddonFile *shipped, NSUInteger count) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *folder = game;
     if (![[fm attributesOfItemAtPath:folder error:nil][NSFileType] isEqual:NSFileTypeDirectory]) return @[];
-    for (NSString *component in @[@"Interface", @"AddOns", @"SPTouchBars"]) {
+    for (NSString *component in @[@"Interface", @"AddOns", name]) {
         folder = [folder stringByAppendingPathComponent:component];
         if (![[fm attributesOfItemAtPath:folder error:nil][NSFileType] isEqual:NSFileTypeDirectory]) return @[];
     }
-
-    const struct { __unsafe_unretained NSString *name; NSUInteger size; __unsafe_unretained NSString *sha256; } shipped[] = {
-        { @"SPTouchBars.toc", 302, @"a08d415998a062d9070d3c939f1dec3dbb33dfcbc200d82495e87043e1be8473" },
-        { @"SPTouchBars.lua", 72334, @"1df930b39f3b2605aa1cc1afa31d2c3618973ef0b7f30f2378dd80996f56aa9b" },
-        { @"SPTouchBars.tga", 1048620, @"c1ff43928d13e89412027a738cae50e62cf91abf33e9f90d9b3ace1435aa0558" },
-    };
     NSMutableArray<NSString *> *removed = [NSMutableArray array];
-    for (NSUInteger i = 0; i < sizeof shipped / sizeof shipped[0]; i++) {
+    for (NSUInteger i = 0; i < count; i++) {
         NSString *path = [folder stringByAppendingPathComponent:shipped[i].name];
         NSDictionary *attributes = [fm attributesOfItemAtPath:path error:nil];
         if (![attributes[NSFileType] isEqual:NSFileTypeRegular] || [attributes[NSFileSize] unsignedLongLongValue] != shipped[i].size) continue;
@@ -967,19 +967,47 @@ static NSArray<NSString *> *sp_retire_touch_bars(NSString *game) {
     return removed;
 }
 
+// Fingerprints of the files shipped by the Enhanced build. Earlier installs have no receipt.
+static NSArray<NSString *> *sp_retire_touch_bars(NSString *game) {
+    const SPPackagedAddonFile shipped[] = {
+        { @"SPTouchBars.toc", 302, @"a08d415998a062d9070d3c939f1dec3dbb33dfcbc200d82495e87043e1be8473" },
+        { @"SPTouchBars.lua", 72334, @"1df930b39f3b2605aa1cc1afa31d2c3618973ef0b7f30f2378dd80996f56aa9b" },
+        { @"SPTouchBars.tga", 1048620, @"c1ff43928d13e89412027a738cae50e62cf91abf33e9f90d9b3ace1435aa0558" },
+    };
+    return sp_remove_packaged_addon(game, @"SPTouchBars", shipped, sizeof shipped / sizeof shipped[0]);
+}
+
+static NSArray<NSString *> *sp_retire_touch_hud(NSString *game) {
+    // Keep previous shipped fingerprints here when changing either bundled file.
+    const SPPackagedAddonFile shipped[] = {
+        { @"SPTouchHUD.toc", 192, @"71ed08d0ae2a9f7c715ca3f68dd6679fac7b8ca7e0bea555041e2958e7b543ed" },
+        { @"SPTouchHUD.lua", 27789, @"8a3af81435e895f3cb7462f8d28e5bc6822509a0379043282d0c763138a290e0" },
+    };
+    return sp_remove_packaged_addon(game, @"SPTouchHUD", shipped, sizeof shipped / sizeof shipped[0]);
+}
+
 BOOL sp_addons_place(NSString *addons, NSString *game, NSString *flavor, BOOL hover, NSString **line) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSMutableArray<NSString *> *written = [NSMutableArray array], *failed = [NSMutableArray array];
     NSUInteger same = 0;
     NSMutableArray<NSString *> *names = [NSMutableArray arrayWithObject:@"SPMovie"];
     if (hover) [names addObject:@"SPHover"];
-    NSArray<NSString *> *removed = [flavor isEqualToString:@"forever"] ? sp_retire_touch_bars(game) : @[];
-    for (NSString *name in names)
-        for (NSString *ext in @[@"toc", @"lua"]) {
+    NSMutableArray<NSString *> *removed = [NSMutableArray array];
+    if ([flavor isEqualToString:@"forever"]) {
+        [removed addObjectsFromArray:sp_retire_touch_bars(game)];
+        BOOL hud = !hover && [NSUserDefaults.standardUserDefaults integerForKey:@"sp_touch_hud_mode"] == 1;
+        if (hud) [names addObject:@"SPTouchHUD"];
+        else [removed addObjectsFromArray:sp_retire_touch_hud(game)];
+    }
+    for (NSString *name in names) {
+        BOOL hud = [name isEqualToString:@"SPTouchHUD"];
+        // Finish writing the HUD's Lua before exposing its manifest to the game.
+        for (NSString *ext in (hud ? @[@"lua", @"toc"] : @[@"toc", @"lua"])) {
             NSString *file = [NSString stringWithFormat:@"%@/%@.%@", name, name, ext];
             NSData *bytes = [NSData dataWithContentsOfFile:[addons stringByAppendingPathComponent:file]];
             if (!bytes) {
                 [failed addObject:[file stringByAppendingString:@" (not in the app)"]];
+                if (hud) break;
                 continue;
             }
             NSString *dest = [game stringByAppendingPathComponent:[@"Interface/AddOns" stringByAppendingPathComponent:file]];
@@ -989,8 +1017,12 @@ BOOL sp_addons_place(NSString *addons, NSString *game, NSString *flavor, BOOL ho
             }
             [fm createDirectoryAtPath:dest.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
             if ([bytes writeToFile:dest atomically:YES]) [written addObject:file];
-            else [failed addObject:[file stringByAppendingString:@" (couldn't be written)"]];
+            else {
+                [failed addObject:[file stringByAppendingString:@" (couldn't be written)"]];
+                if (hud) break;
+            }
         }
+    }
     NSMutableString *text = [NSMutableString stringWithFormat:@"addons: %lu up to date", (unsigned long)same];
     if (removed.count) [text appendFormat:@", removed %@", [removed componentsJoinedByString:@" "]];
     if (written.count) [text appendFormat:@", wrote %@", [written componentsJoinedByString:@" "]];

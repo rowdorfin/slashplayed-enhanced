@@ -73,6 +73,13 @@ jobs:
           shims/appkit/test-thumb.sh
           bash shims/appkit/test-display.sh
 
+      - name: Test bundled addons with Lua 5.1
+        run: |
+          lua_dir=$(mktemp -d)
+          curl -fsSL https://www.lua.org/ftp/lua-5.1.5.tar.gz | tar -xz -C "$lua_dir"
+          make -C "$lua_dir/lua-5.1.5/src" generic
+          LUA="$lua_dir/lua-5.1.5/src/lua" addon/test/test.sh
+
       - name: Fetch the start screen's font
         run: scripts/fetch-font.sh
 
@@ -86,6 +93,11 @@ jobs:
           set -euo pipefail
           sh apps/companion/bundle-resources.sh --build "$RUNNER_TEMP/stage"
           scripts/release/device-kit.sh "$RUNNER_TEMP/stage" "$RUNNER_TEMP/kit/slashplayed-device-kit.zip"
+          for ext in lua toc; do
+            unzip -p "$RUNNER_TEMP/kit/slashplayed-device-kit.zip" \
+              "ios/Slashplayed.app/addons/SPTouchHUD/SPTouchHUD.$ext" |
+              cmp - "addon/SPTouchHUD/SPTouchHUD.$ext"
+          done
           cp shims/metal/LICENSE.tolkara "$RUNNER_TEMP/kit/LICENSE.tolkara"
           cd "$RUNNER_TEMP/kit"
           shasum -a 256 slashplayed-device-kit.zip > SHA256SUMS

@@ -16,3 +16,4 @@ cc -O1 -Wall -o "$OUT/decode" decode.c -lm
 "$OUT/decode" < "$OUT/frames.txt"
 "${LUA:-lua}" spmovie.lua ../SPMovie/SPMovie.lua
 "${LUA:-lua}" sptouchbars.lua ../SPTouchBars/SPTouchBars.lua
+"${LUA:-lua}" sptouchhud.lua ../SPTouchHUD/SPTouchHUD.lua

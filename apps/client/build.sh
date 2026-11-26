@@ -107,8 +107,8 @@ sp_plist Info.plist "$APP"/Info.plist $BUNDLE_ID
 # The flavors' names (the start screen, spstart.m) and Battle.net's arguments (launcher.m).
 cp flavors.plist "$APP"/
 # The addons, which the launcher puts in each game's folder before it loads (spcdn.m's sp_addons_place:
-# SPMovie everywhere and SPHover on the headset). Both are bundled on both platforms.
-for a in SPMovie SPHover; do
+# SPMovie everywhere, SPHover on the headset, and opt-in SPTouchHUD on Forever for iOS).
+for a in SPMovie SPHover SPTouchHUD; do
   mkdir -p "$APP"/addons/$a
   cp ../../addon/$a/$a.toc ../../addon/$a/$a.lua "$APP"/addons/$a/
 done

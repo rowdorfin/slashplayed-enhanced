@@ -1,0 +1,6 @@
+## Interface: 16001
+## Title: SPTouchHUD
+## Notes: Touch controls for your existing action slots
+## SavedVariables: SPTouchHUDDB
+## SavedVariablesPerCharacter: SPTouchHUDCharDB
+SPTouchHUD.lua
