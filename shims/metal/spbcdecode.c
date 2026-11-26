@@ -463,18 +463,19 @@ void SPBCDecodeBlock(SPBCKind kind, const uint8_t *block, uint8_t *texels, size_
     uint8_t rgba[16][4];
     size_t texelBytes = SPBCTexelBytes(kind);
     uint8_t tile[16 * 8];
+    const uint8_t *decoded = texelBytes == 4 ? (const uint8_t *)rgba : tile;
     switch (kind) {
         case SPBCNone: return;
-        case SPBC1: decode_color(block, false, rgba); memcpy(tile, rgba, 64); break;
+        case SPBC1: decode_color(block, false, rgba); break;
         case SPBC2:
             decode_color(block + 8, true, rgba);
             for (unsigned i = 0; i < 16; i++) { unsigned a = block[i / 2] >> (4 * (i & 1)) & 15; rgba[i][3] = (uint8_t)(a * 17); }
-            memcpy(tile, rgba, 64); break;
+            break;
         case SPBC3: {
             uint8_t alpha[16];
             decode_color(block + 8, true, rgba); decode_channel(block, alpha);
             for (unsigned i = 0; i < 16; i++) rgba[i][3] = alpha[i];
-            memcpy(tile, rgba, 64); break;
+            break;
         }
         case SPBC4: decode_channel(block, tile); break;
         case SPBC4S: decode_channel_signed(block, (int8_t *)tile); break;
@@ -492,9 +493,9 @@ void SPBCDecodeBlock(SPBCKind kind, const uint8_t *block, uint8_t *texels, size_
                 for (unsigned ch = 0; ch < 4; ch++) { tile[8 * i + 2 * ch] = (uint8_t)half[i][ch]; tile[8 * i + 2 * ch + 1] = (uint8_t)(half[i][ch] >> 8); }
             break;
         }
-        case SPBC7: decode_bc7(block, rgba); memcpy(tile, rgba, 64); break;
+        case SPBC7: decode_bc7(block, rgba); break;
     }
-    for (unsigned y = 0; y < 4; y++) memcpy(texels + y * rowBytes, tile + y * 4 * texelBytes, 4 * texelBytes);
+    for (unsigned y = 0; y < 4; y++) memcpy(texels + y * rowBytes, decoded + y * 4 * texelBytes, 4 * texelBytes);
 }
 
 bool SPBCDecodeRect(SPBCKind kind, const uint8_t *blocks, size_t blockRowBytes,

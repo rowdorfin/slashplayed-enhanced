@@ -20,3 +20,5 @@ fi
 "$out/astc"
 "${CC:-cc}" "${flags[@]}" tests/test_a16_profile.c -o "$out/a16-profile"
 "$out/a16-profile"
+"${CC:-cc}" "${flags[@]}" tests/test_metal_meter.c -o "$out/metal-meter"
+"$out/metal-meter"

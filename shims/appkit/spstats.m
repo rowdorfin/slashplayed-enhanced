@@ -6,10 +6,12 @@
 // state. Lifecycle changes (scene activation, background, memory warnings, thermal and low-power
 // changes) are logged as they happen. With SP_HOVER_OFF=1 the presents aren't hooked and fps reads 0.
 // For the heat: CPU (the process's threads, summed, and the busiest three by name) and GPU (the time
-// each committed command buffer spent on the GPU, summed over the 30 s; overlaps count twice).
+// occupied time from the union of completed command-buffer intervals).
 #import <Metal/Metal.h>
 #include <mach/mach.h>
-#include <stdatomic.h>
+#include <os/lock.h>
+#include <objc/runtime.h>
+#include "../metal/spmetalmeter.h"
 #include <time.h>
 
 extern size_t os_proc_available_memory(void);
@@ -21,27 +23,44 @@ static void sp_stats_say(const char *s) {
     fprintf(stderr, "[sp:AppKit] %s\n", s);
 }
 
-static _Atomic uint64_t sp_stats_frames, sp_stats_slow, sp_stats_worst_ns, sp_stats_last_ns;
+static os_unfair_lock sp_stats_lock = OS_UNFAIR_LOCK_INIT;
+static uint64_t sp_stats_frames, sp_stats_last_ns, sp_stats_window_start;
+static SPFrameHistogram sp_stats_histogram;
+static SPGPUUnion sp_stats_gpu;
+static uint64_t sp_stats_gpu_sum, sp_stats_cbs, sp_stats_bc_cbs, sp_stats_bc_sum, sp_stats_gpu_clipped;
+static void (*sp_stats_commit_orig)(id, SEL);
+static const void *sp_stats_bc_key;
 
 static void sp_stats_frame(void) {
+    os_unfair_lock_lock(&sp_stats_lock);
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    uint64_t last = atomic_exchange(&sp_stats_last_ns, now);
     sp_stats_frames++;
-    if (!last) return;
-    uint64_t gap = now - last;
-    if (gap > 50000000) sp_stats_slow++;
-    uint64_t worst = sp_stats_worst_ns;
-    while (gap > worst && !atomic_compare_exchange_weak(&sp_stats_worst_ns, &worst, gap)) {}
+    if (sp_stats_last_ns) SPFrameAdd(&sp_stats_histogram, now - sp_stats_last_ns);
+    sp_stats_last_ns = now;
+    os_unfair_lock_unlock(&sp_stats_lock);
 }
-
-static _Atomic uint64_t sp_stats_gpu_ns, sp_stats_cbs;
-static void (*sp_stats_commit_orig)(id, SEL);
 
 static void sp_stats_commit(id<MTLCommandBuffer> cb, SEL _cmd) {
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        CFTimeInterval t = done.GPUEndTime - done.GPUStartTime;
-        if (t > 0 && t < 10) sp_stats_gpu_ns += (uint64_t)(t * 1e9);
+        CFTimeInterval startTime = done.GPUStartTime, endTime = done.GPUEndTime;
+        bool hasBC = objc_getAssociatedObject(done, sp_stats_bc_key) != nil;
+        os_unfair_lock_lock(&sp_stats_lock);
         sp_stats_cbs++;
+        sp_stats_bc_cbs += hasBC;
+        if (startTime > 0 && endTime > startTime && endTime < UINT64_MAX / 1e9) {
+            uint64_t start = (uint64_t)(startTime * 1e9), end = (uint64_t)(endTime * 1e9);
+            if (end - start < 10000000000ULL) {
+                sp_stats_gpu_sum += end - start;
+                if (hasBC) sp_stats_bc_sum += end - start;
+            }
+            // Work whose callback missed an earlier window is reported as clipped.
+            if (start < sp_stats_window_start) {
+                start = sp_stats_window_start;
+                sp_stats_gpu_clipped++;
+            }
+            SPGPUAdd(&sp_stats_gpu, start, end);
+        }
+        os_unfair_lock_unlock(&sp_stats_lock);
     }];
     sp_stats_commit_orig(cb, _cmd);
 }
@@ -52,6 +71,7 @@ static void sp_stats_hook_gpu(Class c) {
     Method m = done ? NULL : class_getInstanceMethod(c, @selector(commit));
     if (!m) return;
     done = YES;
+    sp_stats_bc_key = sel_registerName(SP_BC_UPLOAD_CB_KEY);
     sp_stats_commit_orig = (void *)method_setImplementation(m, (IMP)sp_stats_commit);
 }
 
@@ -106,13 +126,27 @@ static NSString *sp_stats_state(void) {
         sp_stats_thermal(), NSProcessInfo.processInfo.lowPowerModeEnabled ? ", low power" : ""];
 }
 
-static void sp_stats_line(double secs) {
-    uint64_t frames = atomic_exchange(&sp_stats_frames, 0), slow = atomic_exchange(&sp_stats_slow, 0);
-    uint64_t worst = atomic_exchange(&sp_stats_worst_ns, 0);
-    uint64_t gpu = atomic_exchange(&sp_stats_gpu_ns, 0), cbs = atomic_exchange(&sp_stats_cbs, 0);
+static void sp_stats_line(void) {
+    os_unfair_lock_lock(&sp_stats_lock);
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    double secs = (now - sp_stats_window_start) / 1e9;
+    sp_stats_window_start = now;
+    uint64_t frames = sp_stats_frames, gpu = sp_stats_gpu.busy, cbs = sp_stats_cbs;
+    uint64_t sum = sp_stats_gpu_sum, evicted = sp_stats_gpu.evicted, clipped = sp_stats_gpu_clipped;
+    uint64_t bcCbs = sp_stats_bc_cbs, bcSum = sp_stats_bc_sum;
+    SPFrameHistogram h = sp_stats_histogram;
+    sp_stats_frames = sp_stats_gpu_sum = sp_stats_cbs = sp_stats_bc_cbs = sp_stats_bc_sum = sp_stats_gpu_clipped = 0;
+    sp_stats_gpu.count = sp_stats_gpu.busy = sp_stats_gpu.evicted = sp_stats_gpu.sealedThrough = 0;
+    sp_stats_histogram = (SPFrameHistogram){0};
+    os_unfair_lock_unlock(&sp_stats_lock);
+
     sp_stats_say([NSString stringWithFormat:@"stats: %.1f fps, worst %llu ms, %llu over 50 ms | gpu %.0f%% (%.1f ms/frame, "
-                 "%llu buffers) | %@ | %@", frames / secs, worst / 1000000, slow, gpu / (secs * 1e7),
-                 frames ? gpu / 1e6 / frames : 0.0, cbs, sp_stats_cpu(), sp_stats_state()].UTF8String);
+                 "%llu buffers) | %@ | %@ | p50Ms=%u p95Ms=%u p99Ms=%u over33Ms=%llu "
+                 "gpuSum=%.1f%% bcUploadBuffers=%llu bcUploadBufferSumMs=%.1f gpuEvictedRanges=%llu gpuClippedBuffers=%llu",
+                 frames / secs, h.worst / 1000000, h.over50, gpu / (secs * 1e7),
+                 frames ? gpu / 1e6 / frames : 0.0, cbs, sp_stats_cpu(), sp_stats_state(),
+                 SPFramePercentile(&h, 50), SPFramePercentile(&h, 95), SPFramePercentile(&h, 99),
+                 h.over33, sum / (secs * 1e7), bcCbs, bcSum / 1e6, evicted, clipped].UTF8String);
 }
 
 // Every scene, its state, and its windows (hidden, alpha, frame), for app and scene events: once the
@@ -135,12 +169,9 @@ static NSString *sp_stats_scenes(void) {
 
 static void *sp_stats_watch(void *unused) {
     (void)unused;
-    uint64_t last = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     for (;;) {
         sleep(30);
-        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        @autoreleasepool { sp_stats_line((now - last) / 1e9); }
-        last = now;
+        @autoreleasepool { sp_stats_line(); }
     }
     return NULL;
 }
@@ -149,6 +180,13 @@ static void sp_stats_start(void) {
     static BOOL started;
     if (started) return;
     started = YES;
+    os_unfair_lock_lock(&sp_stats_lock);
+    sp_stats_window_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    sp_stats_gpu.count = sp_stats_gpu.busy = sp_stats_gpu.evicted = sp_stats_gpu.sealedThrough = 0;
+    sp_stats_gpu_sum = sp_stats_cbs = sp_stats_bc_cbs = sp_stats_bc_sum = sp_stats_gpu_clipped = 0;
+    sp_stats_frames = sp_stats_last_ns = 0;
+    sp_stats_histogram = (SPFrameHistogram){0};
+    os_unfair_lock_unlock(&sp_stats_lock);
     pthread_t t;
     pthread_create(&t, NULL, sp_stats_watch, NULL);
     pthread_detach(t);

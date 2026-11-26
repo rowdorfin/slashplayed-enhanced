@@ -17,6 +17,8 @@
 #import <ptrauth.h>
 #import "spbclayout.h"
 #import "spbcstaging.h"
+#import "spmetalmeter.h"
+#import <os/lock.h>
 
 #define RETAINED __attribute__((ns_returns_retained))
 
@@ -58,7 +60,9 @@ typedef enum {
 
 static _Atomic unsigned long long spBCUnsupported[SPBCUnsupportedCount];
 static _Atomic unsigned long long spBCFormats[24], spBCCompressed, spBCDecoded;
-static _Atomic unsigned long long spBCDecodeTicks, spBCMaxTicks;
+static os_unfair_lock spBCDecodeLock = OS_UNFAIR_LOCK_INIT;
+typedef struct { unsigned long long count, total, max; } SPBCDecodeStats;
+static SPBCDecodeStats spBCDecodeLifetime, spBCDecodeWindow;
 static _Atomic unsigned long long spBCStagingLive, spBCStagingPeak;
 static _Atomic unsigned long long spBCStagingAllocatedLive, spBCStagingAllocatedPeak;
 static _Atomic unsigned long long spBCMetalAllocationFailures, spBCCPUAllocationFailures, spBCLayoutFailures, spBCDropped;
@@ -90,9 +94,11 @@ static void spBCMax(_Atomic unsigned long long *maximum, unsigned long long valu
 @end
 
 typedef struct {
-    unsigned long long allocated, freed, liveBytes, standaloneAllocatedBytes;
+    unsigned long long allocated, rootsCreated, freed, liveBytes, standaloneAllocatedBytes;
     unsigned long long liveBytesByFormat[MTLPixelFormatRGBA16Float + 1];
     unsigned long long liveBytesByStorage[MTLStorageModeMemoryless + 1];
+    unsigned long long standaloneByFormat[MTLPixelFormatRGBA16Float + 1];
+    unsigned long long standaloneByStorage[MTLStorageModeMemoryless + 1];
 } SPBCTextureStats;
 static SPBCTextureStats spBCTextureStats;
 
@@ -102,10 +108,14 @@ static SPBCTextureStats spBCTextureStats;
         spBCTextureStats.freed++;
         spBCTextureStats.liveBytes -= _trackedBytes;
         spBCTextureStats.standaloneAllocatedBytes -= _standaloneAllocatedBytes;
-        if (_physicalFormat < sizeof spBCTextureStats.liveBytesByFormat / sizeof *spBCTextureStats.liveBytesByFormat)
+        if (_physicalFormat <= MTLPixelFormatRGBA16Float) {
             spBCTextureStats.liveBytesByFormat[_physicalFormat] -= _trackedBytes;
-        if (_storageMode <= MTLStorageModeMemoryless)
+            spBCTextureStats.standaloneByFormat[_physicalFormat] -= _standaloneAllocatedBytes;
+        }
+        if (_storageMode <= MTLStorageModeMemoryless) {
             spBCTextureStats.liveBytesByStorage[_storageMode] -= _trackedBytes;
+            spBCTextureStats.standaloneByStorage[_storageMode] -= _standaloneAllocatedBytes;
+        }
     }
 }
 @end
@@ -115,6 +125,60 @@ static NSString *spBCByteBreakdown(const unsigned long long *bytes, size_t count
     for (size_t i = 0; i < count; i++)
         if (bytes[i]) [result appendFormat:@"%zu=%llu,", i, bytes[i]];
     return result;
+}
+
+// Record backing once, at its root factory. Heap children, buffer aliases,
+// IOSurfaces and texture views are outside these standalone counters.
+enum { SPBCDepth, SPBCTarget, SPBCSampled, SPBCOther, SPBCUsageCount, SPBCFormatCount = 1024 };
+static os_unfair_lock spBCResourceLock = OS_UNFAIR_LOCK_INIT;
+static struct {
+    unsigned long long buffers, noCopyBuffers, textures[SPBCUsageCount][SPBCFormatCount + 1];
+} spBCResources;
+
+static char spBCResourceKey;
+static _Thread_local unsigned spBCMakingStaging;
+
+@interface SPBCResourceInfo : NSObject {
+@public
+    unsigned long long *counter;
+    NSUInteger allocatedBytes;
+}
+@end
+@implementation SPBCResourceInfo
+- (void)dealloc {
+    os_unfair_lock_lock(&spBCResourceLock);
+    *counter -= allocatedBytes;
+    os_unfair_lock_unlock(&spBCResourceLock);
+}
+@end
+
+static void spBCTrackResource(id<MTLResource> resource, unsigned long long *counter, NSUInteger bytes) {
+    if (!bytes || objc_getAssociatedObject(resource, &spBCResourceKey)) return;
+    SPBCResourceInfo *info = [SPBCResourceInfo new];
+    info->counter = counter;
+    info->allocatedBytes = bytes;
+    os_unfair_lock_lock(&spBCResourceLock);
+    *counter += bytes;
+    os_unfair_lock_unlock(&spBCResourceLock);
+    objc_setAssociatedObject(resource, &spBCResourceKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void spBCTrackNativeTexture(id<MTLTexture> texture, MTLTextureUsage usage) {
+    if (!texture || texture.heap || texture.parentTexture || texture.buffer || texture.iosurface ||
+        texture.storageMode == MTLStorageModeMemoryless) return;
+    NSUInteger format = texture.pixelFormat;
+    unsigned kind;
+    switch (format) {
+        case MTLPixelFormatDepth16Unorm: case MTLPixelFormatDepth32Float:
+        case MTLPixelFormatDepth32Float_Stencil8: case MTLPixelFormatStencil8: case MTLPixelFormatX32_Stencil8:
+            kind = SPBCDepth;
+            break;
+        default:
+            kind = usage & MTLTextureUsageRenderTarget ? SPBCTarget :
+                   usage & MTLTextureUsageShaderRead ? SPBCSampled : SPBCOther;
+            break;
+    }
+    spBCTrackResource(texture, &spBCResources.textures[kind][MIN(format, SPBCFormatCount)], texture.allocatedSize);
 }
 
 static bool spA16Footprint(uint64_t *footprint) {
@@ -145,6 +209,17 @@ static NSString *spA16BudgetFields(uint64_t footprint, bool measured) {
 static void spBCSummary(id<MTLDevice> device) {
     SPBCTextureStats textures;
     @synchronized ([SPBCTextureInfo class]) { textures = spBCTextureStats; }
+    static unsigned long long previousRoots;
+    unsigned long long created = textures.rootsCreated - previousRoots;
+    previousRoots = textures.rootsCreated;
+    os_unfair_lock_lock(&spBCDecodeLock);
+    SPBCDecodeStats decode = spBCDecodeWindow, lifetime = spBCDecodeLifetime;
+    spBCDecodeWindow = (SPBCDecodeStats){0};
+    os_unfair_lock_unlock(&spBCDecodeLock);
+    mach_timebase_info_data_t timebase;
+    mach_timebase_info(&timebase);
+    double tickUs = (double)timebase.numer / timebase.denom / 1000.0;
+
     // Take a short-lived snapshot, then query Metal without the registry lock.
     NSArray<id<MTLHeap>> *heaps;
     @synchronized (spBCHeaps) { heaps = spBCHeaps.allObjects; }
@@ -198,7 +273,7 @@ static void spBCSummary(id<MTLDevice> device) {
             atomic_load(&spBCSizingQueries), formats, atomic_load(&spBCCompressed), atomic_load(&spBCDecoded),
             atomic_load(&spBCStagingLive),
             atomic_load(&spBCStagingPeak), SPBCStagingReserved(&staging), staging.reservedPeak,
-            atomic_load(&spBCDecodeTicks), atomic_load(&spBCMaxTicks), unsupported,
+            lifetime.total, lifetime.max, unsupported,
             metalFailures + cpuFailures, atomic_load(&spBCTextureFailures), (unsigned long)heaps.count,
             heapBytes, heapAllocated, (unsigned long)allocatedSamples, heapUsed, (unsigned long)usedSamples,
             haveDeviceSize ? @(device.currentAllocatedSize) : @"n/a",
@@ -211,6 +286,28 @@ static void spBCSummary(id<MTLDevice> device) {
             textures.standaloneAllocatedBytes, atomic_load(&spBCStagingAllocatedLive),
             atomic_load(&spBCStagingAllocatedPeak),
             spA16Profile() ? spA16BudgetFields(footprint, haveFootprint) : @"");
+
+    // Independent snapshots. The device total includes tracked Metal allocations.
+    // Logical converted bytes and heap used size describe backing already counted.
+    unsigned long long native[SPBCUsageCount][SPBCFormatCount + 1], buffers, noCopy;
+    os_unfair_lock_lock(&spBCResourceLock);
+    memcpy(native, spBCResources.textures, sizeof native);
+    buffers = spBCResources.buffers;
+    noCopy = spBCResources.noCopyBuffers;
+    os_unfair_lock_unlock(&spBCResourceLock);
+    spBCLog(@"SP_BC_FALLBACK composition phase=%s newConverted=%llu decodeTiles=%llu "
+            @"decodeTotalUs=%.1f decodeMeanUs=%.1f decodeMaxUs=%.1f "
+            @"convertedStandaloneByFormat=%@ convertedStandaloneByStorage=%@ "
+            @"nativeStandaloneDepth=%@ nativeStandaloneRT=%@ nativeStandaloneSampled=%@ nativeStandaloneOther=%@ "
+            @"gameStandaloneBufferAllocatedBytes=%llu gameNoCopyBufferLogicalBytes=%llu shimCompressedCopyBytes=0",
+            created ? "loading-resources" : "no-new-resources", created, decode.count,
+            decode.total * tickUs, decode.count ? decode.total * tickUs / decode.count : 0.0, decode.max * tickUs,
+            spBCByteBreakdown(textures.standaloneByFormat, MTLPixelFormatRGBA16Float + 1),
+            spBCByteBreakdown(textures.standaloneByStorage, MTLStorageModeMemoryless + 1),
+            spBCByteBreakdown(native[SPBCDepth], SPBCFormatCount + 1),
+            spBCByteBreakdown(native[SPBCTarget], SPBCFormatCount + 1),
+            spBCByteBreakdown(native[SPBCSampled], SPBCFormatCount + 1),
+            spBCByteBreakdown(native[SPBCOther], SPBCFormatCount + 1), buffers, noCopy);
 }
 
 static void spBCStartSummary(id<MTLDevice> device) {
@@ -238,8 +335,13 @@ static void spBCRecordDecode(SPBCKind kind, SPBCTile tile, uint64_t ticks) {
     atomic_fetch_add(&spBCCompressed, SPBCBlockCount(tile.size.width) *
                      SPBCBlockCount(tile.size.height) * SPBCBlockBytes(kind));
     atomic_fetch_add(&spBCDecoded, tile.size.width * tile.size.height * SPBCTexelBytes(kind));
-    atomic_fetch_add(&spBCDecodeTicks, ticks);
-    spBCMax(&spBCMaxTicks, ticks);
+    os_unfair_lock_lock(&spBCDecodeLock);
+    spBCDecodeLifetime.total += ticks;
+    if (ticks > spBCDecodeLifetime.max) spBCDecodeLifetime.max = ticks;
+    spBCDecodeWindow.count++;
+    spBCDecodeWindow.total += ticks;
+    if (ticks > spBCDecodeWindow.max) spBCDecodeWindow.max = ticks;
+    os_unfair_lock_unlock(&spBCDecodeLock);
 }
 
 // --- Callers inside the shared cache are the system's own code ---------------
@@ -585,12 +687,17 @@ static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view)
     }
     @synchronized ([SPBCTextureInfo class]) {
         spBCTextureStats.allocated++;
+        spBCTextureStats.rootsCreated += !view;
         spBCTextureStats.liveBytes += info.trackedBytes;
         spBCTextureStats.standaloneAllocatedBytes += info.standaloneAllocatedBytes;
-        if (info.physicalFormat < sizeof spBCTextureStats.liveBytesByFormat / sizeof *spBCTextureStats.liveBytesByFormat)
+        if (info.physicalFormat <= MTLPixelFormatRGBA16Float) {
             spBCTextureStats.liveBytesByFormat[info.physicalFormat] += info.trackedBytes;
-        if (info.storageMode <= MTLStorageModeMemoryless)
+            spBCTextureStats.standaloneByFormat[info.physicalFormat] += info.standaloneAllocatedBytes;
+        }
+        if (info.storageMode <= MTLStorageModeMemoryless) {
             spBCTextureStats.liveBytesByStorage[info.storageMode] += info.trackedBytes;
+            spBCTextureStats.standaloneByStorage[info.storageMode] += info.standaloneAllocatedBytes;
+        }
     }
     // Immutable after publication. Avoid the atomic association getter's
     // autorelease, which could keep the sentinel alive past the texture.
@@ -682,7 +789,12 @@ static _Thread_local unsigned spBCCreating;
 static id newTexture(id owner, SEL selector, MTLTextureDescriptor *descriptor) RETAINED;
 static id newTexture(id owner, SEL selector, MTLTextureDescriptor *descriptor) {
     CreateWith real = (CreateWith)original(owner, selector);
-    if ((spBCCreating && !spA16Profile()) || !SPBCKindOfPixelFormat(descriptor.pixelFormat)) return real(owner, selector, descriptor);
+    if (!SPBCKindOfPixelFormat(descriptor.pixelFormat)) {
+        id texture = real(owner, selector, descriptor);
+        if (!spBCCreating && spBCActive(owner)) spBCTrackNativeTexture(texture, descriptor.usage);
+        return texture;
+    }
+    if (spBCCreating && !spA16Profile()) return real(owner, selector, descriptor);
     // This selector is shared by MTLDevice and MTLHeap.
     if (!spBCActive(owner) && !([owner respondsToSelector:@selector(device)] &&
                                 spBCActive([(id<MTLHeap>)owner device])))
@@ -745,8 +857,15 @@ static id spBCBufferTexture(id<MTLBuffer> buffer, SEL selector, MTLTextureDescri
         (buffer, selector, descriptor, offset, row);
 }
 
-static id spBCHookBuffer(id buffer) {
-    if (buffer) hook(object_getClass(buffer), @selector(newTextureWithDescriptor:offset:bytesPerRow:), (IMP)spBCBufferTexture);
+static _Thread_local unsigned spBCMakingBuffer;
+
+static id spBCHookBuffer(id<MTLBuffer> buffer, bool noCopy) {
+    if (buffer) {
+        hook(object_getClass(buffer), @selector(newTextureWithDescriptor:offset:bytesPerRow:), (IMP)spBCBufferTexture);
+        if (!spBCMakingBuffer && !spBCMakingStaging && !buffer.heap && spBCActive(buffer.device))
+            spBCTrackResource(buffer, noCopy ? &spBCResources.noCopyBuffers : &spBCResources.buffers,
+                              noCopy ? buffer.length : buffer.allocatedSize);
+    }
     return buffer;
 }
 
@@ -757,21 +876,33 @@ typedef id (*SPBCNewBufferNoCopy)(id, SEL, void *, NSUInteger, MTLResourceOption
 
 static id spBCNewBuffer(id owner, SEL selector, NSUInteger length, MTLResourceOptions options) RETAINED;
 static id spBCNewBuffer(id owner, SEL selector, NSUInteger length, MTLResourceOptions options) {
-    return spBCHookBuffer(((SPBCNewBuffer)original(owner, selector))(owner, selector, length, options));
+    spBCMakingBuffer++;
+    id buffer = ((SPBCNewBuffer)original(owner, selector))(owner, selector, length, options);
+    spBCMakingBuffer--;
+    return spBCHookBuffer(buffer, false);
 }
 static id spBCNewBufferAt(id owner, SEL selector, NSUInteger length, MTLResourceOptions options, NSUInteger offset) RETAINED;
 static id spBCNewBufferAt(id owner, SEL selector, NSUInteger length, MTLResourceOptions options, NSUInteger offset) {
-    return spBCHookBuffer(((SPBCNewBufferAt)original(owner, selector))(owner, selector, length, options, offset));
+    spBCMakingBuffer++;
+    id buffer = ((SPBCNewBufferAt)original(owner, selector))(owner, selector, length, options, offset);
+    spBCMakingBuffer--;
+    return spBCHookBuffer(buffer, false);
 }
 static id spBCNewBufferBytes(id owner, SEL selector, const void *bytes, NSUInteger length, MTLResourceOptions options) RETAINED;
 static id spBCNewBufferBytes(id owner, SEL selector, const void *bytes, NSUInteger length, MTLResourceOptions options) {
-    return spBCHookBuffer(((SPBCNewBufferBytes)original(owner, selector))(owner, selector, bytes, length, options));
+    spBCMakingBuffer++;
+    id buffer = ((SPBCNewBufferBytes)original(owner, selector))(owner, selector, bytes, length, options);
+    spBCMakingBuffer--;
+    return spBCHookBuffer(buffer, false);
 }
 static id spBCNewBufferNoCopy(id owner, SEL selector, void *bytes, NSUInteger length, MTLResourceOptions options,
                               void (^deallocator)(void *, NSUInteger)) RETAINED;
 static id spBCNewBufferNoCopy(id owner, SEL selector, void *bytes, NSUInteger length, MTLResourceOptions options,
                               void (^deallocator)(void *, NSUInteger)) {
-    return spBCHookBuffer(((SPBCNewBufferNoCopy)original(owner, selector))(owner, selector, bytes, length, options, deallocator));
+    spBCMakingBuffer++;
+    id buffer = ((SPBCNewBufferNoCopy)original(owner, selector))(owner, selector, bytes, length, options, deallocator);
+    spBCMakingBuffer--;
+    return spBCHookBuffer(buffer, true);
 }
 
 static id newHeap(id device, SEL selector, MTLHeapDescriptor *descriptor) RETAINED;
@@ -863,8 +994,15 @@ static void spBCTrackStaging(id<MTLBuffer> buffer) {
 - (void)dealloc { [self releaseStaging]; }
 @end
 
-static id<MTLBuffer> spBCAllocateStaging(id<MTLDevice> device, size_t bytes, NSDate *deadline) {
+static id<MTLBuffer> spBCNewStagingBuffer(id<MTLDevice> device, size_t bytes) {
+    spBCMakingStaging++;
     id<MTLBuffer> buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    spBCMakingStaging--;
+    return buffer;
+}
+
+static id<MTLBuffer> spBCAllocateStaging(id<MTLDevice> device, size_t bytes, NSDate *deadline) {
+    id<MTLBuffer> buffer = spBCNewStagingBuffer(device, bytes);
     if (buffer) return buffer;
     atomic_fetch_add(&spBCMetalAllocationFailures, 1);
 
@@ -873,13 +1011,14 @@ static id<MTLBuffer> spBCAllocateStaging(id<MTLDevice> device, size_t bytes, NSD
     bool released = spBCStaging.inFlight.bytes && [condition waitUntilDate:deadline];
     [condition unlock];
     if (released) {
-        buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        buffer = spBCNewStagingBuffer(device, bytes);
         if (!buffer) atomic_fetch_add(&spBCMetalAllocationFailures, 1);
     }
     return buffer;
 }
 
 static char uploadsKey, ownerKey;
+static const void *spBCUploadMarker;
 @interface SPBCOwner : NSObject
 @property (nonatomic, weak) id<MTLCommandBuffer> commandBuffer;
 @end
@@ -909,6 +1048,7 @@ static void commitCommandBuffer(id<MTLCommandBuffer> commandBuffer, SEL selector
         if (pending) objc_setAssociatedObject(commandBuffer, &uploadsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     if (pending.count) {
+        objc_setAssociatedObject(commandBuffer, spBCUploadMarker, @YES, OBJC_ASSOCIATION_RETAIN);
         for (SPBCUpload *upload in pending) [upload decode];
         __block NSArray<SPBCUpload *> *retained = pending;
         [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -1265,6 +1405,7 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
             spA16Profile() ? "a16-profile" : enabled ? "no-native-BC" : haveProperty ? "native-BC" : "capability-unavailable");
     if (!enabled) return;
     findSharedCache();
+    spBCUploadMarker = sel_registerName(SP_BC_UPLOAD_CB_KEY);
     const char *verbose = getenv("SP_BC_VERBOSE");
     spBCVerbose = verbose && strcmp(verbose, "1") == 0;
     spBCHeaps = [[NSHashTable alloc] initWithOptions:NSPointerFunctionsWeakMemory |
