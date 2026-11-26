@@ -7,6 +7,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #import <dispatch/dispatch.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
@@ -67,8 +68,13 @@ static _Atomic unsigned long long spBCStagingLive, spBCStagingPeak;
 static _Atomic unsigned long long spBCStagingAllocatedLive, spBCStagingAllocatedPeak;
 static _Atomic unsigned long long spBCMetalAllocationFailures, spBCCPUAllocationFailures, spBCLayoutFailures, spBCDropped;
 static _Atomic unsigned long long spBCTextureFailures;
+static _Atomic unsigned long long spBCUploadBatchCount, spBCUploadBatchMax, spBCUploadBatchAgeMax;
 static NSHashTable<id<MTLHeap>> *spBCHeaps;
 static _Atomic unsigned long long spBCSizingQueries;
+
+enum { SPBCScratchCacheSize = 64 * 1024, SPBCScratchCacheThreads = 4 };
+static atomic_uint spBCScratchCaches;
+static atomic_ullong spBCScratchCacheHits;
 
 static SPBCStaging spBCStaging;
 static NSCondition *spBCStagingCondition(void) {
@@ -85,16 +91,33 @@ static void spBCMax(_Atomic unsigned long long *maximum, unsigned long long valu
 
 // The existing texture metadata doubles as a lifetime sentinel. It owns no
 // Metal objects. Views count as objects, with their backing charged to the root.
+static _Atomic uint64_t spBCLargestRT;
+
+__attribute__((visibility("default"))) uint64_t sp_largest_render_target(void) {
+    return atomic_load(&spBCLargestRT);
+}
+
+static void spBCTrackRenderTarget(id<MTLTexture> texture, MTLTextureUsage usage) {
+    if (!texture || !(usage & MTLTextureUsageRenderTarget)) return;
+    uint64_t w = texture.width, h = texture.height;
+    uint64_t previous = atomic_load(&spBCLargestRT);
+    while (w * h > (previous >> 32) * (uint32_t)previous &&
+           !atomic_compare_exchange_weak(&spBCLargestRT, &previous, (w << 32) | h)) {}
+}
+
 @interface SPBCTextureInfo : NSObject
 @property (nonatomic) MTLPixelFormat requested;
 @property (nonatomic) SPBCKind kind;
+@property (nonatomic) BOOL root;
+@property (nonatomic) NSUInteger dimensionBucket, mipBucket;
 @property (nonatomic) size_t trackedBytes, standaloneAllocatedBytes;
 @property (nonatomic) MTLPixelFormat physicalFormat;
 @property (nonatomic) MTLStorageMode storageMode;
 @end
 
 typedef struct {
-    unsigned long long allocated, rootsCreated, freed, liveBytes, standaloneAllocatedBytes;
+    unsigned long long allocated, rootsCreated, rootsFreed, freed, liveBytes, standaloneAllocatedBytes, peakBytes;
+    unsigned long long dimensionBytes[5], mipBytes[5];
     unsigned long long liveBytesByFormat[MTLPixelFormatRGBA16Float + 1];
     unsigned long long liveBytesByStorage[MTLStorageModeMemoryless + 1];
     unsigned long long standaloneByFormat[MTLPixelFormatRGBA16Float + 1];
@@ -106,6 +129,9 @@ static SPBCTextureStats spBCTextureStats;
 - (void)dealloc {
     @synchronized ([SPBCTextureInfo class]) {
         spBCTextureStats.freed++;
+        spBCTextureStats.rootsFreed += _root;
+        spBCTextureStats.dimensionBytes[_dimensionBucket] -= _trackedBytes;
+        spBCTextureStats.mipBytes[_mipBucket] -= _trackedBytes;
         spBCTextureStats.liveBytes -= _trackedBytes;
         spBCTextureStats.standaloneAllocatedBytes -= _standaloneAllocatedBytes;
         if (_physicalFormat <= MTLPixelFormatRGBA16Float) {
@@ -134,13 +160,15 @@ static os_unfair_lock spBCResourceLock = OS_UNFAIR_LOCK_INIT;
 static struct {
     unsigned long long buffers, noCopyBuffers, textures[SPBCUsageCount][SPBCFormatCount + 1];
 } spBCResources;
+static unsigned long long spBCCategoryLive[SPBCUsageCount], spBCCategoryPeak[SPBCUsageCount];
+static unsigned long long spBCBufferPeak;
 
 static char spBCResourceKey;
 static _Thread_local unsigned spBCMakingStaging;
 
 @interface SPBCResourceInfo : NSObject {
 @public
-    unsigned long long *counter;
+    unsigned long long *counter, *category;
     NSUInteger allocatedBytes;
 }
 @end
@@ -148,17 +176,24 @@ static _Thread_local unsigned spBCMakingStaging;
 - (void)dealloc {
     os_unfair_lock_lock(&spBCResourceLock);
     *counter -= allocatedBytes;
+    if (category) *category -= allocatedBytes;
     os_unfair_lock_unlock(&spBCResourceLock);
 }
 @end
 
-static void spBCTrackResource(id<MTLResource> resource, unsigned long long *counter, NSUInteger bytes) {
+static void spBCTrackResource(id<MTLResource> resource, unsigned long long *counter, NSUInteger bytes, unsigned kind) {
     if (!bytes || objc_getAssociatedObject(resource, &spBCResourceKey)) return;
     SPBCResourceInfo *info = [SPBCResourceInfo new];
     info->counter = counter;
     info->allocatedBytes = bytes;
     os_unfair_lock_lock(&spBCResourceLock);
     *counter += bytes;
+    if (counter == &spBCResources.buffers) spBCBufferPeak = MAX(spBCBufferPeak, *counter);
+    if (kind < SPBCUsageCount) {
+        info->category = &spBCCategoryLive[kind];
+        *info->category += bytes;
+        spBCCategoryPeak[kind] = MAX(spBCCategoryPeak[kind], *info->category);
+    }
     os_unfair_lock_unlock(&spBCResourceLock);
     objc_setAssociatedObject(resource, &spBCResourceKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -178,7 +213,7 @@ static void spBCTrackNativeTexture(id<MTLTexture> texture, MTLTextureUsage usage
                    usage & MTLTextureUsageShaderRead ? SPBCSampled : SPBCOther;
             break;
     }
-    spBCTrackResource(texture, &spBCResources.textures[kind][MIN(format, SPBCFormatCount)], texture.allocatedSize);
+    spBCTrackResource(texture, &spBCResources.textures[kind][MIN(format, SPBCFormatCount)], texture.allocatedSize, kind);
 }
 
 static bool spA16Footprint(uint64_t *footprint) {
@@ -237,6 +272,8 @@ static void spBCSummary(id<MTLDevice> device) {
         }
     }
 
+    static unsigned long long heapAllocatedPeak;
+    heapAllocatedPeak = MAX(heapAllocatedPeak, heapAllocated);
     uint64_t footprint = 0;
     bool haveFootprint = spA16Footprint(&footprint);
     bool haveDeviceSize = [device respondsToSelector:@selector(currentAllocatedSize)];
@@ -289,17 +326,26 @@ static void spBCSummary(id<MTLDevice> device) {
 
     // Independent snapshots. The device total includes tracked Metal allocations.
     // Logical converted bytes and heap used size describe backing already counted.
-    unsigned long long native[SPBCUsageCount][SPBCFormatCount + 1], buffers, noCopy;
+    unsigned long long native[SPBCUsageCount][SPBCFormatCount + 1], buffers, bufferPeak, noCopy, peaks[SPBCUsageCount];
     os_unfair_lock_lock(&spBCResourceLock);
     memcpy(native, spBCResources.textures, sizeof native);
+    memcpy(peaks, spBCCategoryPeak, sizeof peaks);
     buffers = spBCResources.buffers;
+    bufferPeak = spBCBufferPeak;
     noCopy = spBCResources.noCopyBuffers;
     os_unfair_lock_unlock(&spBCResourceLock);
     spBCLog(@"SP_BC_FALLBACK composition phase=%s newConverted=%llu decodeTiles=%llu "
             @"decodeTotalUs=%.1f decodeMeanUs=%.1f decodeMaxUs=%.1f "
             @"convertedStandaloneByFormat=%@ convertedStandaloneByStorage=%@ "
             @"nativeStandaloneDepth=%@ nativeStandaloneRT=%@ nativeStandaloneSampled=%@ nativeStandaloneOther=%@ "
-            @"gameStandaloneBufferAllocatedBytes=%llu gameNoCopyBufferLogicalBytes=%llu shimCompressedCopyBytes=0",
+            @"convertedRootsCreated=%llu convertedRootsFreed=%llu convertedPeakBytes=%llu "
+            @"convertedByMaxEdge_256_512_1024_2048_larger=%@ convertedByMipCount_1_4_8_12_more=%@ "
+            @"nativePeakDepthRTSampledOther=%llu,%llu,%llu,%llu "
+            @"pendingAtPeak=%llu inFlightAtPeak=%llu scratchAtPeak=%llu pendingLimitHits=%llu "
+            @"scratchCacheBytes=%u scratchCacheHits=%llu "
+            @"uploadCBs=%llu maxUploadsPerCB=%llu maxEncodeToCommitUs=%.1f "
+            @"gameStandaloneBufferAllocatedBytes=%llu gameStandaloneBufferPeak=%llu gameNoCopyBufferLogicalBytes=%llu "
+            @"heapAllocatedSamplePeak=%llu shimCompressedCopyBytes=0",
             created ? "loading-resources" : "no-new-resources", created, decode.count,
             decode.total * tickUs, decode.count ? decode.total * tickUs / decode.count : 0.0, decode.max * tickUs,
             spBCByteBreakdown(textures.standaloneByFormat, MTLPixelFormatRGBA16Float + 1),
@@ -307,7 +353,15 @@ static void spBCSummary(id<MTLDevice> device) {
             spBCByteBreakdown(native[SPBCDepth], SPBCFormatCount + 1),
             spBCByteBreakdown(native[SPBCTarget], SPBCFormatCount + 1),
             spBCByteBreakdown(native[SPBCSampled], SPBCFormatCount + 1),
-            spBCByteBreakdown(native[SPBCOther], SPBCFormatCount + 1), buffers, noCopy);
+            spBCByteBreakdown(native[SPBCOther], SPBCFormatCount + 1),
+            textures.rootsCreated, textures.rootsFreed, textures.peakBytes,
+            spBCByteBreakdown(textures.dimensionBytes, 5), spBCByteBreakdown(textures.mipBytes, 5),
+            peaks[SPBCDepth], peaks[SPBCTarget], peaks[SPBCSampled], peaks[SPBCOther],
+            staging.pendingAtPeak, staging.inFlightAtPeak, staging.scratchAtPeak, staging.pendingLimitHits,
+            atomic_load(&spBCScratchCaches) * SPBCScratchCacheSize, atomic_load(&spBCScratchCacheHits),
+            atomic_load(&spBCUploadBatchCount), atomic_load(&spBCUploadBatchMax),
+            atomic_load(&spBCUploadBatchAgeMax) * tickUs,
+            buffers, bufferPeak, noCopy, heapAllocatedPeak);
 }
 
 static void spBCStartSummary(id<MTLDevice> device) {
@@ -431,6 +485,8 @@ static void spBCReserve(SPBCStagingReservation *reservation, size_t bytes, NSDat
     [condition lock];
     if (!SPBCStagingFits(&spBCStaging, bytes)) {
         spBCStaging.limitHits++;
+        if (spBCStaging.pending.bytes > SPBCStagingLimit ||
+            bytes > SPBCStagingLimit - spBCStaging.pending.bytes) spBCStaging.pendingLimitHits++;
         // Only committed uploads can make progress while this encoder waits.
         // The condition releases its lock while asleep and shares one deadline
         // across the whole upload, including any allocation retry.
@@ -465,6 +521,43 @@ static bool spBCDecodeTile(SPBCKind kind, const uint8_t *source, SPBCLayout layo
     return ok;
 }
 
+static _Thread_local bool spBCScratchInUse;
+
+static void spBCFreeScratchCache(void *cache) {
+    free(cache);
+    atomic_fetch_sub(&spBCScratchCaches, 1);
+}
+
+static uint8_t *spBCScratch(size_t bytes, bool *cached) {
+    *cached = false;
+    if (bytes > SPBCScratchCacheSize || spBCScratchInUse) return malloc(bytes);
+
+    static pthread_key_t key;
+    static bool haveKey;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ haveKey = pthread_key_create(&key, spBCFreeScratchCache) == 0; });
+    if (!haveKey) return malloc(bytes);
+
+    uint8_t *scratch = pthread_getspecific(key);
+    if (!scratch) {
+        unsigned count = atomic_load(&spBCScratchCaches);
+        do {
+            if (count >= SPBCScratchCacheThreads) return malloc(bytes);
+        } while (!atomic_compare_exchange_weak(&spBCScratchCaches, &count, count + 1));
+
+        scratch = malloc(SPBCScratchCacheSize);
+        if (!scratch || pthread_setspecific(key, scratch) != 0) {
+            spBCFreeScratchCache(scratch);
+            return malloc(bytes);
+        }
+    } else {
+        atomic_fetch_add(&spBCScratchCacheHits, 1);
+    }
+    *cached = true;
+    spBCScratchInUse = true;
+    return scratch;
+}
+
 static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo *info, MTLRegion region,
                           NSUInteger level, NSUInteger slice, const void *source,
                           NSUInteger row, NSUInteger image, bool implicitImage) {
@@ -496,7 +589,8 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
         return;
     }
     size_t capacity = tile.bytes;
-    uint8_t *decoded = malloc(capacity);
+    bool cached;
+    uint8_t *decoded = spBCScratch(capacity, &cached);
     if (!decoded) {
         atomic_fetch_add(&spBCCPUAllocationFailures, 1);
         spBCDrop(selector, "CPU scratch allocation failed");
@@ -519,7 +613,8 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
              texture.textureType == MTLTextureType3D ? tile.bytes : 0);
         insideTexture--;
     } while (SPBCNextTile(info.kind, layout.size, 1, SPBCTileLimit, &cursor, &tile));
-    free(decoded);
+    if (cached) spBCScratchInUse = false;
+    else free(decoded);
     [condition lock];
     SPBCStagingReleaseScratch(&spBCStaging, capacity);
     [condition unlock];
@@ -677,6 +772,11 @@ static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view)
     info.requested = requested;
     info.kind = SPBCKindOfPixelFormat(requested);
     if (!view) {
+        info.root = YES;
+        NSUInteger edge = MAX(texture.width, MAX(texture.height, texture.depth));
+        info.dimensionBucket = edge <= 256 ? 0 : edge <= 512 ? 1 : edge <= 1024 ? 2 : edge <= 2048 ? 3 : 4;
+        NSUInteger mips = texture.mipmapLevelCount;
+        info.mipBucket = mips <= 1 ? 0 : mips <= 4 ? 1 : mips <= 8 ? 2 : mips <= 12 ? 3 : 4;
         info.trackedBytes = SPBCTextureBytes(info.kind, (SPBCSize){texture.width, texture.height, texture.depth},
                                              texture.textureType, texture.mipmapLevelCount, texture.arrayLength,
                                              texture.sampleCount);
@@ -689,6 +789,9 @@ static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view)
         spBCTextureStats.allocated++;
         spBCTextureStats.rootsCreated += !view;
         spBCTextureStats.liveBytes += info.trackedBytes;
+        spBCTextureStats.peakBytes = MAX(spBCTextureStats.peakBytes, spBCTextureStats.liveBytes);
+        spBCTextureStats.dimensionBytes[info.dimensionBucket] += info.trackedBytes;
+        spBCTextureStats.mipBytes[info.mipBucket] += info.trackedBytes;
         spBCTextureStats.standaloneAllocatedBytes += info.standaloneAllocatedBytes;
         if (info.physicalFormat <= MTLPixelFormatRGBA16Float) {
             spBCTextureStats.liveBytesByFormat[info.physicalFormat] += info.trackedBytes;
@@ -791,7 +894,10 @@ static id newTexture(id owner, SEL selector, MTLTextureDescriptor *descriptor) {
     CreateWith real = (CreateWith)original(owner, selector);
     if (!SPBCKindOfPixelFormat(descriptor.pixelFormat)) {
         id texture = real(owner, selector, descriptor);
-        if (!spBCCreating && spBCActive(owner)) spBCTrackNativeTexture(texture, descriptor.usage);
+        if (!spBCCreating) {
+            spBCTrackRenderTarget(texture, descriptor.usage);
+            if (spBCActive(owner)) spBCTrackNativeTexture(texture, descriptor.usage);
+        }
         return texture;
     }
     if (spBCCreating && !spA16Profile()) return real(owner, selector, descriptor);
@@ -812,8 +918,11 @@ static id newTextureAtOffset(id<MTLHeap> heap, SEL selector, MTLTextureDescripto
                              NSUInteger offset) RETAINED;
 static id newTextureAtOffset(id<MTLHeap> heap, SEL selector, MTLTextureDescriptor *descriptor, NSUInteger offset) {
     CreateAtOffset real = (CreateAtOffset)original(heap, selector);
-    if ((spBCCreating && !spA16Profile()) || !SPBCKindOfPixelFormat(descriptor.pixelFormat) || !spBCActive(heap.device))
-        return real(heap, selector, descriptor, offset);
+    if ((spBCCreating && !spA16Profile()) || !SPBCKindOfPixelFormat(descriptor.pixelFormat) || !spBCActive(heap.device)) {
+        id texture = real(heap, selector, descriptor, offset);
+        if (!spBCCreating) spBCTrackRenderTarget(texture, descriptor.usage);
+        return texture;
+    }
     @autoreleasepool {
         MTLTextureDescriptor *stored = spBCStoredDescriptor(descriptor);
         spBCCreating++;
@@ -864,7 +973,7 @@ static id spBCHookBuffer(id<MTLBuffer> buffer, bool noCopy) {
         hook(object_getClass(buffer), @selector(newTextureWithDescriptor:offset:bytesPerRow:), (IMP)spBCBufferTexture);
         if (!spBCMakingBuffer && !spBCMakingStaging && !buffer.heap && spBCActive(buffer.device))
             spBCTrackResource(buffer, noCopy ? &spBCResources.noCopyBuffers : &spBCResources.buffers,
-                              noCopy ? buffer.length : buffer.allocatedSize);
+                              noCopy ? buffer.length : buffer.allocatedSize, SPBCUsageCount);
     }
     return buffer;
 }
@@ -949,6 +1058,7 @@ static void spBCTrackStaging(id<MTLBuffer> buffer) {
 @public
     id<MTLBuffer> staging;
     SPBCTile tile;
+    NSUInteger offset;
 }
 @end
 @implementation SPBCUploadTile @end
@@ -962,6 +1072,7 @@ static void spBCTrackStaging(id<MTLBuffer> buffer) {
     SPBCKind kind;
     SEL uploadSelector;
     SPBCStagingReservation reservation;
+    uint64_t encodedAt;
 }
 - (void)decode;
 - (void)releaseStaging;
@@ -971,7 +1082,7 @@ static void spBCTrackStaging(id<MTLBuffer> buffer) {
 - (void)decode {
     const uint8_t *bytes = source.contents;
     for (SPBCUploadTile *part in tiles) {
-        if (!spBCDecodeTile(kind, bytes, layout, part->tile, part->staging.contents)) {
+        if (!spBCDecodeTile(kind, bytes, layout, part->tile, (uint8_t *)part->staging.contents + part->offset)) {
             spBCDropLayout(uploadSelector);
             break;
         }
@@ -1048,6 +1159,9 @@ static void commitCommandBuffer(id<MTLCommandBuffer> commandBuffer, SEL selector
         if (pending) objc_setAssociatedObject(commandBuffer, &uploadsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     if (pending.count) {
+        atomic_fetch_add(&spBCUploadBatchCount, 1);
+        spBCMax(&spBCUploadBatchMax, pending.count);
+        spBCMax(&spBCUploadBatchAgeMax, mach_absolute_time() - pending.firstObject->encodedAt);
         objc_setAssociatedObject(commandBuffer, spBCUploadMarker, @YES, OBJC_ASSOCIATION_RETAIN);
         for (SPBCUpload *upload in pending) [upload decode];
         __block NSArray<SPBCUpload *> *retained = pending;
@@ -1105,7 +1219,7 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
     // Buffer-to-texture blits require a whole-texel row pitch. The stricter
     // alignment for buffer-backed texture views does not apply to these copies.
     size_t alignment = SPBCTexelBytes(info.kind);
-    size_t bytes = 0;
+    size_t bytes = 0, tileCount = 0;
     SPBCOrigin cursor = {0};
     SPBCTile tile;
     while (SPBCNextTile(info.kind, layout.size, alignment, SPBCTileLimit, &cursor, &tile)) {
@@ -1114,6 +1228,7 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
             return;
         }
         bytes += tile.bytes;
+        tileCount++;
     }
     if (!bytes) {
         spBCDropLayout(selector);
@@ -1134,19 +1249,33 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
 
     // Allocate all tiles for this copy before encoding it. Once a blit is
     // encoded it cannot be rolled back if a later tile fails to allocate.
+    // Small volume copies may contain many sub-page tiles. Keep one buffer
+    // for their contiguous, whole-texel ranges. Larger copies retain bounded
+    // individual allocations, and a failed packing attempt uses that path too.
+    id<MTLBuffer> packed = nil;
+    if (SPBCStagingPackTiles(bytes, tileCount, SPBCTileLimit)) {
+        packed = spBCNewStagingBuffer(texture.device, bytes);
+        if (packed) spBCTrackStaging(packed);
+    }
+    size_t offsetInBuffer = 0;
     cursor = (SPBCOrigin){0};
     while (SPBCNextTile(info.kind, layout.size, alignment, SPBCTileLimit, &cursor, &tile)) {
         SPBCUploadTile *part = [SPBCUploadTile new];
         part->tile = tile;
-        part->staging = spBCAllocateStaging(texture.device, tile.bytes, deadline);
+        part->staging = packed ?: spBCAllocateStaging(texture.device, tile.bytes, deadline);
+        if (packed) {
+            part->offset = offsetInBuffer;
+            offsetInBuffer += tile.bytes;
+        }
         if (!part->staging) {
             [upload releaseStaging];
             spBCDrop(selector, "Metal staging allocation failed");
             return;
         }
-        spBCTrackStaging(part->staging);
+        if (!packed) spBCTrackStaging(part->staging);
         [upload->tiles addObject:part];
     }
+    upload->encodedAt = mach_absolute_time();
     @synchronized (commandBuffer) {
         NSMutableArray *pending = objc_getAssociatedObject(commandBuffer, &uploadsKey);
         if (!pending) {
@@ -1162,10 +1291,10 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
         MTLRegion region = spBCPart(origin, part->tile);
         NSUInteger imageBytes = volume ? part->tile.bytes : 0;
         if (withOptions)
-            ((BufferToTextureOptions)real)(encoder, selector, part->staging, 0, part->tile.row, imageBytes,
+            ((BufferToTextureOptions)real)(encoder, selector, part->staging, part->offset, part->tile.row, imageBytes,
                                            region.size, texture, slice, level, region.origin, options);
         else
-            ((BufferToTexture)real)(encoder, selector, part->staging, 0, part->tile.row, imageBytes,
+            ((BufferToTexture)real)(encoder, selector, part->staging, part->offset, part->tile.row, imageBytes,
                                     region.size, texture, slice, level, region.origin);
     }
     insideTexture--;
@@ -1403,6 +1532,7 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
     bool enabled = spBCShouldEnable(device);
     spBCLog(@"SP_BC_FALLBACK %s device=%@ reason=%s", enabled ? "enabled" : "disabled", device.name,
             spA16Profile() ? "a16-profile" : enabled ? "no-native-BC" : haveProperty ? "native-BC" : "capability-unavailable");
+    hook(cls, @selector(newTextureWithDescriptor:), (IMP)newTexture);
     if (!enabled) return;
     findSharedCache();
     spBCUploadMarker = sel_registerName(SP_BC_UPLOAD_CB_KEY);
@@ -1414,7 +1544,6 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
 #if !SP_METAL_DIAG
     hook(cls, @selector(heapTextureSizeAndAlignWithDescriptor:), (IMP)spBCHeapSizeHook);
 #endif
-    hook(cls, @selector(newTextureWithDescriptor:), (IMP)newTexture);
     hook(cls, @selector(newTextureWithDescriptor:iosurface:plane:), (IMP)spBCSurfaceTexture);
     hook(cls, @selector(newHeapWithDescriptor:), (IMP)newHeap);
     hook(cls, @selector(minimumLinearTextureAlignmentForPixelFormat:), (IMP)spBCLinearAlignment);

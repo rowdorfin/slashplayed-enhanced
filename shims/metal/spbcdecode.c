@@ -5,6 +5,9 @@
 // formats Metal names BC1_RGBA ... BC7_RGBAUnorm). See BCDecode.h.
 #include "spbcdecode.h"
 #include <string.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 SPBCKind SPBCKindOfPixelFormat(unsigned long format) {
     switch (format) {
@@ -69,9 +72,8 @@ static uint64_t load64(const uint8_t *p) {
 
 // The colour half of BC1, BC2 and BC3. BC2 and BC3 always use four colours;
 // BC1 uses three and transparent black when the first endpoint is not greater.
-static void decode_color(const uint8_t *block, bool alwaysFourColors, uint8_t out[16][4]) {
+static void color_palette(const uint8_t *block, bool alwaysFourColors, uint8_t palette[4][4]) {
     unsigned c0 = block[0] | (unsigned)block[1] << 8, c1 = block[2] | (unsigned)block[3] << 8;
-    uint8_t palette[4][4];
     unsigned endpoints[2] = { c0, c1 };
     for (unsigned e = 0; e < 2; e++) {
         unsigned c = endpoints[e], r = c >> 11 & 31, g = c >> 5 & 63, b = c & 31;
@@ -93,6 +95,32 @@ static void decode_color(const uint8_t *block, bool alwaysFourColors, uint8_t ou
         palette[2][3] = 255;
         memset(palette[3], 0, 4);   // punch-through: transparent black
     }
+}
+
+static void decode_bc1(const uint8_t *block, uint8_t *out, size_t rowBytes) {
+    uint8_t palette[4][4];
+    color_palette(block, false, palette);
+#if defined(__aarch64__)
+    uint8x16_t colors = vld1q_u8((const uint8_t *)palette);
+    int8x16_t shift = vld1q_s8((const int8_t[]){0,0,0,0,-2,-2,-2,-2,-4,-4,-4,-4,-6,-6,-6,-6});
+    uint8x16_t channel = vld1q_u8((const uint8_t[]){0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3});
+#endif
+    for (unsigned y = 0; y < 4; y++) {
+        unsigned indices = block[4 + y];
+        uint8_t *row = out + y * rowBytes;
+#if defined(__aarch64__)
+        uint8x16_t index = vshlq_u8(vdupq_n_u8((uint8_t)indices), shift);
+        index = vorrq_u8(vshlq_n_u8(vandq_u8(index, vdupq_n_u8(3)), 2), channel);
+        vst1q_u8(row, vqtbl1q_u8(colors, index));
+#else
+        for (unsigned x = 0; x < 4; x++) memcpy(row + 4 * x, palette[(indices >> (2 * x)) & 3], 4);
+#endif
+    }
+}
+
+static void decode_color_with_alpha(const uint8_t *block, uint8_t out[16][4]) {
+    uint8_t palette[4][4];
+    color_palette(block, true, palette);
     uint32_t indices = block[4] | (uint32_t)block[5] << 8 | (uint32_t)block[6] << 16 | (uint32_t)block[7] << 24;
     for (unsigned i = 0; i < 16; i++) memcpy(out[i], palette[indices >> (2 * i) & 3], 4);
 }
@@ -466,14 +494,14 @@ void SPBCDecodeBlock(SPBCKind kind, const uint8_t *block, uint8_t *texels, size_
     const uint8_t *decoded = texelBytes == 4 ? (const uint8_t *)rgba : tile;
     switch (kind) {
         case SPBCNone: return;
-        case SPBC1: decode_color(block, false, rgba); break;
+        case SPBC1: decode_bc1(block, texels, rowBytes); return;
         case SPBC2:
-            decode_color(block + 8, true, rgba);
+            decode_color_with_alpha(block + 8, rgba);
             for (unsigned i = 0; i < 16; i++) { unsigned a = block[i / 2] >> (4 * (i & 1)) & 15; rgba[i][3] = (uint8_t)(a * 17); }
             break;
         case SPBC3: {
             uint8_t alpha[16];
-            decode_color(block + 8, true, rgba); decode_channel(block, alpha);
+            decode_color_with_alpha(block + 8, rgba); decode_channel(block, alpha);
             for (unsigned i = 0; i < 16; i++) rgba[i][3] = alpha[i];
             break;
         }

@@ -70,6 +70,31 @@ static void test_bc1(void) {
     expect_rgba(out[0], 132, 130, 132, 255);
 }
 
+// Every selector byte must decode identically through scalar and SIMD
+// builds, including a misaligned destination and untouched row padding.
+static void test_color_selectors(void) {
+    static const uint8_t endpoints[2][4] = {{0, 0xf8, 0x1f, 0}, {0x1f, 0, 0, 0xf8}};
+    static const uint8_t expected[2][4][4] = {
+        {{255,0,0,255}, {0,0,255,255}, {171,0,84,255}, {84,0,171,255}},
+        {{0,0,255,255}, {255,0,0,255}, {128,0,128,255}, {0,0,0,0}},
+    };
+    for (unsigned mode = 0; mode < 2; mode++) {
+        for (unsigned selectors = 0; selectors < 256; selectors++) {
+            uint8_t block[8];
+            memcpy(block, endpoints[mode], 4);
+            for (unsigned y = 0; y < 4; y++) block[4 + y] = (uint8_t)(selectors ^ (0x55 * y));
+            uint8_t out[4][19];
+            memset(out, 0xa5, sizeof out);
+            SPBCDecodeBlock(SPBC1, block, (uint8_t *)out + 1, sizeof out[0]);
+            for (unsigned y = 0; y < 4; y++) {
+                for (unsigned x = 0; x < 4; x++)
+                    assert(!memcmp(out[y] + 1 + 4 * x, expected[mode][block[4 + y] >> (2 * x) & 3], 4));
+                assert(out[y][0] == 0xa5 && out[y][17] == 0xa5 && out[y][18] == 0xa5);
+            }
+        }
+    }
+}
+
 static void test_bc2_bc3(void) {
     uint8_t out[16][4];
     // BC2: explicit alpha nibbles 0..15; the colour half never punches through.
@@ -274,6 +299,7 @@ static void test_fixture(SPBCKind kind, uint32_t width, uint32_t height,
 int main(void) {
     test_formats();
     test_bc1();
+    test_color_selectors();
     test_bc2_bc3();
     test_bc4_bc5();
     test_bc7();

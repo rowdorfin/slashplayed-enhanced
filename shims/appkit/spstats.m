@@ -118,12 +118,13 @@ static const char *sp_stats_thermal(void) {
 
 // Footprint (and its peak), what's left before the limit, thermal state.
 static NSString *sp_stats_state(void) {
-    task_vm_info_data_t vm;
+    task_vm_info_data_t vm = {0};
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) != KERN_SUCCESS) memset(&vm, 0, sizeof vm);
-    return [NSString stringWithFormat:@"footprint %llu MB (peak %llu), %zu MB left | thermal %s%s",
+    return [NSString stringWithFormat:@"footprint %llu MB (peak %llu), %zu MB left | thermal %s%s | vmResident=%llu vmInternal=%llu vmCompressed=%llu",
         vm.phys_footprint >> 20, vm.ledger_phys_footprint_peak >> 20, os_proc_available_memory() >> 20,
-        sp_stats_thermal(), NSProcessInfo.processInfo.lowPowerModeEnabled ? ", low power" : ""];
+        sp_stats_thermal(), NSProcessInfo.processInfo.lowPowerModeEnabled ? ", low power" : "",
+        vm.resident_size, vm.internal, vm.compressed];
 }
 
 static void sp_stats_line(void) {

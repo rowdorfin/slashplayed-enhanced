@@ -19,6 +19,7 @@ static void pendingPressure(void) {
     SPBCStagingRelease(&staging, &abandoned);
     assert(staging.pending.uploads == 2 && staging.overLimit == 2);
     assert(staging.reservedPeak == SPBCStagingLimit + 4096 + 8192);
+    assert(staging.pendingAtPeak == staging.reservedPeak && staging.inFlightAtPeak == 0);
 
     SPBCStagingSubmit(&staging, &second);
     assert(!SPBCStagingCanWait(&staging, 1)); // The pending upload alone fills the budget.
@@ -67,9 +68,31 @@ static void synchronousScratch(void) {
     assert(!SPBCStagingReserved(&staging));
 }
 
+// Model page rounding for a burst of 64 volume uploads, each with 64
+// 16x16 RGBA slices. Both paths reserve the same logical upload payload.
+static void packedVolume(void) {
+    enum { uploads = 64, slices = 64, sliceBytes = 1024, page = 16384 };
+    SPBCStaging staging = {0};
+    SPBCStagingReservation copies[uploads] = {0};
+    size_t oldPeak = 0, packedPeak = 0;
+    for (size_t i = 0; i < uploads; i++) {
+        size_t bytes = slices * sliceBytes;
+        assert(SPBCStagingPackTiles(bytes, slices, 4 * 1024 * 1024));
+        SPBCStagingReserve(&staging, &copies[i], bytes);
+        oldPeak += slices * page;
+        packedPeak += (bytes + page - 1) / page * page;
+    }
+    assert(oldPeak == 64 * 1024 * 1024 && packedPeak == 4 * 1024 * 1024);
+    assert(staging.reservedPeak == packedPeak && !staging.overLimit);
+    assert(!SPBCStagingPackTiles(sliceBytes, 1, 4 * 1024 * 1024));
+    assert(!SPBCStagingPackTiles(8 * 1024 * 1024, 2, 4 * 1024 * 1024));
+    printf("BC staging volume model: page-rounded peak %zu -> %zu bytes, logical hits 0 -> 0\n", oldPeak, packedPeak);
+}
+
 int main(void) {
     pendingPressure();
     submittedPressure();
     synchronousScratch();
+    packedVolume();
     puts("BC staging tests passed");
 }

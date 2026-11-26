@@ -4,6 +4,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+static inline bool SPBCStagingPackTiles(size_t bytes, size_t tiles, size_t tileLimit) {
+    return tiles > 1 && bytes <= tileLimit;
+}
+
 enum { SPBCStagingLimit = 128 * 1024 * 1024 };
 
 typedef struct {
@@ -12,6 +16,7 @@ typedef struct {
 
 typedef struct {
     SPBCStagingUsage pending, inFlight;
+    unsigned long long pendingAtPeak, inFlightAtPeak, scratchAtPeak, pendingLimitHits;
     unsigned long long scratchBytes, reservedPeak, limitHits, overLimit, overLimitBytes;
 } SPBCStaging;
 

@@ -20,7 +20,12 @@ bool SPBCStagingCanWait(const SPBCStaging *staging, size_t bytes) {
 
 static void spBCUpdatePeak(SPBCStaging *staging) {
     unsigned long long reserved = SPBCStagingReserved(staging);
-    if (reserved > staging->reservedPeak) staging->reservedPeak = reserved;
+    if (reserved > staging->reservedPeak) {
+        staging->reservedPeak = reserved;
+        staging->pendingAtPeak = staging->pending.bytes;
+        staging->inFlightAtPeak = staging->inFlight.bytes;
+        staging->scratchAtPeak = staging->scratchBytes;
+    }
 }
 
 static void spBCRemoveUsage(SPBCStagingUsage *usage, size_t bytes) {
