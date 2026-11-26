@@ -43,6 +43,7 @@ void SPBCStagingReserve(SPBCStaging *staging, SPBCStagingReservation *reservatio
     *reservation = (SPBCStagingReservation){SPBCStagingPending, bytes};
     staging->pending.uploads++;
     staging->pending.bytes += bytes;
+    if (staging->pending.bytes > staging->pendingPeak) staging->pendingPeak = staging->pending.bytes;
     spBCUpdatePeak(staging);
 }
 
@@ -60,6 +61,16 @@ void SPBCStagingRelease(SPBCStaging *staging, SPBCStagingReservation *reservatio
     SPBCStagingUsage *usage = reservation->phase == SPBCStagingPending ? &staging->pending : &staging->inFlight;
     spBCRemoveUsage(usage, reservation->bytes);
     reservation->phase = SPBCStagingReleased;
+}
+
+void SPBCStagingRecordBatch(SPBCStaging *staging, unsigned long long bytes, unsigned long long uploads) {
+    staging->batchBytes += bytes;
+    staging->batchUploads += uploads;
+    if (bytes > staging->maxBatchBytes ||
+        (bytes == staging->maxBatchBytes && uploads > staging->uploadsAtMaxBatch)) {
+        staging->maxBatchBytes = bytes;
+        staging->uploadsAtMaxBatch = uploads;
+    }
 }
 
 void SPBCStagingAddScratch(SPBCStaging *staging, size_t bytes) {

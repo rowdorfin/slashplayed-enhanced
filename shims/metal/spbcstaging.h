@@ -18,6 +18,7 @@ typedef struct {
     SPBCStagingUsage pending, inFlight;
     unsigned long long pendingAtPeak, inFlightAtPeak, scratchAtPeak, pendingLimitHits;
     unsigned long long scratchBytes, reservedPeak, limitHits, overLimit, overLimitBytes;
+    unsigned long long pendingPeak, batchBytes, batchUploads, maxBatchBytes, uploadsAtMaxBatch;
 } SPBCStaging;
 
 typedef enum {
@@ -36,6 +37,7 @@ bool SPBCStagingCanWait(const SPBCStaging *staging, size_t bytes);
 void SPBCStagingReserve(SPBCStaging *staging, SPBCStagingReservation *reservation, size_t bytes);
 void SPBCStagingSubmit(SPBCStaging *staging, SPBCStagingReservation *reservation);
 void SPBCStagingRelease(SPBCStaging *staging, SPBCStagingReservation *reservation);
+void SPBCStagingRecordBatch(SPBCStaging *staging, unsigned long long bytes, unsigned long long uploads);
 void SPBCStagingAddScratch(SPBCStaging *staging, size_t bytes);
 void SPBCStagingReleaseScratch(SPBCStaging *staging, size_t bytes);
 

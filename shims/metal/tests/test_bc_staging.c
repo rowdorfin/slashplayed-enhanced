@@ -89,10 +89,31 @@ static void packedVolume(void) {
     printf("BC staging volume model: page-rounded peak %zu -> %zu bytes, logical hits 0 -> 0\n", oldPeak, packedPeak);
 }
 
+static void batchAccounting(void) {
+    SPBCStaging staging = {0};
+    SPBCStagingReservation first = {0}, second = {0};
+    SPBCStagingReserve(&staging, &first, 4096);
+    SPBCStagingReserve(&staging, &second, 8192);
+    assert(staging.pendingPeak == 12288 && staging.pendingAtPeak == 12288);
+    SPBCStagingSubmit(&staging, &first);
+    SPBCStagingSubmit(&staging, &second);
+    SPBCStagingRelease(&staging, &first);
+    SPBCStagingRelease(&staging, &second);
+    assert(staging.pendingPeak == 12288 && !SPBCStagingReserved(&staging));
+
+    SPBCStagingRecordBatch(&staging, 12288, 2);
+    SPBCStagingRecordBatch(&staging, 4096, 4);
+    assert(staging.batchBytes == 16384 && staging.batchUploads == 6);
+    assert(staging.maxBatchBytes == 12288 && staging.uploadsAtMaxBatch == 2);
+    SPBCStagingRecordBatch(&staging, 12288, 3);
+    assert(staging.maxBatchBytes == 12288 && staging.uploadsAtMaxBatch == 3);
+}
+
 int main(void) {
     pendingPressure();
     submittedPressure();
     synchronousScratch();
     packedVolume();
+    batchAccounting();
     puts("BC staging tests passed");
 }

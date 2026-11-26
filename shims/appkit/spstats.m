@@ -13,6 +13,8 @@
 #include <objc/runtime.h>
 #include "../metal/spmetalmeter.h"
 #include <time.h>
+#include <stddef.h>
+#include <stdatomic.h>
 
 extern size_t os_proc_available_memory(void);
 
@@ -177,6 +179,18 @@ static void *sp_stats_watch(void *unused) {
     return NULL;
 }
 
+static atomic_ullong sp_stats_memory_warnings;
+
+static void sp_stats_memory_warning(void) {
+    unsigned long long warnings = atomic_fetch_add_explicit(&sp_stats_memory_warnings, 1, memory_order_relaxed) + 1;
+    task_vm_info_data_t vm = {0};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    bool measured = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS &&
+        count * sizeof(natural_t) >= offsetof(task_vm_info_data_t, phys_footprint) + sizeof(vm.phys_footprint);
+    sp_stats_say([NSString stringWithFormat:@"SP_MEM_PRESSURE source=UIKit level=warn warnings=%llu phys_footprint=%@",
+                  warnings, measured ? @(vm.phys_footprint) : @"n/a"].UTF8String);
+}
+
 static void sp_stats_start(void) {
     static BOOL started;
     if (started) return;
@@ -213,6 +227,7 @@ static void sp_stats_start(void) {
         NSString *what = events[name];
         [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:nil
                                                     usingBlock:^(NSNotification *note) {
+            if ([name isEqualToString:UIApplicationDidReceiveMemoryWarningNotification]) sp_stats_memory_warning();
             sp_stats_say([NSString stringWithFormat:@"lifecycle: %@ | %@%@", what, sp_stats_state(),
                          [thermal containsObject:name] ? @"" : sp_stats_scenes()].UTF8String);
         }];
