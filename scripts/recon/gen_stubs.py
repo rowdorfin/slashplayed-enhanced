@@ -145,12 +145,13 @@ uint32_t sp_KBGetLayoutType(int16_t kbdType) { return 'ANSI'; }
     "Metal": """
 #import <Metal/Metal.h>
 #import <objc/message.h>
+#include <errno.h>
+#include <stdarg.h>
 
 #ifndef SP_METAL_DIAG
 #define SP_METAL_DIAG 1
 #endif
 #if SP_METAL_DIAG
-#include <errno.h>
 #include <fcntl.h>
 #include <os/lock.h>
 #include <pthread.h>
@@ -229,6 +230,12 @@ static id sp_nextDrawable(id self, SEL _cmd) {
     return d;
 }
 
+static void spBCInstall(id<MTLDevice> device, Class cls);
+static bool spBCActive(id device);
+static MTLSizeAndAlign spBCHeapSize(id device, SEL selector, MTLTextureDescriptor *descriptor,
+                                  MTLSizeAndAlign (*real)(id, SEL, MTLTextureDescriptor *),
+                                  MTLPixelFormat *physicalFormat);
+
 #if SP_METAL_DIAG
 enum { SP_METAL_DIAG_LIMIT = 1024 * 1024 };
 static int sp_metal_diag_fds[2] = {-1, -1};
@@ -280,7 +287,9 @@ static const char *sp_metal_diag_format(MTLPixelFormat format) {
     switch (format) {
         SP_FORMAT(Invalid);
         SP_FORMAT(R8Unorm);
+        SP_FORMAT(R8Snorm);
         SP_FORMAT(RG8Unorm);
+        SP_FORMAT(RG8Snorm);
         SP_FORMAT(RGBA8Unorm);
         SP_FORMAT(RGBA8Unorm_sRGB);
         SP_FORMAT(BGRA8Unorm);
@@ -348,8 +357,7 @@ static uint64_t sp_metal_diag_begin(SEL sel, MTLTextureDescriptor *d) {
     return seq;
 }
 
-// Called inside sp_add_device_props' dispatch_once, before the device is returned to the client.
-static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
+static void sp_open_metal_diag(void) {
     NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     if (documents) {
         NSArray<NSString *> *names = @[@"sp-metal-diag.log", @"sp-metal-diag.1.log"];
@@ -367,13 +375,17 @@ static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
     }
 
     if (sp_metal_diag_fds[0] < 0) sp_metal_diag_slot = 1;
+}
 
+// Called once before handing out the device on an instrumented entry point.
+static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
     SEL selector = @selector(heapTextureSizeAndAlignWithDescriptor:);
     Method method = class_getInstanceMethod(cls, selector);
     const char *bc = "n/a";
     if ([dev respondsToSelector:@selector(supportsBCTextureCompression)])
         bc = dev.supportsBCTextureCompression ? "yes" : "no";
     NSString *name = dev.name;
+    os_unfair_lock_lock(&sp_metal_diag_lock);
     snprintf(sp_metal_diag_device, sizeof sp_metal_diag_device,
              "SP_METAL_DIAG=1 device=\\"%.96s\\" class=%.96s Apple7=%d Apple8=%d Apple9=%d Mac2=%d"
              " supportsBCTextureCompression=%s selector=%s hook=%s\\n",
@@ -381,6 +393,7 @@ static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
              [dev supportsFamily:MTLGPUFamilyApple7], [dev supportsFamily:MTLGPUFamilyApple8],
              [dev supportsFamily:MTLGPUFamilyApple9], [dev supportsFamily:MTLGPUFamilyMac2], bc,
              sel_getName(selector), method ? "installed" : "missing");
+    os_unfair_lock_unlock(&sp_metal_diag_lock);
     sp_metal_diag_write(sp_metal_diag_device);
     if (!method) return;
 
@@ -390,12 +403,20 @@ static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
     IMP hook = imp_implementationWithBlock(^MTLSizeAndAlign(id self, MTLTextureDescriptor *descriptor) {
         int saved_errno = errno;
         uint64_t seq = sp_metal_diag_begin(selector, descriptor);
+        MTLPixelFormat physical = MTLPixelFormatInvalid;
+        BOOL fallback = spBCActive(self);
         errno = saved_errno;
-        MTLSizeAndAlign result = original(self, selector, descriptor);
+        MTLSizeAndAlign result = fallback ? spBCHeapSize(self, selector, descriptor, original, &physical)
+                                          : original(self, selector, descriptor);
         saved_errno = errno;
-        char line[128];
-        snprintf(line, sizeof line, "seq=%llu phase=after size=%lu align=%lu\\n",
-                 (unsigned long long)seq, result.size, result.align);
+        char line[192];
+        if (fallback)
+            snprintf(line, sizeof line, "seq=%llu phase=after size=%lu align=%lu physicalFormat=%lu(%s)\\n",
+                     (unsigned long long)seq, result.size, result.align, (unsigned long)physical,
+                     sp_metal_diag_format(physical));
+        else
+            snprintf(line, sizeof line, "seq=%llu phase=after size=%lu align=%lu\\n",
+                     (unsigned long long)seq, result.size, result.align);
         sp_metal_diag_write(line);
         errno = saved_errno;
         return result;
@@ -404,13 +425,59 @@ static void sp_install_metal_diag(id<MTLDevice> dev, Class cls) {
 }
 #endif
 
+static void spBCLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void spBCLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+#if SP_METAL_DIAG
+    sp_metal_diag_write([[line stringByAppendingString:@"\\n"] UTF8String]);
+#else
+    sp_stub_log(line.UTF8String);
+#endif
+}
+
+static void sp_prepare_metal_device(id<MTLDevice> device, bool observer) {
+    if (!device) return;
+#if SP_METAL_DIAG
+    static dispatch_once_t open_once, diag_once;
+    dispatch_once(&open_once, ^{ sp_open_metal_diag(); });
+    if (observer || ([device respondsToSelector:@selector(supportsBCTextureCompression)] &&
+                     !device.supportsBCTextureCompression))
+        dispatch_once(&diag_once, ^{ sp_install_metal_diag(device, object_getClass(device)); });
+#endif
+    static dispatch_once_t bc_once;
+    dispatch_once(&bc_once, ^{ spBCInstall(device, object_getClass(device)); });
+}
+
+// The re-export remains the provider of the real device. The direct factory
+// and the macOS observer compatibility entry point both prepare it.
+id<MTLDevice> sp_MTLCreateSystemDefaultDevice(void) __asm__("_MTLCreateSystemDefaultDevice") NS_RETURNS_RETAINED;
+id<MTLDevice> sp_MTLCreateSystemDefaultDevice(void) {
+    typedef id<MTLDevice> (*Factory)(void) NS_RETURNS_RETAINED;
+    static Factory real;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        real = (Factory)dlsym(RTLD_NEXT, "MTLCreateSystemDefaultDevice");
+        if (!real || real == sp_MTLCreateSystemDefaultDevice) {
+            void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY | RTLD_NOLOAD);
+            real = metal ? (Factory)dlsym(metal, "MTLCreateSystemDefaultDevice") : NULL;
+            if (metal) dlclose(metal);
+            if (real == sp_MTLCreateSystemDefaultDevice) real = NULL;
+        }
+    });
+    id<MTLDevice> device = real ? real() : nil;
+    int saved_errno = errno;
+    sp_prepare_metal_device(device, false);
+    errno = saved_errno;
+    return device;
+}
+
 static void sp_add_device_props(id dev) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         Class c = object_getClass(dev);
-#if SP_METAL_DIAG
-        sp_install_metal_diag(dev, c);
-#endif
         Method m = class_getInstanceMethod(c, @selector(newLibraryWithData:error:));
         sp_newLibraryWithData_orig = (void *)method_setImplementation(m, (IMP)sp_newLibraryWithData);
         Method nd = class_getInstanceMethod(NSClassFromString(@"CAMetalLayer"), sel_registerName("nextDrawable"));
@@ -437,8 +504,11 @@ static void sp_add_device_props(id dev) {
 // MTLRemoveDeviceObserver. (As id * under ARC it was autoreleased, and quitting crashed on the
 // over-release.)
 CFArrayRef sp_MTLCopyAllDevicesWithObserver(void **observer, id handler) {
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (dev) sp_add_device_props(dev);
+    id<MTLDevice> dev = sp_MTLCreateSystemDefaultDevice();
+    if (dev) {
+        sp_prepare_metal_device(dev, true);
+        sp_add_device_props(dev);
+    }
     sp_stub_log([NSString stringWithFormat:@"MTLCopyAllDevicesWithObserver: %@", dev.name].UTF8String);
     if (observer) *observer = (void *)CFBridgingRetain([NSObject new]);
     return CFBridgingRetain(dev ? @[ dev ] : @[]);
@@ -501,6 +571,7 @@ int32_t sp_UCKeyTranslate(const void *layout, uint16_t key, uint16_t action, uin
 
 # Hand-written source files #included at the end of a generated shim: library -> paths in the repo.
 EXTRA_INCLUDES = {
+    "Metal": ["shims/metal/spbcfallback.m"],
     # UIKit app and scene, sharing the main thread with the client's loop; window geometry over it;
     # bitmap/image/cursor objects for the client's cursor images; input events from UIKit; play-session
     # stats; the loading screen until the client's first frame; look highlights.
@@ -691,6 +762,18 @@ def gen_shim(lib, records, chains, xros_classes, shim_dir):
     return "".join(out)
 
 
+# Compile the portable C sources directly, with the same sources as the host tests.
+EXTRA_SOURCES = {"libspMetal": ("shims/metal/spbcdecode.c", "shims/metal/spbclayout.c")}
+
+
+def shim_build_line(name, link, shim_dir):
+    sources = [name + ".m"]
+    sources += [os.path.relpath(os.path.join(REPO, path), shim_dir)
+                for path in EXTRA_SOURCES.get(name, ())]
+    return (f'$CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class {" ".join(sources)} -o "$OUT/{name}.dylib" '
+            f"-install_name @rpath/{name}.dylib -framework Foundation {' '.join(link)}\n")
+
+
 def main():
     import bucket
 
@@ -771,8 +854,7 @@ def main():
             if isinstance(link, str):  # HANDWRITTEN: its directory
                 fh.write(f'"{os.path.relpath(link, shim_dir)}/build.sh" "$PLATFORM" "$OUT"\n')
                 continue
-            fh.write(f'$CC -fobjc-arc -dynamiclib -O1 -Wno-objc-root-class {name}.m -o "$OUT/{name}.dylib" '
-                     f"-install_name @rpath/{name}.dylib -framework Foundation {' '.join(link)}\n")
+            fh.write(shim_build_line(name, link, shim_dir))
     os.chmod(os.path.join(shim_dir, "build.sh"), 0o755)
     print(f"{len(builds)} shims, {len(rewrite)} load commands mapped")
 

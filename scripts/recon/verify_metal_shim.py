@@ -6,7 +6,7 @@ import difflib
 import sys
 from pathlib import Path
 
-from gen_stubs import gen_shim
+from gen_stubs import gen_shim, shim_build_line
 
 GENERATED = Path(__file__).resolve().parents[2] / "shims" / "generated"
 # These are the Metal stubs emitted from the current merged imports. Refresh this
@@ -21,7 +21,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--emit", action="store_true", help="print the generated source")
-    mode.add_argument("--check", type=Path, default=GENERATED / "libspMetal.m")
+    mode.add_argument("--emit-build-line", action="store_true", help="print the generated Metal build command")
+    mode.add_argument("--check", type=Path)
     args = parser.parse_args()
     records = [
         {"stub": True, "kind": kind, "symbol": symbol}
@@ -32,16 +33,27 @@ def main():
     if args.emit:
         sys.stdout.buffer.write(expected)
         return 0
-    actual = args.check.read_bytes()
+    build_line = shim_build_line("libspMetal", ["-Wl,-reexport_framework,Metal"], GENERATED).encode("utf-8")
+    if args.emit_build_line:
+        sys.stdout.buffer.write(build_line)
+        return 0
+    source = args.check or GENERATED / "libspMetal.m"
+    actual = source.read_bytes()
     if actual != expected:
         sys.stderr.writelines(difflib.unified_diff(
             actual.decode("utf-8", errors="replace").splitlines(keepends=True),
             expected.decode("utf-8").splitlines(keepends=True),
-            fromfile=str(args.check), tofile="generator output",
+            fromfile=str(source), tofile="generator output",
         ))
         print("Metal shim differs from the generator (byte comparison).", file=sys.stderr)
         return 1
     print("Metal shim matches the generator byte for byte.")
+    if args.check is None:
+        commands = (GENERATED / "build.sh").read_bytes().splitlines(keepends=True)
+        if [line for line in commands if line.startswith(b"$CC ") and b" libspMetal.m " in line] != [build_line]:
+            print("Metal build command differs from the generator (byte comparison).", file=sys.stderr)
+            return 1
+        print("Metal build command matches the generator byte for byte.")
     return 0
 
 
