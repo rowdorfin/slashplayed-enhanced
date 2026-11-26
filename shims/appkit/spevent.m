@@ -866,7 +866,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
         [_thumbButton cancelHold];
         [_joystick setSuspended:YES];
         for (SPKeyboardButton *button in _keyboardButtons) {
-            [button cancelInput];
+            [button cancelInputWithReason:@"touch controls disabled"];
             [button removeFromSuperview];
         }
         [_thumbButton removeFromSuperview];
@@ -1013,7 +1013,8 @@ static BOOL sp_physical_touch(UITouch *touch) {
     sp_stub_log([NSString stringWithFormat:@"input: suspended by %@", notification.name ?: @"direct call"].UTF8String);
     [_touchChat close];
     [_thumbButton cancelHold];
-    for (SPKeyboardButton *button in _keyboardButtons) [button cancelInput];
+    NSString *reason = [NSString stringWithFormat:@"suspension (%@)", notification.name ?: @"direct call"];
+    for (SPKeyboardButton *button in _keyboardButtons) [button cancelInputWithReason:reason];
     [_joystick setSuspended:YES];
     sp_input_suspended = YES;
     [_hudTaps removeAllObjects];
@@ -1026,6 +1027,19 @@ static BOOL sp_physical_touch(UITouch *touch) {
     if (_touches.count) [self touchesCancelled:[NSSet setWithArray:_touches] withEvent:nil];
     _mask = _pointer_mask = 0;
     for (NSInteger button = 0; button < 8; button++) sp_mouse_button_at(button, NO, sp_mouse, NO);
+}
+
+// A new touch or press in a foreground-active scene is fresher than a missed activation notification:
+// without this, one deactivation whose resume never reached the view would drop input for good. Only
+// new contacts recover; touches that began before the suspension stay cancelled.
+- (BOOL)sp_input_blocked {
+    if (!sp_input_suspended) return NO;
+    UIWindowScene *scene = self.window.windowScene;
+    if (!scene || scene.activationState != UISceneActivationStateForegroundActive) return YES;
+    sp_stub_log("input: recovered from a missed activation on a new foreground touch");
+    sp_input_suspended = NO;
+    [_joystick setSuspended:NO];
+    return NO;
 }
 
 - (void)sp_resume_touch:(NSNotification *)notification {
@@ -1228,7 +1242,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
 #if !TARGET_OS_VISION
-    if (sp_input_suspended) return;
+    if ([self sp_input_blocked]) return;
     touches = [self sp_game_touches:touches];
     if (!touches.count) return;
     [_touchChat cancel];
@@ -1471,7 +1485,7 @@ static void sp_hud_move_event(CGPoint position) {
 
 - (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
 #if !TARGET_OS_VISION
-    if (sp_input_suspended) return;
+    if ([self sp_input_blocked]) return;
     for (SPKeyboardButton *button in _keyboardButtons) [button syncWithEvent:event];
 #endif
     for (UIPress *p in presses)

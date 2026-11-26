@@ -368,10 +368,14 @@ static void sp_test_space_ring(SPInputView *view, void (^done)(NSString *)) {
 
     [sp_events removeAllObjects];
     CGPoint center = space.center;
+    sp_space_last_release = nil;
     SPTestTouch *early = sp_test_touch(space, center); SPTestEvent *event = sp_test_event(@[early]);
     sp_test_send(early, UITouchPhaseBegan, event);
     early.at = CGPointMake(center.x + 20, center.y);
     sp_test_send(early, UITouchPhaseMoved, event);
+    // Replay a geometry-changing relayout while the synthetic touch still belongs to Space.
+    CGRect safe = CGRectIntersection(UIEdgeInsetsInsetRect(view.bounds, view.safeAreaInsets), sp_game_rect());
+    [space layoutInRect:CGRectInset(safe, 2, 2)];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 23 * NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
         @try {
             SPJoystickHandle *ring = nil;
@@ -379,7 +383,10 @@ static void sp_test_space_ring(SPInputView *view, void (^done)(NSString *)) {
             sp_test_check(!ring.highlighted && space.highlighted && CGPointEqualToPoint(space.center, center) && sp_events.count == 1,
                           @"Moving early cancels the unlock without moving the button or releasing a held Space key.");
             sp_test_send(early, UITouchPhaseEnded, event);
-            sp_test_check(!space.highlighted && !sp_repeat_key, @"The early-moving press still releases Space normally on lift.");
+            sp_test_check(!space.highlighted && !sp_repeat_key && sp_events.count == 2 &&
+                          ((SPEvent *)sp_events.lastObject)->type == SPKeyUp,
+                          @"The early-moving press still releases Space exactly once on lift.");
+            [view layoutIfNeeded];
         } @catch (NSException *e) { done(e.reason); return; }
         sp_test_space_hold(view, done);
     });

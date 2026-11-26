@@ -1,6 +1,7 @@
 // Optional touch-owned keyboard keys. Modifier squares drag like R. The whole Space circle presses
 // its key and starts the joystick's timed unlock; after two seconds, release Space and allow moving.
 static NSString *const sp_keyboard_size_key = @"sp_keyboard_size";
+static NSString *sp_space_last_release;
 static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, sp_keyboard_max_size = 152;
 
 @interface SPKeyboardButton : UIControl <SPMovableControl>
@@ -10,7 +11,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 @property(nonatomic) BOOL editingPosition;
 - (instancetype)initWithName:(NSString *)name label:(NSString *)label usage:(unsigned)usage position:(CGPoint)position;
 - (void)layoutInRect:(CGRect)rect;
-- (void)cancelInput;
+- (void)cancelInputWithReason:(NSString *)reason;
 - (void)setActionActive:(BOOL)active;
 - (void)syncWithEvent:(UIEvent *)event;
 - (BOOL)containsKeyPoint:(CGPoint)point;
@@ -34,7 +35,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 @implementation SPKeyboardButton {
     NSString *_name, *_enabledKey, *_positionKey;
     unsigned _usage;
-    BOOL _actionActive;
+    BOOL _actionActive, _layoutDeferred;
     UIView *_face;
     UILabel *_label;
     SPJoystickHandle *_handle;
@@ -98,24 +99,33 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 }
 - (void)setEditingPosition:(BOOL)editingPosition {
     if (_editingPosition == editingPosition) return;
-    [self cancelInput];
+    [self cancelInputWithReason:@"edit mode changed"];
     _editingPosition = editingPosition;
 }
-- (void)releaseKey {
+- (void)releaseKeyWithReason:(NSString *)reason {
     _latched = NO;
-    if (_keyDown) sp_touch_key(_usage, NO);
+    if (_keyDown) {
+        if (_usage == 0x2C) sp_space_last_release = reason;
+        sp_touch_key(_usage, NO);
+    }
     _keyDown = NO;
     [self setHighlighted:NO];
 }
-- (void)cancelInput {
-    [self releaseKey];
+- (void)flushDeferredLayout {
+    if (!_layoutDeferred) return;
+    _layoutDeferred = NO;
+    [self.superview setNeedsLayout];
+}
+- (void)cancelInputWithReason:(NSString *)reason {
+    [self releaseKeyWithReason:reason];
     _touch = nil;
     [self endMove];
     [_handle cancelTouch];
+    [self flushDeferredLayout];
 }
 - (void)didMoveToWindow {
     [super didMoveToWindow];
-    if (!self.window) [self cancelInput];
+    if (!self.window) [self cancelInputWithReason:@"detached from window"];
 }
 - (void)layoutInRect:(CGRect)rect {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
@@ -146,7 +156,17 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     CGRect centers = room ? CGRectInset(lane, outer / 2 + 8, outer / 2 + 8) : CGRectZero;
     BOOL enabled = [defaults objectForKey:_enabledKey] ? [defaults boolForKey:_enabledKey]
                                                        : !(_usage >= 0xE0 && _usage <= 0xE2);
-    if (!enabled || !room || !CGRectEqualToRect(centers, _centers)) [self cancelInput];
+    BOOL geometryChanged = !CGRectEqualToRect(centers, _centers) ||
+                           (room && outer != CGRectGetWidth(self.bounds));
+    if (enabled && room && geometryChanged && _handle && _touch && !_moving) {
+        // Keep Jump under the owning finger until lift. The resize invalidates the move ring's
+        // gesture, but Space stays down and the latest layout is applied once the touch ends.
+        if (!_layoutDeferred) [_handle cancelTouch];
+        _layoutDeferred = YES;
+        return;
+    }
+    if (!enabled || !room || geometryChanged)
+        [self cancelInputWithReason:!enabled ? @"disabled" : !room ? @"hidden or no room" : @"layout geometry changed"];
     self.hidden = !enabled || !room;
     if (self.hidden) return;
     _centers = centers;
@@ -236,17 +256,18 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
         BOOL activate = !_editingPosition && !_moving && [self containsKeyPoint:[_touch locationInView:self]];
         BOOL modifier = _usage >= 0xE0 && _usage <= 0xE2;
         if (activate && modifier && !_latched && _touch.tapCount == 2) _latched = YES;
-        else [self releaseKey];
+        else [self releaseKeyWithReason:@"touch ended"];
         _touch = nil;
         [self endMove];
+        [self flushDeferredLayout];
         if (activate && _action) _action();
     }
 }
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    if (_touch && [touches containsObject:_touch]) [self cancelInput];
+    if (_touch && [touches containsObject:_touch]) [self cancelInputWithReason:@"touch cancelled"];
 }
 - (void)beginMove:(UITouch *)touch {
-    [self releaseKey];
+    [self releaseKeyWithReason:@"move ring unlocked"];
     _moving = YES;
     _fingerStart = [touch locationInView:self.superview]; _centerStart = self.center;
 }

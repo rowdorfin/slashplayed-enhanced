@@ -29,12 +29,18 @@
 
 static NSUInteger sp_test_checks;
 static void sp_test_check(BOOL ok, NSString *message) {
-    // The input state rides along so a CI failure says whether a deactivation or a latched button caused it.
-    if (!ok) @throw [NSException exceptionWithName:@"Thumb input test failed"
-                                            reason:[NSString stringWithFormat:@"%@ [suspended=%d buttons=%lu keys=%lu events=%lu]",
-                                                    message, sp_input_suspended, (unsigned long)sp_mouse_buttons,
-                                                    (unsigned long)sp_touch_keys.count, (unsigned long)sp_events.count]
-                                          userInfo:nil];
+    if (!ok) {
+        NSMutableArray<NSString *> *events = [NSMutableArray array];
+        for (SPEvent *event in sp_events)
+            [events addObject:[NSString stringWithFormat:@"%lu:%u", (unsigned long)event->type, event->keyCode]];
+        @throw [NSException exceptionWithName:@"Thumb input test failed"
+                                       reason:[NSString stringWithFormat:
+                                               @"%@ [suspended=%d frozen=%d hud=%d buttons=%lu keys=%lu events=%@ spaceRelease=%@]",
+                                               message, sp_input_suspended, sp_mouse_frozen, sp_touch_hud(),
+                                               (unsigned long)sp_mouse_buttons, (unsigned long)sp_touch_keys.count,
+                                               [events componentsJoinedByString:@","], sp_space_last_release ?: @"none"]
+                                     userInfo:nil];
+    }
     sp_test_checks++;
 }
 static SPTestTouch *sp_test_touch(UIView *target, CGPoint at) {
