@@ -508,7 +508,7 @@ struct SettingsView: View {
                     settings.reload()
                 })) {
                     Text("Botões 1–0 (T008-B)").tag(0)
-                    Text("HUD 2.0 (addon SPTouchHUD)").tag(1)
+                    Text("HUD 3.0 (addon SPTouchHUD)").tag(1)
                 }
                 Picker("Lado dos controles", selection: Binding(get: { settings.now.touchLeftHanded }, set: {
                     UserDefaults.standard.set($0, forKey: touchLeftHandedKey)
