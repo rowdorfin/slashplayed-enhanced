@@ -11,6 +11,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 - (instancetype)initWithName:(NSString *)name label:(NSString *)label usage:(unsigned)usage position:(CGPoint)position;
 - (void)layoutInRect:(CGRect)rect;
 - (void)cancelInput;
+- (void)setActionActive:(BOOL)active;
 - (void)syncWithEvent:(UIEvent *)event;
 - (BOOL)containsKeyPoint:(CGPoint)point;
 @end
@@ -33,6 +34,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 @implementation SPKeyboardButton {
     NSString *_name, *_enabledKey, *_positionKey;
     unsigned _usage;
+    BOOL _actionActive;
     UIView *_face;
     UILabel *_label;
     SPJoystickHandle *_handle;
@@ -82,12 +84,17 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 }
 - (NSString *)name { return _name; }
 - (void)setHighlighted:(BOOL)highlighted {
+    highlighted = highlighted || _actionActive;
     [super setHighlighted:highlighted];
     UIColor *gold = [UIColor colorWithRed:0.78 green:0.73 blue:0.59 alpha:1];
     _face.backgroundColor = highlighted ? gold : [UIColor colorWithWhite:0.06 alpha:0.8];
     _face.layer.borderColor = [gold colorWithAlphaComponent:highlighted ? 1 : 0.7].CGColor;
     _label.textColor = highlighted ? [UIColor colorWithWhite:0.06 alpha:1] : gold;
     self.accessibilityValue = _face.accessibilityValue = highlighted ? @"Held" : @"Released";
+}
+- (void)setActionActive:(BOOL)active {
+    _actionActive = active;
+    [self setHighlighted:NO];
 }
 - (void)setEditingPosition:(BOOL)editingPosition {
     if (_editingPosition == editingPosition) return;
@@ -134,7 +141,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     CGRect lane = rect;
     if (room && _compactColumn) {
         lane.size.width = (CGRectGetWidth(rect) - 76) / 2;
-        if (_defaultPosition.x == 1) lane.origin.x = CGRectGetMaxX(rect) - lane.size.width;
+        if (sp_touch_x(_defaultPosition.x) == 1) lane.origin.x = CGRectGetMaxX(rect) - lane.size.width;
     }
     CGRect centers = room ? CGRectInset(lane, outer / 2 + 8, outer / 2 + 8) : CGRectZero;
     BOOL enabled = [defaults objectForKey:_enabledKey] ? [defaults boolForKey:_enabledKey]
@@ -157,7 +164,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
         }
     }
     self.bounds = CGRectMake(0, 0, outer, outer);
-    self.center = CGPointMake(centers.origin.x + centers.size.width * _position.x,
+    self.center = CGPointMake(centers.origin.x + centers.size.width * sp_touch_x(_position.x),
                              centers.origin.y + centers.size.height * _position.y);
     CGFloat face = outer - ring;
     _face.bounds = CGRectMake(0, 0, face, _handle ? MAX(32, face * 0.58) : face);
@@ -248,7 +255,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     CGPoint p = [touch locationInView:self.superview];
     self.center = CGPointMake(MAX(CGRectGetMinX(_centers), MIN(CGRectGetMaxX(_centers), _centerStart.x + p.x - _fingerStart.x)),
                               MAX(CGRectGetMinY(_centers), MIN(CGRectGetMaxY(_centers), _centerStart.y + p.y - _fingerStart.y)));
-    _position = CGPointMake(_centers.size.width ? (self.center.x - _centers.origin.x) / _centers.size.width : 0,
+    _position = CGPointMake(sp_touch_x(_centers.size.width ? (self.center.x - _centers.origin.x) / _centers.size.width : 0.5),
                             _centers.size.height ? (self.center.y - _centers.origin.y) / _centers.size.height : 0);
 }
 - (void)endMove {

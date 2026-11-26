@@ -810,11 +810,14 @@ int main(int argc, char **argv) {
     skip_intro(flavor);
     flavor_info(flavor);
     // The addons the app carries, into the game's folder before the client loads (sp_addons_place): SPMovie
-    // everywhere and SPHover on the headset. Also retire the old bundled touch bars from Forever.
+    // everywhere, SPHover on the headset, and SPTouchHUD on opt-in iOS Forever installs.
     NSString *addons = nil;
-    sp_addons_place([dir stringByAppendingPathComponent:@"addons"],
+    BOOL placedAddons = sp_addons_place([dir stringByAppendingPathComponent:@"addons"],
                     [NSHomeDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"Documents/_%@_", flavor]],
                     flavor, TARGET_OS_VISION, &addons);
+    // The shim keeps its numbered keys when this build could not install the selected HUD.
+    if (placedAddons) unsetenv("SP_TOUCH_HUD_UNAVAILABLE");
+    else setenv("SP_TOUCH_HUD_UNAVAILABLE", "1", 1);
     say(addons);
     // Download the optional bag addon once, directly from its publisher. The cached ZIP also repairs
     // missing files offline, and a failed download never prevents starting the game.

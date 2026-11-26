@@ -53,6 +53,85 @@ static void sp_test_action_and_movement(SPInputView *view, SPJoystick *stick) {
     [view setNeedsLayout]; [view layoutIfNeeded];
 }
 
+static void sp_test_hud_multitouch(SPInputView *view, SPJoystick *stick) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    setenv("SP_SYSTEM_FLAVOR", "_forever_", 1);
+    [defaults setInteger:1 forKey:@"sp_touch_hud_mode"];
+    [defaults setBool:YES forKey:@"sp_autorun_enabled"];
+    [view setNeedsLayout]; [view layoutIfNeeded];
+    for (NSString *digit in @[@"1", @"2", @"3", @"4", @"5", @"6", @"7", @"8", @"9", @"0"]) {
+        sp_test_check(sp_test_keyboard_button(view, [@"action_" stringByAppendingString:digit]).hidden,
+                      @"HUD mode hides all ten digit buttons.");
+    }
+    sp_test_check(sp_test_keyboard_button(view, @"tab").hidden && !stick.hidden &&
+                  !sp_test_keyboard_button(view, @"chat").hidden,
+                  @"HUD mode hides Tab and preserves movement and chat.");
+
+    SPKeyboardButton *run = sp_test_keyboard_button(view, @"autorun");
+    sp_test_check(!run.hidden, @"The explicit autorun control is available with WASD.");
+    SPTestTouch *runner = sp_test_touch(run, run.center);
+    SPTestEvent *runEvent = sp_test_event(@[runner]);
+    [sp_events removeAllObjects];
+    sp_test_send(runner, UITouchPhaseBegan, runEvent);
+    sp_test_send(runner, UITouchPhaseEnded, runEvent);
+    sp_test_check(run.highlighted && [sp_touch_keys containsIndex:0x1A] && sp_events.count == 1,
+                  @"Lifting Correr latches W once.");
+    SPTestTouch *walk = sp_test_touch(stick, CGPointMake(stick.center.x - 40, stick.center.y));
+    SPTestTouch *camera = sp_test_touch(view, CGPointMake(450, 220));
+    SPTestTouch *tap = sp_test_touch(view, CGPointMake(605, 290));
+    SPTestEvent *event = sp_test_event(@[walk, camera, tap]);
+    sp_test_send(walk, UITouchPhaseBegan, event);
+    sp_test_check(!run.highlighted && ![sp_touch_keys containsIndex:0x1A] && [sp_touch_keys containsIndex:0x04],
+                  @"A fresh joystick touch clears autorun and immediately owns movement.");
+
+    [sp_events removeAllObjects];
+    sp_test_send(tap, UITouchPhaseBegan, event);
+    sp_test_send(tap, UITouchPhaseEnded, event);
+    sp_test_check([sp_test_buttons() isEqual:@[@(SPLeftMouseDown), @(SPLeftMouseUp)]] &&
+                  [sp_touch_keys containsIndex:0x04], @"Walking and tapping the HUD emit one click without changing movement.");
+
+    sp_test_send(camera, UITouchPhaseBegan, event);
+    camera.at = CGPointMake(475, 230);
+    sp_test_send(camera, UITouchPhaseMoved, event);
+    tap = sp_test_touch(view, CGPointMake(605, 290));
+    event = sp_test_event(@[walk, camera, tap]);
+    sp_set_mouse_frozen(YES);
+    [sp_events removeAllObjects];
+    sp_test_send(tap, UITouchPhaseBegan, event);
+    sp_test_send(tap, UITouchPhaseEnded, event);
+    sp_test_check([sp_test_buttons() isEqual:@[@(SPRightMouseUp), @(SPLeftMouseDown), @(SPLeftMouseUp), @(SPRightMouseDown)]],
+                  @"A HUD tap pauses mouselook around exactly one click and resumes it.");
+    for (SPEvent *input in sp_events) {
+        if (input->type == SPLeftMouseDown || input->type == SPLeftMouseUp)
+            sp_test_check(CGPointEqualToPoint(input->location, sp_from_uikit(tap.at)),
+                          @"Both events click the tap point even with a frozen cursor.");
+    }
+    camera.at = CGPointMake(480, 240);
+    sp_test_send(camera, UITouchPhaseMoved, event);
+    SPEvent *drag = sp_events.lastObject;
+    sp_test_check(drag->type == SPRightMouseDragged && fabs(drag->deltaX) < 15 &&
+                  [sp_touch_keys containsIndex:0x04], @"Mouselook resumes from its finger without a jump or a movement release.");
+    [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationDidEnterBackgroundNotification object:nil];
+    sp_test_check(!sp_touch_keys.count && !sp_mouse_buttons, @"Background releases movement and mouselook.");
+    sp_test_send(tap, UITouchPhaseEnded, event);
+    sp_test_send(walk, UITouchPhaseMoved, event);
+    sp_test_check(!sp_touch_keys.count && !sp_mouse_buttons, @"Stale touches cannot press input after backgrounding.");
+    sp_set_mouse_frozen(NO);
+    [view sp_resume_touch:nil];
+    runner = sp_test_touch(run, run.center);
+    runEvent = sp_test_event(@[runner]);
+    sp_test_send(runner, UITouchPhaseBegan, runEvent);
+    sp_test_send(runner, UITouchPhaseEnded, runEvent);
+    sp_test_check([sp_touch_keys containsIndex:0x1A], @"Autorun can be re-engaged after activation.");
+    [view sp_suspend_touch:nil];
+    sp_test_check(!run.highlighted && !sp_touch_keys.count, @"Resigning active clears the autorun latch.");
+    [view sp_resume_touch:nil];
+    [defaults removeObjectForKey:@"sp_touch_hud_mode"];
+    [defaults removeObjectForKey:@"sp_autorun_enabled"];
+    unsetenv("SP_SYSTEM_FLAVOR");
+    [view setNeedsLayout]; [view layoutIfNeeded];
+}
+
 static void sp_test_keyboard(SPInputView *view, SPThumbButton *thumb) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults removeObjectForKey:sp_keyboard_size_key];

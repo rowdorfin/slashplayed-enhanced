@@ -90,7 +90,7 @@ static const CGFloat sp_thumb_default_size = 76, sp_thumb_min_size = 44, sp_thum
     self.bounds = CGRectMake(0, 0, size, size);
     _label.font = [UIFont systemFontOfSize:round(size * 18 / 52) weight:UIFontWeightSemibold];
     self.layer.cornerRadius = MIN(16, size * 8 / 52);
-    self.center = CGPointMake(centers.origin.x + centers.size.width * _position.x,
+    self.center = CGPointMake(centers.origin.x + centers.size.width * sp_touch_x(_position.x),
                              centers.origin.y + centers.size.height * _position.y);
 }
 
@@ -129,7 +129,7 @@ static BOOL sp_thumb_touch_active(UITouch *touch) {
     if (!_dragging && hypot(dx, dy) < 10) return;
     _dragging = YES;
     self.center = [self clampedCenter:CGPointMake(_centerStart.x + dx, _centerStart.y + dy)];
-    _position = CGPointMake(_centers.size.width ? (self.center.x - _centers.origin.x) / _centers.size.width : 0,
+    _position = CGPointMake(sp_touch_x(_centers.size.width ? (self.center.x - _centers.origin.x) / _centers.size.width : 0.5),
                             _centers.size.height ? (self.center.y - _centers.origin.y) / _centers.size.height : 0);
 }
 

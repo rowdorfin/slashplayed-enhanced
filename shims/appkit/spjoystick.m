@@ -18,6 +18,9 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 @property(nonatomic, readonly) CGPoint value;
 @property(nonatomic, readonly) GCController *controller;
 - (void)layoutInRect:(CGRect)rect;
+@property(nonatomic, copy) void (^autorunChanged)(BOOL);
+- (void)toggleAutorun;
+- (void)stopAutorun;
 - (void)cancelInput;
 - (void)setSuspended:(BOOL)suspended;
 - (void)gameDidStart;
@@ -165,10 +168,11 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     SPJoystickShield *_shield;
     UITouch *_stickTouch;
     GCVirtualController *_virtualController;
-    CGPoint _value, _position, _fingerStart, _centerStart;
+    CGPoint _value, _position, _fingerStart, _centerStart, _stickOrigin;
     CGRect _centers;
     BOOL _moving, _suspended, _connected, _gameReady, _requested, _analog;
     unsigned _movementKeys;
+    BOOL _autorun;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -226,7 +230,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     for (unsigned i = 0; i < 4; i++) {
         unsigned bit = 1 << i;
         BOOL held = (_movementKeys & bit) != 0;
-        BOOL next = !_analog && axes[i] >= (held ? 0.18 : 0.27);
+        BOOL next = !_analog && ((i == 0 && _autorun) || axes[i] >= (held ? 0.18 : 0.27));
         if (held == next) continue;
         _movementKeys ^= bit;
         sp_touch_key(usages[i], next);
@@ -234,7 +238,24 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     [self drawValue];
 }
 
+- (void)setAutorunActive:(BOOL)active {
+    if (_autorun == active) return;
+    _autorun = active;
+    [self sendValue:_value];
+    if (self.autorunChanged) self.autorunChanged(active);
+}
+
+- (void)toggleAutorun {
+    if (!_analog && !_suspended && !self.hidden && !_stickTouch) [self setAutorunActive:!_autorun];
+}
+
+- (void)stopAutorun { [self setAutorunActive:NO]; }
+
 - (void)cancelInput {
+    if (_autorun) {
+        _autorun = NO;
+        if (self.autorunChanged) self.autorunChanged(NO);
+    }
     _stickTouch = nil;
     [self sendValue:CGPointZero];
     [self endMove];
@@ -348,7 +369,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
         }
         self.bounds = CGRectMake(0, 0, size, size);
         self.layer.cornerRadius = size / 2;
-        self.center = CGPointMake(centers.origin.x + centers.size.width * _position.x,
+        self.center = CGPointMake(centers.origin.x + centers.size.width * sp_touch_x(_position.x),
                                  centers.origin.y + centers.size.height * _position.y);
         CGFloat handleSize = 44 * sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
         _handle.frame = CGRectMake(size - handleSize, 0, handleSize, handleSize);
@@ -381,11 +402,12 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 - (void)updateTouch:(UITouch *)touch {
     CGPoint p = [touch locationInView:self];
     CGFloat travel = self.bounds.size.width * 0.30;
-    CGFloat x = (p.x - self.bounds.size.width / 2) / travel;
-    CGFloat y = (self.bounds.size.height / 2 - p.y) / travel;
+    CGFloat x = (p.x - _stickOrigin.x) / travel;
+    CGFloat y = (_stickOrigin.y - p.y) / travel;
     CGFloat length = hypot(x, y);
     // A radial dead zone removes thumb jitter while preserving every diagonal and analog speed.
-    CGFloat strength = MIN(1, MAX(0, (length - 0.12) / 0.88));
+    CGFloat deadzone = sp_touch_number(@"sp_joystick_deadzone", 0.12, 0, 0.5);
+    CGFloat strength = MIN(1, MAX(0, (length - deadzone) / (1 - deadzone)));
     [self sendValue:length > 0 ? CGPointMake(x / length * strength, y / length * strength) : CGPointZero];
 }
 
@@ -410,6 +432,10 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
             sp_stub_log("input: virtual left joystick recovered foreground touch");
         }
         if (_suspended) return;
+        [self stopAutorun];
+        _stickOrigin = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+        if ([NSUserDefaults.standardUserDefaults boolForKey:@"sp_joystick_floating"])
+            _stickOrigin = [touch locationInView:self];
         _stickTouch = touch;
         _requested = YES;
         [self updateConnection];
@@ -429,6 +455,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 
 - (void)beginMove:(UITouch *)touch {
     _stickTouch = nil;
+    [self stopAutorun];
     [self sendValue:CGPointZero];
     [self endMove];
     _moving = YES;
@@ -440,7 +467,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     CGPoint p = [touch locationInView:self.superview];
     self.center = CGPointMake(MAX(CGRectGetMinX(_centers), MIN(CGRectGetMaxX(_centers), _centerStart.x + p.x - _fingerStart.x)),
                               MAX(CGRectGetMinY(_centers), MIN(CGRectGetMaxY(_centers), _centerStart.y + p.y - _fingerStart.y)));
-    _position = CGPointMake(_centers.size.width ? (self.center.x - _centers.origin.x) / _centers.size.width : 0,
+    _position = CGPointMake(sp_touch_x(_centers.size.width ? (self.center.x - _centers.origin.x) / _centers.size.width : 0.5),
                             _centers.size.height ? (self.center.y - _centers.origin.y) / _centers.size.height : 0);
 }
 - (void)endMove {

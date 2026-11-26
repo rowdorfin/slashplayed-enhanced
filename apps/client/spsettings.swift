@@ -49,6 +49,12 @@ private let joystickSizeKey = "sp_joystick_size"
 private let joystickDefaultSize = 156.0
 private let joystickSizeRange = 100.0...260.0
 // Optional keyboard overlays use the same literals and size limits as spkeys.m.
+private let touchHUDModeKey = "sp_touch_hud_mode"
+private let touchLeftHandedKey = "sp_touch_left_handed"
+private let touchCameraSensitivityKey = "sp_touch_camera_sensitivity"
+private let joystickFloatingKey = "sp_joystick_floating"
+private let joystickDeadzoneKey = "sp_joystick_deadzone"
+private let autorunKey = "sp_autorun_enabled"
 private let touchControlsKey = "sp_touch_controls_enabled"
 private let touchScaleKey = "sp_touch_controls_scale"
 private let touchOpacityKey = "sp_touch_controls_opacity"
@@ -152,6 +158,12 @@ struct Snapshot {
     var chordRightFinger = false
     var thumbEnabled = true
     var thumbSize = thumbDefaultSize
+    var touchHUDMode = 0
+    var touchLeftHanded = false
+    var touchCameraSensitivity = 1.0
+    var joystickFloating = false
+    var joystickDeadzone = 0.12
+    var autorun = false
     var touchControls = false
     var touchScale = 1.0
     var touchOpacity = 1.0
@@ -200,6 +212,14 @@ final class Settings: ObservableObject {
         s.thumbEnabled = UserDefaults.standard.object(forKey: thumbEnabledKey) as? Bool ?? true
         let thumbSize = (UserDefaults.standard.object(forKey: thumbSizeKey) as? NSNumber)?.doubleValue ?? thumbDefaultSize
         s.thumbSize = thumbSize.isFinite ? min(thumbSizeRange.upperBound, max(thumbSizeRange.lowerBound, thumbSize)) : thumbDefaultSize
+        let defaults = UserDefaults.standard
+        s.touchHUDMode = defaults.integer(forKey: touchHUDModeKey) == 1 ? 1 : 0
+        s.touchLeftHanded = defaults.bool(forKey: touchLeftHandedKey)
+        s.touchCameraSensitivity = touchControlValue(touchCameraSensitivityKey, in: 0.25...3)
+        s.joystickFloating = defaults.bool(forKey: joystickFloatingKey)
+        let deadzone = (defaults.object(forKey: joystickDeadzoneKey) as? NSNumber)?.doubleValue ?? 0.12
+        s.joystickDeadzone = deadzone.isFinite ? min(0.5, max(0, deadzone)) : 0.12
+        s.autorun = defaults.bool(forKey: autorunKey)
         s.touchControls = UserDefaults.standard.bool(forKey: touchControlsKey)
         s.touchScale = touchControlValue(touchScaleKey, in: 0.6...1.6)
         s.touchOpacity = touchControlValue(touchOpacityKey, in: 0.2...1.0)
@@ -480,6 +500,26 @@ struct SettingsView: View {
                     UserDefaults.standard.set($0, forKey: touchControlsKey)
                     settings.reload()
                 }))
+                Picker("Barra de habilidades", selection: Binding(get: { settings.now.touchHUDMode }, set: {
+                    UserDefaults.standard.set($0, forKey: touchHUDModeKey)
+                    settings.reload()
+                })) {
+                    Text("Botões 1–0 (T008-B)").tag(0)
+                    Text("HUD 2.0 (addon SPTouchHUD)").tag(1)
+                }
+                Picker("Lado dos controles", selection: Binding(get: { settings.now.touchLeftHanded }, set: {
+                    UserDefaults.standard.set($0, forKey: touchLeftHandedKey)
+                    settings.reload()
+                })) {
+                    Text("Destro").tag(false)
+                    Text("Canhoto").tag(true)
+                }
+                LabeledContent("Sensibilidade da câmera", value: "\(Int((settings.now.touchCameraSensitivity * 100).rounded()))%")
+                Slider(value: Binding(get: { settings.now.touchCameraSensitivity }, set: {
+                    settings.now.touchCameraSensitivity = $0
+                    UserDefaults.standard.set($0, forKey: touchCameraSensitivityKey)
+                }), in: 0.25...3, step: 0.05)
+                .accessibilityLabel("Sensibilidade da câmera")
                 LabeledContent("Escala", value: "\(Int((settings.now.touchScale * 100).rounded()))%")
                 Slider(value: Binding(get: { settings.now.touchScale }, set: {
                     settings.now.touchScale = $0
@@ -498,7 +538,7 @@ struct SettingsView: View {
             } header: {
                 Text("On-screen controls")
             } footer: {
-                Text("Desativados por padrão. Em jogo, use ··· para esconder, mostrar ou mover os botões.")
+                Text("O HUD 2.0 carrega ao iniciar Forever. Em jogo, use ··· para esconder, mostrar ou mover os controles nativos.")
             }
             Section {
                 LabeledContent("Click With") {
@@ -701,6 +741,24 @@ struct SettingsView: View {
                 .accessibilityLabel("Joystick Size")
             }
             .disabled(!settings.now.joystickEnabled)
+            Picker("Centro do joystick", selection: Binding(get: { settings.now.joystickFloating }, set: {
+                UserDefaults.standard.set($0, forKey: joystickFloatingKey)
+                settings.reload()
+            })) {
+                Text("Fixo").tag(false)
+                Text("Flutuante dentro do joystick").tag(true)
+            }
+            LabeledContent("Zona morta", value: "\(Int((settings.now.joystickDeadzone * 100).rounded()))%")
+            Slider(value: Binding(get: { settings.now.joystickDeadzone }, set: {
+                settings.now.joystickDeadzone = $0
+                UserDefaults.standard.set($0, forKey: joystickDeadzoneKey)
+            }), in: 0...0.5, step: 0.01)
+            .accessibilityLabel("Zona morta do joystick")
+            Toggle("Botão Correr (W)", isOn: Binding(get: { settings.now.autorun }, set: {
+                UserDefaults.standard.set($0, forKey: autorunKey)
+                settings.reload()
+            }))
+            .disabled(settings.now.joystickAnalog)
             Button("Reset Position") {
                 UserDefaults.standard.removeObject(forKey: joystickPositionKey)
             }

@@ -184,8 +184,9 @@ static void sp_test_run(SPInputView *view, SPThumbButton *thumb) {
     [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationWillResignActiveNotification object:nil];
     sp_test_check(!thumb.highlighted && sp_mouse_buttons == 0, @"App deactivation releases the modifier and game button.");
     sp_test_check([sp_test_buttons() isEqual:@[@(SPRightMouseDown), @(SPRightMouseUp)]], @"Cancellation balances right-down with right-up.");
+    [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationDidBecomeActiveNotification object:nil];
     [sp_events removeAllObjects]; sp_test_tap(view, @[]);
-    sp_test_check([sp_test_buttons() isEqual:@[@(SPLeftMouseDown), @(SPLeftMouseUp)]], @"Input recovers after deactivation.");
+    sp_test_check([sp_test_buttons() isEqual:@[@(SPLeftMouseDown), @(SPLeftMouseUp)]], @"Input recovers on reactivation.");
 
     [defaults setBool:NO forKey:sp_thumb_enabled_key]; [view setNeedsLayout]; [view layoutIfNeeded];
     sp_test_check(thumb.hidden && ![thumb heldInEvent:both], @"Settings can disable the modifier.");
@@ -292,9 +293,14 @@ static void sp_test_pencil(SPInputView *view, SPThumbButton *thumb) {
     sp_window = self.window;
     UIViewController *controller = [UIViewController new];
     unsetenv("SP_GAME_TOUCH");
+    unsetenv("SP_SYSTEM_FLAVOR");
+    unsetenv("SP_TOUCH_HUD_UNAVAILABLE");
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults removeObjectForKey:@"sp_touch_controls_enabled"];
     [defaults removeObjectForKey:@"sp_joystick_analog"];
+    for (NSString *key in @[@"sp_touch_hud_mode", @"sp_autorun_enabled", @"sp_touch_left_handed",
+                            @"sp_joystick_floating", @"sp_joystick_deadzone", @"sp_touch_camera_sensitivity"])
+        [defaults removeObjectForKey:key];
     [defaults removeObjectForKey:@"sp_action_1_enabled"];
     [defaults removeObjectForKey:@"sp_action_1_position"];
     [defaults removeObjectForKey:@"sp_touch_controls_scale"];
@@ -332,6 +338,7 @@ static void sp_test_pencil(SPInputView *view, SPThumbButton *thumb) {
         @try {
             sp_test_check(thumb && !thumb.hidden && stick && !stick.hidden, @"Enabling the preference creates the overlay on the existing view.");
             sp_test_action_and_movement(view, stick);
+            sp_test_hud_multitouch(view, stick);
             // The legacy margin fixtures isolate the original controls when probing clear areas.
             for (NSString *name in @[@"tab", @"chat", @"zoom_in", @"zoom_out"])
                 [defaults setBool:NO forKey:[NSString stringWithFormat:@"sp_%@_enabled", name]];

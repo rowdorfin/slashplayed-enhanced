@@ -73,6 +73,18 @@ static void sp_test_shield(SPInputView *view, SPThumbButton *thumb, SPJoystick *
     [stick layoutInRect:safe];
     [sp_events removeAllObjects];
 }
+static void sp_test_wait_joystick_progress(CAShapeLayer *progress, NSTimeInterval deadline,
+                                           void (^done)(NSString *)) {
+    CGFloat visible = ((CAShapeLayer *)progress.presentationLayer).strokeEnd;
+    if (progress && visible > 0 && visible < 1) { done(nil); return; }
+    if (NSProcessInfo.processInfo.systemUptime >= deadline) {
+        done(@"The move arrow visibly fills its border while waiting.");
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 60), dispatch_get_main_queue(), ^{
+        sp_test_wait_joystick_progress(progress, deadline, done);
+    });
+}
 static void sp_test_move_hold(SPInputView *view, SPJoystick *stick, void (^done)(NSString *)) {
     SPJoystickHandle *handle;
     for (UIView *child in stick.subviews) if ([child isKindOfClass:SPJoystickHandle.class]) handle = (id)child;
@@ -84,47 +96,50 @@ static void sp_test_move_hold(SPInputView *view, SPJoystick *stick, void (^done)
     sp_test_send(tap, UITouchPhaseEnded, sp_test_event(@[tap]));
     SPTestTouch *hold = sp_test_touch(handle, at);
     sp_test_send(hold, UITouchPhaseBegan, sp_test_event(@[hold]));
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        @try {
-            sp_test_check(!handle.highlighted && CGPointEqualToPoint(stick.center, center), @"A one-second arrow hold cannot reposition the joystick.");
-            CAShapeLayer *progress = nil;
-            for (CALayer *layer in handle.layer.sublayers) if ([layer isKindOfClass:CAShapeLayer.class]) progress = (id)layer;
-            CGFloat visibleProgress = ((CAShapeLayer *)progress.presentationLayer).strokeEnd;
-            sp_test_check(progress && visibleProgress > 0 && visibleProgress < 1, @"The move arrow visibly fills its border while waiting.");
-            hold.at = CGPointMake(at.x + 2, at.y);
-            sp_test_send(hold, UITouchPhaseMoved, sp_test_event(@[hold]));
-        } @catch (NSException *e) { done(e.reason); return; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 13 * NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
+    CAShapeLayer *progress = nil;
+    for (CALayer *layer in handle.layer.sublayers) if ([layer isKindOfClass:CAShapeLayer.class]) progress = (id)layer;
+    NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
+    sp_test_wait_joystick_progress(progress, started + 1.8, ^(NSString *error) {
+        if (error) { done(error); return; }
+        NSTimeInterval untilOneSecond = MAX(0, started + 1 - NSProcessInfo.processInfo.systemUptime);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(untilOneSecond * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @try {
-                sp_test_check(handle.highlighted, @"A real two-second hold unlocks the move arrow.");
-                sp_test_check(CGPointEqualToPoint(stick.center, center), @"Unlocking does not jump the joystick after minor thumb drift.");
-                [sp_events removeAllObjects];
-                hold.at = CGPointMake(at.x + 180, at.y - 160);
+                sp_test_check(!handle.highlighted && CGPointEqualToPoint(stick.center, center), @"A one-second arrow hold cannot reposition the joystick.");
+                hold.at = CGPointMake(at.x + 2, at.y);
                 sp_test_send(hold, UITouchPhaseMoved, sp_test_event(@[hold]));
-                sp_test_check(!CGPointEqualToPoint(stick.center, center), @"Dragging after the hold repositions the joystick.");
-                sp_test_check(CGPointEqualToPoint(stick.value, CGPointZero) && sp_events.count == 0, @"An unlocked move still emits neither character movement nor clicks.");
-                CGPoint moved = stick.center;
-                sp_test_send(hold, UITouchPhaseEnded, sp_test_event(@[hold]));
-                sp_test_check(!handle.highlighted, @"Lifting the thumb relocks the move arrow.");
-                sp_test_check([defaults arrayForKey:sp_joystick_position_key].count == 2, @"The held-and-dragged position is saved.");
-                SPJoystick *restored = [[SPJoystick alloc] initWithFrame:CGRectZero]; [restored layoutInRect:safe];
-                sp_test_check(hypot(restored.center.x - moved.x, restored.center.y - moved.y) < 0.01, @"A fresh joystick restores the held-and-dragged position.");
             } @catch (NSException *e) { done(e.reason); return; }
-            CGPoint moved = stick.center;
-            CGPoint newAt = [view convertPoint:CGPointMake(22, 22) fromView:handle];
-            SPTestTouch *cancelled = sp_test_touch(handle, newAt);
-            sp_test_send(cancelled, UITouchPhaseBegan, sp_test_event(@[cancelled]));
-            [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationWillResignActiveNotification object:nil];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 23 * NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 13 * NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
                 @try {
-                    sp_test_check(!handle.highlighted && CGPointEqualToPoint(stick.center, moved), @"An app switch cancels the pending two-second unlock.");
-                    cancelled.at = CGPointMake(newAt.x + 120, newAt.y - 80);
-                    sp_test_send(cancelled, UITouchPhaseMoved, sp_test_event(@[cancelled]));
-                    sp_test_check(CGPointEqualToPoint(stick.center, moved), @"A cancelled hold cannot drag the joystick later.");
-                    [defaults removeObjectForKey:sp_joystick_position_key]; [stick layoutInRect:safe];
-                    [view sp_resume_touch:nil];
+                    sp_test_check(handle.highlighted, @"A real two-second hold unlocks the move arrow.");
+                    sp_test_check(CGPointEqualToPoint(stick.center, center), @"Unlocking does not jump the joystick after minor thumb drift.");
+                    [sp_events removeAllObjects];
+                    hold.at = CGPointMake(at.x + 180, at.y - 160);
+                    sp_test_send(hold, UITouchPhaseMoved, sp_test_event(@[hold]));
+                    sp_test_check(!CGPointEqualToPoint(stick.center, center), @"Dragging after the hold repositions the joystick.");
+                    sp_test_check(CGPointEqualToPoint(stick.value, CGPointZero) && sp_events.count == 0, @"An unlocked move still emits neither character movement nor clicks.");
+                    CGPoint moved = stick.center;
+                    sp_test_send(hold, UITouchPhaseEnded, sp_test_event(@[hold]));
+                    sp_test_check(!handle.highlighted, @"Lifting the thumb relocks the move arrow.");
+                    sp_test_check([defaults arrayForKey:sp_joystick_position_key].count == 2, @"The held-and-dragged position is saved.");
+                    SPJoystick *restored = [[SPJoystick alloc] initWithFrame:CGRectZero]; [restored layoutInRect:safe];
+                    sp_test_check(hypot(restored.center.x - moved.x, restored.center.y - moved.y) < 0.01, @"A fresh joystick restores the held-and-dragged position.");
                 } @catch (NSException *e) { done(e.reason); return; }
-                sp_test_wait_stick(stick, 120, done);
+                CGPoint moved = stick.center;
+                CGPoint newAt = [view convertPoint:CGPointMake(22, 22) fromView:handle];
+                SPTestTouch *cancelled = sp_test_touch(handle, newAt);
+                sp_test_send(cancelled, UITouchPhaseBegan, sp_test_event(@[cancelled]));
+                [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationWillResignActiveNotification object:nil];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 23 * NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
+                    @try {
+                        sp_test_check(!handle.highlighted && CGPointEqualToPoint(stick.center, moved), @"An app switch cancels the pending two-second unlock.");
+                        cancelled.at = CGPointMake(newAt.x + 120, newAt.y - 80);
+                        sp_test_send(cancelled, UITouchPhaseMoved, sp_test_event(@[cancelled]));
+                        sp_test_check(CGPointEqualToPoint(stick.center, moved), @"A cancelled hold cannot drag the joystick later.");
+                        [defaults removeObjectForKey:sp_joystick_position_key]; [stick layoutInRect:safe];
+                        [view sp_resume_touch:nil];
+                    } @catch (NSException *e) { done(e.reason); return; }
+                    sp_test_wait_stick(stick, 120, done);
+                });
             });
         });
     });
