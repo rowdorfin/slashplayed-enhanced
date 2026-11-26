@@ -86,6 +86,9 @@ jobs:
       - name: Test the BC decoder and layout with sanitizers
         run: CC=clang shims/metal/tests/run.sh
 
+      - name: Test Forever graphics presets
+        run: apps/client/tests/graphics.sh
+
       - name: Build and hash the diagnostic kit
         env:
           SP_A16_BUILD_SHA: ${{ github.sha }}

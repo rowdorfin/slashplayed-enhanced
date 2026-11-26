@@ -17,3 +17,23 @@ cc -O1 -Wall -o "$OUT/decode" decode.c -lm
 "${LUA:-lua}" spmovie.lua ../SPMovie/SPMovie.lua
 "${LUA:-lua}" sptouchbars.lua ../SPTouchBars/SPTouchBars.lua
 "${LUA:-lua}" sptouchhud.lua ../SPTouchHUD/SPTouchHUD.lua
+
+# Fallback can only retire files whose exact packaged fingerprint is recorded by the launcher.
+awk '/^static .*sp_retire_touch_hud\(/ { recording = 1 } recording { print } recording && /^}/ { exit }' \
+    ../../apps/client/spcdn.m > "$OUT/sptouchhud-fingerprints"
+for ext in toc lua; do
+    name="SPTouchHUD.$ext"
+    path="../SPTouchHUD/$name"
+    size=$(wc -c < "$path" | tr -d '[:space:]')
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum "$path")
+    else
+        digest=$(shasum -a 256 "$path")
+    fi
+    digest=${digest%% *}
+    if ! grep -Fq "@\"$name\", $size, @\"$digest\"" "$OUT/sptouchhud-fingerprints"; then
+        echo "SPTouchHUD: update sp_retire_touch_hud with $name ($size bytes, SHA-256 $digest)" >&2
+        exit 1
+    fi
+done
+echo "SPTouchHUD: cleanup fingerprints match"

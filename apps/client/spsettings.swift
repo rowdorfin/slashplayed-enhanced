@@ -386,6 +386,8 @@ private struct DoneButton: ToolbarContent {
 
 struct SettingsView: View {
     @ObservedObject var settings: Settings
+    @AppStorage("sp_forever_graphics_preset") private var graphicsPreset = 0
+    @State private var graphicsRestoreFailed = false
     @State private var columns: NavigationSplitViewVisibility = .all
 
     var body: some View {
@@ -855,6 +857,28 @@ struct SettingsView: View {
                 }
             } else {
                 LabeledContent("Region", value: sp_region_name(g.region))
+            }
+            if g.flavor == "forever" {
+                Picker("Preset gráfico", selection: $graphicsPreset) {
+                    Text("Não alterar").tag(0)
+                    Text("Performance").tag(1)
+                    Text("Balanceado").tag(2)
+                    Text("Qualidade").tag(3)
+                }
+                Button("Restaurar configuração anterior") {
+                    if sp_graphics_restore() {
+                        graphicsPreset = 0
+                        settings.reload()
+                    } else {
+                        graphicsRestoreFailed = true
+                    }
+                }
+                .disabled(!sp_graphics_has_backup())
+                .alert("Falha ao restaurar configuração", isPresented: $graphicsRestoreFailed) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text("Confira o arquivo de backup em WTF e tente novamente.")
+                }
             }
             Button("Open in Files") { settings.openInFiles(g.flavor) }
             Button("Reset Game Settings", role: .destructive) { settings.confirmation = .reset(g.flavor) }

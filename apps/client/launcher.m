@@ -53,6 +53,7 @@
 #import "spcdn.h"  // sp_table_row, sp_build_info_for_image, sp_flavor_info
 #import "spaddons.h"
 #import "spsign.h"
+#include "spgraphics.h"
 
 static void say(NSString *s) {
     fprintf(stderr, "[sp:launch] %s\n", s.UTF8String);
@@ -181,25 +182,131 @@ static void write_free_space(void) {
                                    outright.doubleValue / 1e9]);
 }
 
-// Settings in the game's Config.wtf (`SET name "value"` lines): each of `cvars` ({name, value}) the file
-// doesn't have is added. A value the game or a person set stays. Makes the file (and WTF/) if there's none.
-// The names it set, empty for none; nil if it couldn't write the file. (The region's three are
-// sp_config_with_region's: game_region.)
+static NSString *config_wtf_directory(NSString *flavor) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"Documents/_%@_/WTF", flavor]];
+}
+
+static NSString *config_wtf_path(NSString *flavor) {
+    return [config_wtf_directory(flavor) stringByAppendingPathComponent:@"Config.wtf"];
+}
+
+// Read bytes directly to preserve line endings and unrelated values. A missing file and a read
+// error are distinct so applying a preset cannot overwrite a file that the launcher couldn't read.
+static NSMutableData *config_read(NSString *path, BOOL *missing) {
+    NSError *error = nil;
+    NSData *data = [NSData dataWithContentsOfFile:path options:0 error:&error];
+    *missing = !data && [error.domain isEqualToString:NSCocoaErrorDomain] && error.code == NSFileReadNoSuchFileError;
+    if ((!data && !*missing) || (data.length && memchr(data.bytes, 0, data.length))) return nil;
+    NSMutableData *terminated = data ? [data mutableCopy] : [NSMutableData data];
+    [terminated appendBytes:"" length:1];
+    return terminated;
+}
+
+static BOOL config_write(NSString *path, const char *text) {
+    NSFileManager *files = NSFileManager.defaultManager;
+    if (![files createDirectoryAtPath:path.stringByDeletingLastPathComponent
+           withIntermediateDirectories:YES attributes:nil error:nil]) return NO;
+    return [[NSData dataWithBytes:text length:strlen(text)] writeToFile:path atomically:YES];
+}
+
+// Seed only missing SET lines. The graphics preset uses the same line editor and file writer.
 static NSArray<NSString *> *config_seed(NSString *flavor, NSArray<NSArray<NSString *> *> *cvars) {
-    NSString *wtf = [NSHomeDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"Documents/_%@_/WTF", flavor]];
-    NSString *config = [wtf stringByAppendingPathComponent:@"Config.wtf"];
-    NSString *text = [NSString stringWithContentsOfFile:config encoding:NSUTF8StringEncoding error:nil] ?: @"";
-    NSMutableArray<NSString *> *added = [NSMutableArray array];
-    for (NSArray<NSString *> *cvar in cvars) {
-        NSString *line = [NSString stringWithFormat:@"SET %@ \"%@\"", cvar[0], cvar[1]];
-        if ([text rangeOfString:[NSString stringWithFormat:@"SET %@ ", cvar[0]] options:NSCaseInsensitiveSearch].location != NSNotFound) continue;
-        if (text.length && ![text hasSuffix:@"\n"]) text = [text stringByAppendingString:@"\n"];
-        text = [text stringByAppendingFormat:@"%@\n", line];
-        [added addObject:cvar[0]];
+    NSString *path = config_wtf_path(flavor);
+    BOOL missing;
+    NSData *text = config_read(path, &missing);
+    if (!text) return nil;
+    SPWTFEdit *edits = calloc(cvars.count, sizeof *edits);
+    if (!edits) return nil;
+    for (NSUInteger i = 0; i < cvars.count; i++) {
+        edits[i].name = cvars[i][0].UTF8String;
+        edits[i].value = cvars[i][1].UTF8String;
+        edits[i].length = strlen(edits[i].value);
+        edits[i].seed = true;
     }
-    if (!added.count) return added;
-    [NSFileManager.defaultManager createDirectoryAtPath:wtf withIntermediateDirectories:YES attributes:nil error:nil];
-    return [text writeToFile:config atomically:YES encoding:NSUTF8StringEncoding error:nil] ? added : nil;
+    char *output = sp_wtf_edit(text.bytes, edits, cvars.count);
+    NSMutableArray<NSString *> *added = [NSMutableArray array];
+    for (NSUInteger i = 0; i < cvars.count; i++)
+        if (edits[i].changed) [added addObject:cvars[i][0]];
+    BOOL ok = output && (!added.count || config_write(path, output));
+    free(output);
+    free(edits);
+    return ok ? added : nil;
+}
+
+static NSString *const graphicsChoiceKey = @"sp_forever_graphics_preset";
+static NSString *const graphicsAppliedKey = @"sp_forever_graphics_applied";
+
+static NSString *graphics_backup_path(void) {
+    return [config_wtf_directory(@"forever") stringByAppendingPathComponent:@"sp-graphics-backup.wtf"];
+}
+
+BOOL sp_graphics_has_backup(void) {
+    return [NSFileManager.defaultManager fileExistsAtPath:graphics_backup_path()];
+}
+
+static BOOL graphics_create_backup(NSString *path, const char *backup) {
+    NSString *temporary = [path.stringByDeletingLastPathComponent stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    if (!config_write(temporary, backup)) return NO;
+    NSFileManager *files = NSFileManager.defaultManager;
+    // Publish the completed snapshot without clobbering a backup that already exists.
+    BOOL linked = [files linkItemAtPath:temporary toPath:path error:nil];
+    [files removeItemAtPath:temporary error:nil];
+    return linked;
+}
+
+static BOOL graphics_config(enum SPGraphicsPreset preset, NSString *name) {
+    NSString *path = config_wtf_path(@"forever");
+    NSString *backupPath = graphics_backup_path();
+    NSString *status = @"none";
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    BOOL restore = preset == SP_GRAPHICS_KEEP;
+    BOOL ok = NO, missingConfig, missingBackup;
+    size_t applied = 0, unchanged = 0;
+    NSData *config = config_read(path, &missingConfig);
+    NSData *saved = config_read(backupPath, &missingBackup);
+    char *snapshot = NULL, *output = NULL;
+    if (!missingBackup) status = @"kept";
+    if (!config || !saved || (missingBackup && restore)) goto done;
+    if (missingBackup) {
+        snapshot = sp_graphics_backup(config.bytes);
+        if (!snapshot || !graphics_create_backup(backupPath, snapshot)) goto done;
+        status = @"created";
+    }
+    NSInteger prior = [defaults integerForKey:graphicsAppliedKey];
+    BOOL restoreBaseline = preset == SP_GRAPHICS_QUALITY &&
+                          (prior == SP_GRAPHICS_PERFORMANCE || prior == SP_GRAPHICS_BALANCED);
+    output = sp_graphics_edit(config.bytes, snapshot ? snapshot : saved.bytes, preset, restoreBaseline, &applied, &unchanged);
+    if (!output || (applied && !config_write(path, output))) {
+        applied = unchanged = 0;
+        goto done;
+    }
+    [defaults setInteger:preset forKey:graphicsAppliedKey];
+    if (restore) {
+        [defaults setInteger:SP_GRAPHICS_KEEP forKey:graphicsChoiceKey];
+        if (![NSFileManager.defaultManager removeItemAtPath:backupPath error:nil]) goto done;
+        status = @"none";
+    }
+    ok = YES;
+
+done:
+    free(output);
+    free(snapshot);
+    say([NSString stringWithFormat:@"SP_GRAPHICS preset=%@ applied=%zu unchanged=%zu backup=%@",
+                                   name, applied, unchanged, status]);
+    if (!ok) say(@"graphics: could not complete Config.wtf transaction");
+    return ok;
+}
+
+BOOL sp_graphics_restore(void) {
+    return graphics_config(SP_GRAPHICS_KEEP, @"restore");
+}
+
+static void graphics_preset(NSString *flavor) {
+    if (![flavor isEqualToString:@"forever"]) return;
+    NSInteger preset = [NSUserDefaults.standardUserDefaults integerForKey:graphicsChoiceKey];
+    if (preset < SP_GRAPHICS_PERFORMANCE || preset > SP_GRAPHICS_QUALITY) return;
+    NSArray<NSString *> *names = @[@"performance", @"balanced", @"quality"];
+    graphics_config((enum SPGraphicsPreset)preset, names[preset - SP_GRAPHICS_PERFORMANCE]);
 }
 
 // An iPhone renders at 2x by default (spwindow.m), for a readable UI; the game's own render scale at 50%
@@ -806,6 +913,7 @@ int main(int argc, char **argv) {
                                    sp_region_name(choice[@"Region"]), choice[@"Text"], choice[@"Speech"], choice[@"Source"]]);
     region_sync(flavor, choice);
     game_region(flavor, choice);
+    graphics_preset(flavor);
     default_render_scale(flavor);
     skip_intro(flavor);
     flavor_info(flavor);
