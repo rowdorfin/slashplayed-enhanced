@@ -97,7 +97,7 @@ pub async fn fetch(path: Option<&Path>) -> Result<(Vec<u8>, String), Report> {
     if got != want {
         bail!("the device kit from {url} isn't the one this build was made with (SHA-256 {got}, not {want})");
     }
-    Ok((bytes, format!("{tag}'s {ASSET}")))
+    Ok((bytes, format!("{ASSET} da versão {tag}")))
 }
 
 /// What extract leaves: the unsigned app and the two entitlements templates.

@@ -71,11 +71,11 @@ pub async fn register_device(
 ) -> Result<(), Report> {
     let devices = session.list_devices(team, None).await?;
     if devices.iter().any(|d| d.device_number == device.udid) {
-        ui.say(&format!("{name} is already registered on the team"));
+        ui.say(&format!("{name} já está registrado na equipe"));
         return Ok(());
     }
     session.add_device(team, name, &device.udid, None).await?;
-    ui.say(&format!("registered {name} on the team"));
+    ui.say(&format!("{name} foi registrado na equipe"));
     Ok(())
 }
 
@@ -104,7 +104,7 @@ pub async fn app_ids(
         for b in &missing {
             let name = if b.ends_with(".helper") { "Slashplayed helper" } else { "Slashplayed" };
             session.add_app_id(team, name, b, None).await?;
-            ui.say(&format!("made the App ID {b}"));
+            ui.say(&format!("App ID {b} criado"));
         }
     }
     let list = session.list_app_ids(team, None).await?;
@@ -161,7 +161,7 @@ pub async fn capabilities(
         PatchAnswer::Granted => Ok(Eva::Granted),
         PatchAnswer::Refused => {
             // The status alone (no body), so a run shows which answer it took.
-            ui.say(&format!("Apple refused extended-virtual-addressing (HTTP {status}): signing with increased-memory-limit alone"));
+            ui.say(&format!("A Apple recusou extended-virtual-addressing (HTTP {status}). A assinatura usará increased-memory-limit."));
             session
                 .add_increased_memory_limit(team, app_id)
                 .await
@@ -253,12 +253,12 @@ pub async fn identity(
                 (_, Ok(())) => true,
                 (keystore::Loaded::Unavailable(why), Err(_)) => {
                     ui.say(&format!(
-                        "no credential store to keep the signing key in ({why}): this run makes a new certificate"
+                        "Gerenciador de credenciais indisponível ({why}). Será criado um certificado."
                     ));
                     false
                 }
                 (_, Err(e)) => {
-                    ui.say(&format!("{}: this run makes a new certificate", crate::secret::safe_error(&e)));
+                    ui.say(&format!("Será criado um certificado ({})", crate::secret::safe_error(&e)));
                     false
                 }
             };
@@ -267,7 +267,7 @@ pub async fn identity(
     };
     let certs = session.list_ios_certs(team).await?;
     if let Some(cert) = certs.iter().find_map(|c| is_ours(c, &key)) {
-        ui.say("reusing this computer's Slashplayed certificate");
+        ui.say("Reutilizando o certificado Slashplayed deste computador.");
         let cert_der = cert.to_der()?;
         return Ok(Identity { key, cert_der });
     }
@@ -278,7 +278,7 @@ pub async fn identity(
         }
         return Err(e);
     }
-    ui.say(if stored { "made a Slashplayed certificate for this computer" } else { "made a Slashplayed certificate for this run" });
+    ui.say(if stored { "Certificado Slashplayed criado para este computador." } else { "Certificado Slashplayed criado para esta instalação." });
     let certs = session.list_ios_certs(team).await?;
     let cert = certs
         .iter()
@@ -321,9 +321,9 @@ pub async fn profiles(
     if let Some(exp) = parsed.expires() {
         let days = exp.duration_since(std::time::SystemTime::now()).map(|d| d.as_secs() / 86400).unwrap_or(0);
         ui.say(&format!(
-            "profiles made: {} team, good for {days} more days{}",
-            if free { "a free" } else { "a paid" },
-            if free { " (run this again within a week to keep Slashplayed opening)" } else { "" }
+            "Perfis da equipe {} preparados, válidos por mais {days} dias{}",
+            if free { "gratuita" } else { "paga" },
+            if free { " (repita a instalação dentro de uma semana para continuar usando o Slashplayed)" } else { "" }
         ));
     }
     Ok((app_bytes, helper_bytes, free))

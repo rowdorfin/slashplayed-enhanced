@@ -6,6 +6,7 @@
 // draws and what Copy Details copies from, and holds no credential.
 
 use eframe::egui;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use isideload::{
@@ -44,6 +45,8 @@ pub enum Question {
 #[derive(Default)]
 pub struct Shared {
     pub step: Option<Step>,
+    pub rejected: bool,
+    pub team: Option<String>,
     /// The say() lines, for Details.
     pub lines: Vec<String>,
     pub wait: Option<Wait>,
@@ -75,12 +78,12 @@ impl Shared {
             out.push('\n');
         }
         out.push_str(&format!(
-            "\nSlashplayed Companion {} (device kit: {}) on {}\n",
+            "\nSlashplayed Companion {} (kit do dispositivo: {}) em {}\n",
             env!("CARGO_PKG_VERSION"),
             crate::kit::release_tag(),
             std::env::consts::OS
         ));
-        out
+        crate::secret::sanitize(&out)
     }
 }
 
@@ -91,32 +94,56 @@ pub fn lock(s: &Handle) -> MutexGuard<'_, Shared> {
 }
 
 /// Starts a run: the person's side in `shared`, the device and Apple from `backend`.
-pub type Starter = Arc<dyn Fn(Handle, egui::Context) + Send + Sync>;
+#[derive(Clone)]
+pub struct RunOptions {
+    pub kit: Option<PathBuf>,
+    pub hash: Option<String>,
+    pub remember_session: bool,
+    pub remember_password: bool,
+    pub apple_id: String,
+}
+
+pub type Starter = Arc<dyn Fn(Handle, egui::Context, RunOptions) + Send + Sync>;
 
 /// A Starter for a Backend: each run on a thread of its own, with its own runtime.
 pub fn starter<B: Backend + 'static>(
     backend: impl Fn() -> Result<B, Report> + Send + Sync + 'static,
-    kit: Option<std::path::PathBuf>,
 ) -> Starter {
     let backend = Arc::new(backend);
-    Arc::new(move |shared: Handle, ctx: egui::Context| {
-        let (backend, kit) = (backend.clone(), kit.clone());
+    Arc::new(move |shared: Handle, ctx: egui::Context, options: RunOptions| {
+        let backend = backend.clone();
         std::thread::spawn(move || {
-            let gui = Gui { shared: shared.clone(), ctx: ctx.clone() };
-            let opts = flow::Options {
-                kit: kit.as_deref(),
-                team: None,
-                bundle_id: None,
-                anisette: None,
-                server_client_info: false,
-                remember_session: true,
-                remember_password: false,
+            let gui = Gui { shared: shared.clone(), ctx: ctx.clone(), apple_id: options.apple_id };
+            let run = || -> Result<Done, Report> {
+                let scratch;
+                let kit = if let (Some(path), Some(hash)) = (options.kit.as_deref(), options.hash.as_deref()) {
+                    scratch = crate::secret::Scratch::new("kit-verificado")?;
+                    let snapshot = scratch.path().join("slashplayed-device-kit.zip");
+                    std::fs::copy(path, &snapshot)?;
+                    let (actual, _, _) = crate::checksum::check_file(&snapshot, "")?;
+                    if actual != hash {
+                        bail!("O ZIP mudou desde a verificação do SHA-256. Verifique o arquivo novamente.");
+                    }
+                    Some(snapshot)
+                } else {
+                    options.kit
+                };
+                let opts = flow::Options {
+                    kit: kit.as_deref(),
+                    team: None,
+                    bundle_id: None,
+                    anisette: None,
+                    server_client_info: false,
+                    remember_session: options.remember_session,
+                    remember_password: options.remember_password,
+                };
+                let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+                // A panic in the run (an unwrap in a dependency, a keystore thread's) would leave the screen
+                // waiting on a run that's gone: it ends the run with an error instead, and Try Again.
+                runtime.block_on(async { flow::install(&mut backend()?, &gui, &opts).await })
             };
-            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-            // A panic in the run (an unwrap in a dependency, a keystore thread's) would leave the screen
-            // waiting on a run that's gone: it ends the run with an error instead, and Try Again.
-            let run = std::panic::AssertUnwindSafe(|| runtime.block_on(async { flow::install(&mut backend()?, &gui, &opts).await }));
-            let result = std::panic::catch_unwind(run).unwrap_or_else(|_| Err(report!("the install stopped unexpectedly")));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+                .unwrap_or_else(|_| Err(report!("A instalação foi interrompida inesperadamente.")));
             drop(gui);
             let mut s = lock(&shared);
             s.question = None;
@@ -128,6 +155,7 @@ pub fn starter<B: Backend + 'static>(
 }
 
 struct Gui {
+    apple_id: String,
     shared: Handle,
     ctx: egui::Context,
 }
@@ -142,7 +170,7 @@ impl Gui {
     async fn ask<T>(&self, question: impl FnOnce(oneshot::Sender<T>) -> Question) -> Result<T, Report> {
         let (tx, rx) = oneshot::channel();
         self.with(|s| s.question = Some(question(tx)));
-        rx.await.map_err(|_| report!("the window closed"))
+        rx.await.map_err(|_| report!("A janela foi fechada."))
     }
 }
 
@@ -156,7 +184,7 @@ impl Frontend for Gui {
             }
             Event::Say(line) => {
                 s.wait = None;
-                s.lines.push(line);
+                s.lines.extend(line.lines().map(crate::secret::sanitize));
             }
             Event::Wait(w) => s.wait = Some(w),
             Event::Progress(p) => s.progress = Some(p),
@@ -185,8 +213,25 @@ impl Frontend for Gui {
         true
     }
 
+    fn session_rejected(&self) {
+        self.with(|s| s.rejected = true);
+    }
+
+    fn selected_team(&self, team: &str) {
+        self.with(|s| {
+            s.team = Some(team.into());
+            s.rejected = false;
+        });
+    }
+
     fn sign_in(&self) -> Ask<'_, SignIn> {
-        Box::pin(async move { self.ask(Question::SignIn).await })
+        Box::pin(async move {
+            if self.apple_id.is_empty() {
+                self.ask(Question::SignIn).await
+            } else {
+                Ok(SignIn { apple_id: self.apple_id.clone(), pair_again: false })
+            }
+        })
     }
 
     fn password<'a>(&'a self, _: &'a str) -> Ask<'a, Zeroizing<String>> {

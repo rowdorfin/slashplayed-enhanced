@@ -35,7 +35,7 @@ spzsign = { path = "zsign" }
 # usbmuxd, lockdown and its pairing, installation_proxy over AFC, house_arrest, amfi, and the RemotePairing
 # record. Patched below to the repo's pinned idevice (scripts/build-idevice.sh pins the same commit).
 idevice = { version = "0.1.68", default-features = false, features = [
-  "ring", "usbmuxd", "pair", "afc", "house_arrest", "installation_proxy", "amfi", "remote_pairing",
+  "ring", "usbmuxd", "pair", "afc", "house_arrest", "installation_proxy", "amfi", "remote_pairing", "misagent", "crashreportcopymobile",
 ] }
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "fs", "sync"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -73,7 +73,7 @@ skrifa = { version = "0.44", default-features = false }
 
 # A window that can't open says why (window.rs): with no console, a message box is all there is.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Security_Cryptography", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Controls_Dialogs", "Win32_Security_Cryptography", "Win32_Foundation"] }
 
 [build-dependencies]
 # The Windows programs' icon and version resource (icons/slashplayed.ico), compiled with the SDK's rc.exe.

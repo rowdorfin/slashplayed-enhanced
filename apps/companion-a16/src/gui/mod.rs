@@ -8,13 +8,14 @@
 mod drill;
 pub mod front;
 mod theme;
+mod home;
 #[cfg(test)]
 mod tests;
 
 use eframe::egui;
 use std::sync::Arc;
 
-use egui::{Align, Button, Layout, RichText, TextEdit};
+use egui::{Button, RichText, TextEdit};
 use isideload::auth::apple_account::TwoFactorCallbackResponse;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -22,34 +23,31 @@ use crate::flow::{SignIn, Step, Wait};
 use front::{Handle, Question, Shared, Starter, lock};
 use theme::{DIM, ERROR, GOLD, GROUND, WELL};
 
-/// The window's size: fixed, so every screen is laid out for it.
-pub const SIZE: [f32; 2] = [560.0, 620.0];
+/// Initial size of the resizable window.
+pub const SIZE: [f32; 2] = [640.0, 760.0];
 
 const STEPS: [(Step, &str); 6] = [
-    (Step::Kit, "Get the Slashplayed app"),
-    (Step::Device, "Connect to the device"),
-    (Step::SignIn, "Sign in to Apple"),
-    (Step::Provision, "Make the signing profiles"),
-    (Step::Install, "Sign and install the app"),
-    (Step::Container, "Get it ready to install games"),
+    (Step::Kit, "Obter o aplicativo Slashplayed"),
+    (Step::Device, "Conectar ao dispositivo"),
+    (Step::SignIn, "Entrar na Apple"),
+    (Step::Provision, "Preparar os perfis de assinatura"),
+    (Step::Install, "Assinar e instalar o aplicativo"),
+    (Step::Container, "Preparar para instalar jogos"),
 ];
 
 pub struct App {
     shared: Handle,
     starter: Starter,
+    home: home::Home,
     /// Goodmountain is loaded (theme::apply).
     face: bool,
     apple_id: String,
     /// The password field's text, until Install hands it to the sign-in. Zeroed on drop.
     password: Zeroizing<String>,
-    code: String,
+    code: Zeroizing<String>,
     show_numbers: bool,
     device_choice: Option<String>,
     team_choice: Option<usize>,
-    /// The Forget dialog: its Apple ID field and what it last said.
-    forget: Option<(String, Option<String>)>,
-    /// Its Forget, running: the credential store can take a while (Secret Service's unlock prompt).
-    forgetting: Option<std::thread::JoinHandle<String>>,
     /// A drill's screenshot to save (SP_GUI_SHOT), and the frames drawn so far.
     shot: Option<(std::path::PathBuf, u32)>,
 }
@@ -61,23 +59,26 @@ impl App {
         let mut app = Self {
             shared: Handle::default(),
             starter,
+            home: home::Home::new(drill.is_none(), if drill.is_none() {
+                std::env::var_os("SP_GUI_KIT").map(std::path::PathBuf::from)
+            } else { None }),
             face,
             apple_id: String::new(),
             password: Zeroizing::new(String::new()),
-            code: String::new(),
+            code: Zeroizing::new(String::new()),
             show_numbers: false,
             device_choice: None,
             team_choice: None,
-            forget: None,
-            forgetting: None,
             shot: None,
         };
         match drill {
+            Some("home") => {}
             Some(state) => {
+                app.home.active = true;
                 drill::fill(&mut app, state);
                 app.shot = std::env::var_os("SP_GUI_SHOT").map(|p| (p.into(), 0));
             }
-            None => (app.starter)(app.shared.clone(), ctx.clone()),
+            None => {}
         }
         app
     }
@@ -88,25 +89,8 @@ impl App {
     }
 
     fn header(&mut self, ui: &mut egui::Ui, title: &str) {
-        ui.horizontal(|ui| {
-            ui.label(theme::title(title, self.face));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.menu_button(RichText::new("…").size(20.0), |ui| {
-                    if ui.button("Forget this computer's signing key…").clicked() {
-                        self.forget = Some((self.apple_id.clone(), None));
-                        ui.close();
-                    }
-                });
-            });
-        });
-        // Windows and Linux are new, and tested on fewer devices than the Mac: said on every screen, under the
-        // title (beside it, the longest titles would run into the menu).
-        egui::Frame::new()
-            .stroke(egui::Stroke::new(1.0, GOLD.linear_multiply(0.6)))
-            .corner_radius(4.0)
-            .inner_margin(egui::vec2(6.0, 1.0))
-            .show(ui, |ui| ui.label(RichText::new("Experimental").small().color(GOLD)));
-        ui.add_space(12.0);
+        ui.label(theme::title(title, self.face));
+        ui.add_space(8.0);
     }
 
     fn restart(&mut self, ctx: &egui::Context) {
@@ -122,7 +106,8 @@ impl App {
         self.show_numbers = false;
         self.team_choice = None;
         self.device_choice = None;
-        (self.starter)(self.shared.clone(), ctx.clone());
+        self.home.active = true;
+        (self.starter)(self.shared.clone(), ctx.clone(), self.home.options(&self.apple_id));
     }
 }
 
@@ -131,34 +116,50 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let shared = self.shared.clone();
         let mut s = lock(&shared);
-        // A cancelled sign-in isn't an error: start over, the Apple ID kept.
-        if s.cancelled && s.outcome.is_some() {
-            drop(s);
-            self.restart(&ctx);
-            s = lock(&shared);
+        if s.outcome.is_some() && s.cancelled {
+            self.home.active = false;
+            self.home.refresh();
+            self.code.zeroize();
+            forget_typing(&ctx);
+            s.cancelled = false;
         }
-        let frame = egui::Frame::new().fill(GROUND).inner_margin(28.0);
+        let frame = egui::Frame::new().fill(GROUND).inner_margin(24.0);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            match (&s.outcome, &s.question) {
-                (Some(Ok(_)), _) => self.done(ui, &mut s),
-                (Some(Err(_)), _) => self.steps(ui, &mut s, "Something went wrong"),
-                (None, Some(Question::SignIn(_))) => self.sign_in(ui, &mut s),
-                (None, Some(Question::Password(_))) => self.ask_password(ui, &mut s),
-                (None, Some(Question::TwoFactor { .. })) => self.two_factor(ui, &mut s),
-                (None, Some(Question::Team { .. })) => self.team(ui, &mut s),
-                (None, _) if s.step.is_none() || s.step == Some(Step::Kit) || s.step == Some(Step::Device) => {
-                    self.device(ui, &mut s)
+            egui::ScrollArea::vertical().id_salt("a16-main").show(ui, |ui| {
+                if !self.home.active {
+                    self.dashboard(ui, &mut s);
+                    return;
                 }
-                (None, _) => self.steps(ui, &mut s, "Installing"),
-            }
+                match (&s.outcome, &s.question) {
+                    (Some(Ok(_)), _) => self.done(ui, &mut s),
+                    (Some(Err(_)), _) => self.steps(ui, &mut s, "Algo deu errado"),
+                    (None, Some(Question::SignIn(_))) => self.sign_in(ui, &mut s),
+                    (None, Some(Question::Password(_))) => self.ask_password(ui, &mut s),
+                    (None, Some(Question::TwoFactor { .. })) => self.two_factor(ui, &mut s),
+                    (None, Some(Question::Team { .. })) => self.team(ui, &mut s),
+                    (None, _) if s.step == Some(Step::Device) => self.device(ui, &mut s),
+                    (None, _) => self.steps(ui, &mut s, "Instalando"),
+                }
+                if let Some(step) = s.step {
+                    let stage = step as usize + 1;
+                    let done = s.outcome.as_ref().is_some_and(Result::is_ok);
+                    let progress = if done { 1.0 } else { (stage - 1) as f32 / STEPS.len() as f32 };
+                    ui.add(egui::ProgressBar::new(progress).text(format!("Etapa {stage} de {}", STEPS.len())));
+                }
+                ui.add_space(12.0);
+                details(ui, &s);
+            });
         });
-        let retry = s.outcome.as_ref().is_some_and(|o| o.is_err()) && ctx.data(|d| d.get_temp::<bool>(retry_id())) == Some(true);
         drop(s);
-        if retry {
+        if ctx.data(|d| d.get_temp::<bool>(retry_id())) == Some(true) {
             ctx.data_mut(|d| d.remove::<bool>(retry_id()));
             self.restart(&ctx);
         }
-        self.forget_dialog(&ctx);
+        if ctx.data(|d| d.get_temp::<bool>(home_id())) == Some(true) {
+            ctx.data_mut(|d| d.remove::<bool>(home_id()));
+            self.home.active = false;
+            self.home.refresh();
+        }
         self.screenshot(&ctx);
     }
 }
@@ -182,6 +183,8 @@ impl App {
         ctx.request_repaint();
     }
 }
+
+fn home_id() -> egui::Id { egui::Id::unique("sp-home") }
 
 fn retry_id() -> egui::Id {
     egui::Id::unique("sp-retry")
@@ -249,25 +252,18 @@ fn small(ui: &mut egui::Ui, text: &str) {
 
 impl App {
     fn device(&mut self, ui: &mut egui::Ui, s: &mut Shared) {
-        self.header(ui, "Connect your device");
-        if s.step.is_none() || s.step == Some(Step::Kit) {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Getting the Slashplayed app…");
-            });
-            return;
-        }
+        self.header(ui, "Conecte o dispositivo");
         let Some(d) = s.device.clone() else {
             if s.devices.is_empty() {
-                ui.label("Plug in your iPhone or iPad with its cable, and unlock it.");
+                ui.label("Conecte seu iPhone ou iPad com um cabo e desbloqueie-o.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Looking for it…").color(DIM));
+                    ui.label(RichText::new("Procurando o dispositivo…").color(DIM));
                 });
                 return;
             }
-            ui.label("Several are plugged in. Which one should get Slashplayed?");
+            ui.label("Selecione o dispositivo que receberá o Slashplayed.");
             ui.add_space(8.0);
             for d in &s.devices {
                 let label = format!("{} ({}, iOS {})", d.name, d.class, d.os);
@@ -275,7 +271,7 @@ impl App {
             }
             ui.add_space(16.0);
             let chosen = self.device_choice.as_ref().filter(|u| s.devices.iter().any(|d| &d.udid == *u));
-            if self.main_button(ui, "Continue", chosen.is_some()) {
+            if self.main_button(ui, "Continuar", chosen.is_some()) {
                 s.picked = chosen.cloned();
             }
             return;
@@ -285,12 +281,12 @@ impl App {
         ui.add_space(12.0);
         match &s.wait {
             Some(Wait::DeveloperMode { device }) => {
-                ui.label(format!("Developer Mode is off on {device}. To turn it on:"));
+                ui.label(format!("O Modo de Desenvolvedor está desativado em {device}."));
                 ui.add_space(4.0);
                 for (i, line) in [
-                    "Open Settings > Privacy & Security > Developer Mode.".to_string(),
-                    "Turn it on, and restart when it asks.".to_string(),
-                    "After the restart, unlock it, tap Turn On, and enter the passcode.".to_string(),
+                    "Abra Ajustes > Privacidade e Segurança > Modo de Desenvolvedor.".to_string(),
+                    "Ative o modo e reinicie quando solicitado.".to_string(),
+                    "Após reiniciar, desbloqueie, toque em Ativar e digite o código do dispositivo.".to_string(),
                 ]
                 .iter()
                 .enumerate()
@@ -300,7 +296,7 @@ impl App {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Setup goes on by itself once it's on.").color(DIM));
+                    ui.label(RichText::new("A instalação continua assim que o modo for ativado.").color(DIM));
                 });
             }
             Some(w) => {
@@ -308,26 +304,26 @@ impl App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Waiting for the device…").color(DIM));
+                    ui.label(RichText::new("Aguardando o dispositivo…").color(DIM));
                 });
             }
             None => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Connecting…");
+                    ui.label("Conectando…");
                 });
             }
         }
     }
 
     fn sign_in(&mut self, ui: &mut egui::Ui, s: &mut Shared) {
-        self.header(ui, "Sign in with your Apple ID");
+        self.header(ui, "Entre com seu Apple ID");
         if let Some(d) = &s.device {
-            ui.label(format!("Slashplayed gets signed with your Apple ID, for {}.", d.name));
+            ui.label(format!("Seu Apple ID assinará o Slashplayed para {}.", d.name));
             ui.add_space(8.0);
         }
         let id_label = ui.label("Apple ID");
-        let id = ui.add(TextEdit::singleline(&mut self.apple_id).hint_text("name@example.com").desired_width(f32::INFINITY))
+        let id = ui.add(TextEdit::singleline(&mut self.apple_id).hint_text("nome@exemplo.com").desired_width(f32::INFINITY))
             .labelled_by(id_label.id);
         ui.add_space(16.0);
         let ready = !self.apple_id.trim().is_empty();
@@ -342,15 +338,18 @@ impl App {
 
     fn ask_password(&mut self, ui: &mut egui::Ui, s: &mut Shared) {
         self.header(ui, "Digite a senha do Apple ID");
-        let pw_label = ui.label("Password");
+        if s.rejected {
+            note(ui, "Sessão rejeitada pela Apple. Entre novamente para continuar.");
+        }
+        let pw_label = ui.label("Senha");
         let pw = ui
             .add(TextEdit::singleline(&mut *self.password).id(password_id()).password(true).desired_width(f32::INFINITY))
             .labelled_by(pw_label.id);
-        small(ui, "Your password is used once, for this sign-in, and never stored.");
+        small(ui, "A senha só será guardada se você tiver marcado essa opção.");
         ui.add_space(16.0);
         let ready = !self.password.is_empty();
         let enter = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if (self.main_button(ui, "Install", ready) || (enter && ready))
+        if (self.main_button(ui, "Enviar senha", ready) || (enter && ready))
             && let Some(Question::Password(reply)) = s.question.take()
         {
             let password = Zeroizing::new(std::mem::take(&mut *self.password));
@@ -362,21 +361,21 @@ impl App {
     fn two_factor(&mut self, ui: &mut egui::Ui, s: &mut Shared) {
         let Some(Question::TwoFactor { sms, retry, unknown, numbers, .. }) = &s.question else { return };
         let (sms, retry, unknown, numbers) = (*sms, *retry, *unknown, numbers.clone());
-        self.header(ui, "Enter the code");
+        self.header(ui, "Digite o código de verificação");
         if retry {
-            ui.label(RichText::new("That didn't work. Try again, or get a code another way.").color(ERROR));
+            ui.label(RichText::new("Não foi possível verificar. Tente novamente ou solicite outro código.").color(ERROR));
         }
         let mut answer = None;
         if unknown {
             // The last way failed and Apple says nothing of where a code went: a code can't be sent, nor
             // resent, only asked for again (isideload's NeedsUnknown2FA).
-            ui.label("Get a new code: on your Apple devices, or by text.");
+            ui.label("Solicite um novo código nos dispositivos Apple ou por SMS.");
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button("Send it to my Apple devices").clicked() {
+                if ui.button("Enviar aos meus dispositivos Apple").clicked() {
                     answer = Some(TwoFactorCallbackResponse::SendToDevices);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancelar").clicked() {
                     answer = Some(TwoFactorCallbackResponse::Abort);
                 }
             });
@@ -385,34 +384,34 @@ impl App {
             return;
         }
         ui.label(if sms {
-            "Apple texted a code to your phone."
+            "A Apple enviou um código por SMS."
         } else {
-            "Apple sent a code to your Apple devices: allow the sign-in on one of them to see it."
+            "Autorize o início de sessão em um dispositivo Apple para ver o código."
         });
         ui.add_space(8.0);
-        let label = ui.label(if sms { "Code from the text message" } else { "Code from your Apple device" });
+        let label = ui.label(if sms { "Código recebido por SMS" } else { "Código do dispositivo Apple" });
         let field = ui
-.add(TextEdit::singleline(&mut self.code).id(code_id()).char_limit(6).desired_width(140.0).font(egui::TextStyle::Heading))
+.add(TextEdit::singleline(&mut *self.code).id(code_id()).password(true).char_limit(6).desired_width(140.0).font(egui::TextStyle::Heading))
             .labelled_by(label.id);
         self.code.retain(|c| c.is_ascii_digit());
         ui.add_space(12.0);
         let ready = self.code.len() == 6;
         let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if self.main_button(ui, "Continue", ready) || (enter && ready) {
-            answer = Some(TwoFactorCallbackResponse::SubmitCode(self.code.clone()));
+        if self.main_button(ui, "Continuar", ready) || (enter && ready) {
+            answer = Some(TwoFactorCallbackResponse::SubmitCode(self.code.to_string()));
         }
         ui.add_space(16.0);
         ui.horizontal(|ui| {
-            if !numbers.is_empty() && ui.button("Text me instead").clicked() {
+            if !numbers.is_empty() && ui.button("Receber por SMS").clicked() {
                 self.show_numbers = !self.show_numbers;
             }
-            if sms && ui.button("Send it to my Apple devices").clicked() {
+            if sms && ui.button("Enviar aos meus dispositivos Apple").clicked() {
                 answer = Some(TwoFactorCallbackResponse::SendToDevices);
             }
-            if ui.button("Resend").clicked() {
+            if ui.button("Reenviar").clicked() {
                 answer = Some(TwoFactorCallbackResponse::ResendCode);
             }
-            if ui.button("Cancel").clicked() {
+            if ui.button("Cancelar").clicked() {
                 answer = Some(TwoFactorCallbackResponse::Abort);
             }
         });
@@ -427,10 +426,10 @@ impl App {
             return;
         }
         ui.add_space(8.0);
-        ui.label("Text a code to:");
+        ui.label("Escolha um número para receber o código");
         for (id, number) in numbers {
             // Apple sends them masked; they're shown only here, on the person's own screen.
-            if ui.button(format!("Text {number}")).clicked() {
+            if ui.button(format!("Enviar SMS para {number}")).clicked() {
                 *answer = Some(TwoFactorCallbackResponse::SendSms(*id));
             }
         }
@@ -450,14 +449,14 @@ impl App {
     fn team(&mut self, ui: &mut egui::Ui, s: &mut Shared) {
         let Some(Question::Team { teams, .. }) = &s.question else { return };
         let teams = teams.clone();
-        self.header(ui, "Pick a team");
-        ui.label("This Apple ID has several teams. Which one should sign Slashplayed?");
+        self.header(ui, "Escolha uma equipe");
+        ui.label("Escolha qual equipe deste Apple ID vai assinar o Slashplayed.");
         ui.add_space(8.0);
         for (i, (name, id)) in teams.iter().enumerate() {
             ui.radio_value(&mut self.team_choice, Some(i), format!("{name} ({id})"));
         }
         ui.add_space(16.0);
-        if self.main_button(ui, "Continue", self.team_choice.is_some())
+        if self.main_button(ui, "Continuar", self.team_choice.is_some())
             && let (Some(i), Some(Question::Team { reply, .. })) = (self.team_choice, s.question.take())
         {
             let _ = reply.send(i);
@@ -491,17 +490,29 @@ impl App {
             if step == current {
                 ui.indent(label, |ui| {
                     if let Some(e) = &error {
-                        ui.label(RichText::new(capitalized(e)).color(ERROR));
+                        let message = if e.contains("A cota de certificados") {
+                            crate::provision::CERT_QUOTA
+                        } else {
+                            match current {
+                                Step::Kit => "Não foi possível preparar o ZIP. Confira o caminho e verifique o SHA-256 na tela principal.",
+                                Step::Device => "Não foi possível preparar o dispositivo. Confira o cabo, o desbloqueio e a autorização USB.",
+                                Step::SignIn => "Não foi possível entrar na Apple. Confira os dados da conta e tente novamente.",
+                                Step::Provision => "Não foi possível preparar os perfis de assinatura.",
+                                Step::Install => "Não foi possível assinar ou instalar o aplicativo no dispositivo.",
+                                Step::Container => "O aplicativo foi instalado, mas a configuração no dispositivo ficou incompleta.",
+                            }
+                        };
+                        home::error(ui, message, e);
                     } else if let Some(w) = &s.wait {
                         note(ui, &w.text());
                     } else if step == Step::Install
                         && let Some(p) = s.progress
                     {
                         ui.add(egui::ProgressBar::new(p as f32 / 100.0).show_percentage().fill(GOLD.linear_multiply(0.8)));
-                    } else if step == Step::Install && s.lines.last().is_some_and(|l| l.starts_with("installing on")) {
+                    } else if step == Step::Install && s.lines.last().is_some_and(|l| l.starts_with("Instalando em")) {
                         // The copy to the device reports nothing (idevice's upload has no progress), and on a
                         // phone it takes a minute or so: say it's going, until the install's percentages come.
-                        small(ui, "Copying the app to the device. This can take a minute or two.");
+                        small(ui, "Copiando o aplicativo para o dispositivo. Isso pode levar alguns minutos.");
                     }
                 });
             }
@@ -509,22 +520,20 @@ impl App {
         if error.is_some() {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                if self.main_button(ui, "Try Again", true) {
+                if self.main_button(ui, "Tentar novamente", true) {
                     ui.ctx().data_mut(|d| d.insert_temp(retry_id(), true));
                 }
-                if ui.button("Copy Details").clicked() {
-                    ui.ctx().copy_text(s.details());
+                if ui.button("Voltar").clicked() {
+                    ui.ctx().data_mut(|d| d.insert_temp(home_id(), true));
                 }
             });
         }
-        ui.add_space(12.0);
-        details(ui, s);
     }
 
     fn done(&mut self, ui: &mut egui::Ui, s: &mut Shared) {
         let Some(Ok(done)) = &s.outcome else { return };
         let lines = done.lines();
-        self.header(ui, "All set");
+        self.header(ui, "Instalação concluída");
         for (i, line) in lines.iter().enumerate() {
             if i == 0 {
                 ui.label(RichText::new(line).size(18.0));
@@ -534,86 +543,30 @@ impl App {
             ui.add_space(4.0);
         }
         ui.add_space(16.0);
-        if self.main_button(ui, "Done", true) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.main_button(ui, "Voltar à tela principal", true) {
+            ui.ctx().data_mut(|d| d.insert_temp(home_id(), true));
         }
-        ui.add_space(12.0);
-        details(ui, s);
     }
 
-    fn forget_dialog(&mut self, ctx: &egui::Context) {
-        let Some((id, said)) = &mut self.forget else { return };
-        if self.forgetting.as_ref().is_some_and(|h| h.is_finished()) {
-            let h = self.forgetting.take().unwrap();
-            *said = Some(h.join().unwrap_or_else(|_| "Couldn't reach the credential store.".into()));
-        }
-        let busy = self.forgetting.is_some();
-        let mut close = false;
-        egui::Modal::new(egui::Id::unique("sp-forget")).show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.label(RichText::new("Forget the signing key").family(theme::family(self.face)).size(22.0).color(GOLD));
-            ui.add_space(8.0);
-            ui.label("This computer keeps a signing key for each Apple ID, so it can reuse its certificate. Forgetting it makes the next run make a new certificate.");
-            ui.add_space(8.0);
-            let label = ui.label("Apple ID");
-            ui.add(TextEdit::singleline(id).desired_width(f32::INFINITY)).labelled_by(label.id);
-            if let Some(said) = said.as_ref() {
-                ui.label(said);
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!busy && !id.trim().is_empty(), Button::new("Forget")).clicked() {
-                    let (id, ctx) = (id.trim().to_string(), ui.ctx().clone());
-                    self.forgetting = Some(std::thread::spawn(move || {
-                        let said = match crate::keystore::forget(&id) {
-                            Ok(true) => "Deleted this computer's signing key for that Apple ID.".into(),
-                            Ok(false) => "This computer has no signing key for that Apple ID.".into(),
-                            Err(e) => capitalized(&crate::secret::safe_error(&e)),
-                        };
-                        ctx.request_repaint();
-                        said
-                    }));
-                }
-                if busy {
-                    ui.spinner();
-                }
-                if ui.button("Close").clicked() {
-                    close = true;
-                }
-            });
-        });
-        if close {
-            self.forget = None;
-        }
-    }
 }
 
 fn details(ui: &mut egui::Ui, s: &Shared) {
-    egui::CollapsingHeader::new("Details").default_open(false).show(ui, |ui| {
+    if ui.button("Copiar log").clicked() {
+        ui.ctx().copy_text(s.details());
+    }
+    egui::CollapsingHeader::new("Log da instalação").default_open(false).show(ui, |ui| {
         egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
             for l in &s.lines {
-                ui.label(RichText::new(l).small().color(DIM));
+                ui.label(RichText::new(crate::secret::sanitize(l)).small().color(DIM));
             }
         });
     });
 }
 
-/// The library's errors start in lower case, to follow "slashplayed-cli: "; a screen starts a sentence.
-fn capitalized(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().chain(c).collect(),
-        None => String::new(),
-    }
-}
-
 /// Runs the window, with the real device and Apple.
 pub fn run() -> eframe::Result {
     let drill = std::env::var("SP_GUI_DRILL").ok();
-    // A development build has no kit pinned (build.rs): this names one, as slashplayed-cli's --kit does. A
-    // release build uses only its pinned kit, whatever the environment says.
-    let kit = std::env::var_os("SP_GUI_KIT").filter(|_| crate::kit::pinned_sha256().is_none()).map(std::path::PathBuf::from);
-    let starter = front::starter(crate::live::Live::new, kit);
+    let starter = front::starter(crate::live::Live::new);
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../icons/slashplayed.png")).expect("the window's icon");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -621,8 +574,8 @@ pub fn run() -> eframe::Result {
             // Wayland has no window icons: the compositor matches this to a desktop entry, if there's one.
             .with_app_id("slashplayed-companion")
             .with_inner_size(SIZE)
-            .with_resizable(false)
-            .with_maximize_button(false)
+            .with_resizable(true)
+            .with_drag_and_drop(true)
             .with_icon(Arc::new(icon)),
         ..Default::default()
     };

@@ -2,7 +2,7 @@
 # Packages a release build of the host tool's two programs for one target, with every notice its license
 # terms ask for:
 #
-#   apps/companion-rs/package.sh <target triple> <out dir>
+#   apps/companion-a16/package.sh <target triple> <out dir>
 #
 # after `cargo build --release --locked --target <triple>` here and scripts/fetch-font.sh (CI's companion-rs
 # jobs, .github/workflows/). Writes <out dir>/slashplayed-companion-<os>-<arch>.zip (Windows) or .tar.gz
@@ -29,9 +29,9 @@ die() { echo "package: $*" >&2; exit 1; }
 TARGET=$1
 mkdir -p "$2"
 OUTDIR=$(cd "$2" && pwd)
-CRATE=$ROOT/apps/companion-rs
+CRATE=$(cd "$(dirname "$0")" && pwd)
 TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' "$CRATE/rust-toolchain.toml")
-[ -n "$TOOLCHAIN" ] || die "no channel in apps/companion-rs/rust-toolchain.toml"
+[ -n "$TOOLCHAIN" ] || die "no channel in $CRATE/rust-toolchain.toml"
 
 case $TARGET in
   *windows*) os=windows; exe=.exe ;;

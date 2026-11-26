@@ -69,15 +69,15 @@ impl Wait {
     pub fn text(&self) -> String {
         match self {
             Wait::UnlockTrusted { device } => {
-                format!("Unlock {device}: it trusts this computer, and setup goes on once it's unlocked.")
+                format!("Desbloqueie {device} para continuar. O dispositivo já confia neste computador.")
             }
             Wait::UnlockToTrust { device } => {
-                format!("Unlock {device}: it asks whether to trust this computer once it's unlocked.")
+                format!("Desbloqueie {device} para autorizar este computador.")
             }
-            Wait::Unlock { device } => format!("Unlock {device}: setup goes on once it's unlocked."),
-            Wait::Trust { device } => format!("On {device}, tap Trust, then enter its passcode."),
+            Wait::Unlock { device } => format!("Desbloqueie {device} para continuar."),
+            Wait::Trust { device } => format!("Em {device}, toque em Confiar e digite o código do dispositivo."),
             Wait::DeveloperMode { device } => format!(
-                "Developer Mode is off on {device}. On it, open Settings > Privacy & Security > Developer Mode, turn it on, and restart when asked; after the restart, tap Turn On and enter the passcode."
+                "O Modo de Desenvolvedor está desativado em {device}. Abra Ajustes > Privacidade e Segurança > Modo de Desenvolvedor e ative-o. Após reiniciar, toque em Ativar e digite o código."
             ),
         }
     }
@@ -96,19 +96,19 @@ pub struct Done {
 impl Done {
     /// The closing lines, as the command line has always printed them.
     pub fn lines(&self) -> Vec<String> {
-        let mut out = vec![format!("Slashplayed is on {}.", self.device)];
+        let mut out = vec![format!("Slashplayed instalado em {}.", self.device)];
         if self.free {
             out.push(
-                "It's signed with a free Apple ID: the first time, trust it in Settings > General > VPN & Device Management."
+                "Para usar a assinatura gratuita, autorize-a em Ajustes > Geral > VPN e Gerenciamento de Dispositivo."
                     .into(),
             );
             out.push(if self.renews {
-                "Its signing lasts 7 days. It renews itself when a game starts in the last 3; if it can't, its start screen says so, and running this again fixes it.".into()
+                "A assinatura dura 7 dias. O aplicativo tenta renová-la ao abrir um jogo nos últimos 3 dias. Se a renovação falhar, instale novamente.".into()
             } else {
-                "Run this again within 7 days, or the app stops opening.".into()
+                "Repita a instalação em até 7 dias para continuar abrindo o aplicativo.".into()
             });
         }
-        out.push("Open Slashplayed and tap a game to install it on the device.".into());
+        out.push("Abra o Slashplayed e toque em um jogo para instalá-lo.".into());
         out
     }
 }
@@ -137,6 +137,8 @@ pub struct SignIn {
 /// The person's side of a run.
 pub trait Frontend: Sync {
     fn report(&self, event: Event);
+    fn session_rejected(&self) {}
+    fn selected_team(&self, _team: &str) {}
 
     fn say(&self, line: &str) {
         self.report(Event::Say(line.to_string()));
@@ -274,6 +276,7 @@ async fn authenticate(
                     }
                     Err(e) if crate::account::authentication_rejected(&e) => {
                         b.session_store().delete(apple_id)?;
+                        ui.session_rejected();
                         ui.say("A Apple rejeitou a sessão guardada. É preciso entrar novamente.");
                     }
                     Err(e) => return Err(e).context("Falha ao validar a sessão Apple guardada")?,
@@ -324,7 +327,7 @@ pub async fn install(b: &mut impl Backend, ui: &dyn Frontend, opts: &Options<'_>
     // 1. The kit, first: a bad download shouldn't cost a sign-in.
     ui.report(Event::Step(Step::Kit));
     let (version, from) = b.kit(opts.kit).await?;
-    ui.say(&format!("device kit {version} from {from}"));
+    ui.say(&format!("Kit do dispositivo {version}, origem {from}"));
 
     // 2. The device.
     ui.report(Event::Step(Step::Device));
@@ -387,7 +390,7 @@ pub async fn install(b: &mut impl Backend, ui: &dyn Frontend, opts: &Options<'_>
                 }
             }
         }
-        ui.say(&format!("Developer Mode is on on {}", d.name));
+        ui.say(&format!("Modo de Desenvolvedor ativo em {}", d.name));
     }
 
     // 3. The Apple ID and team.
@@ -410,7 +413,8 @@ pub async fn install(b: &mut impl Backend, ui: &dyn Frontend, opts: &Options<'_>
     }
     drop(stored);
     let team = teams.remove(selection?);
-    ui.say(&crate::secret::sanitize(&format!("team {} ({})", team.name.as_deref().unwrap_or("?"), team.team_id)));
+    ui.selected_team(&team.team_id);
+    ui.say(&crate::secret::sanitize(&format!("Equipe {} ({})", team.name.as_deref().unwrap_or("?"), team.team_id)));
     let bundle_id = opts.bundle_id.map(str::to_string).unwrap_or_else(|| format!("{}.slashplayed", team.team_id));
     if !crate::kit::valid_bundle_id(&bundle_id) {
         bail!("{bundle_id} isn't a valid bundle ID (letters, digits, and hyphens, separated by dots)");
@@ -428,19 +432,19 @@ pub async fn install(b: &mut impl Backend, ui: &dyn Frontend, opts: &Options<'_>
     // app gets its own renewed profiles from Apple: apps/client/spapple.m).
     ui.report(Event::Step(Step::Container));
     if b.has_pairing(&d, &bundle_id).await? && !pair_again {
-        ui.say("the app already has a pairing record");
+        ui.say("O aplicativo já tem um registro de emparelhamento.");
     } else {
         let size = b.send_pairing(&d).await?;
-        ui.say(&format!("sent {} ({size} bytes)", crate::device::PAIRING_PATH));
+        ui.say(&format!("Arquivo {} enviado ({size} bytes)", crate::device::PAIRING_PATH));
     }
     if !b.send_ddi(ui).await? {
-        ui.say("the app already has this developer disk image");
+        ui.say("A imagem de disco de desenvolvedor já está no aplicativo.");
     }
     let renews = b.send_token().await?;
     ui.say(if renews {
-        "sent the Apple token, for the app to renew its own profiles"
+        "Credencial Apple enviada para renovação dos perfis pelo aplicativo."
     } else {
-        "no Apple token sent (--server-client-info): the app can't renew its own profiles"
+        "Renovação no aplicativo indisponível com --server-client-info."
     });
 
     let done = Done { device: d.name.clone(), free, renews };
@@ -891,9 +895,9 @@ mod tests {
     #[test]
     fn closing_words() {
         let paid = Done { device: "iPad".into(), free: false, renews: true }.lines();
-        assert_eq!(paid, ["Slashplayed is on iPad.", "Open Slashplayed and tap a game to install it on the device."]);
+        assert_eq!(paid, ["Slashplayed instalado em iPad.", "Abra o Slashplayed e toque em um jogo para instalá-lo."]);
         let free = Done { device: "iPad".into(), free: true, renews: false }.lines();
-        assert!(free[1].contains("VPN & Device Management"));
-        assert!(free[2].contains("within 7 days"));
+        assert!(free[1].contains("VPN e Gerenciamento de Dispositivo"));
+        assert!(free[2].contains("até 7 dias"));
     }
 }

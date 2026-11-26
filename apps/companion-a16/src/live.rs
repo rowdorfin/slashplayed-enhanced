@@ -155,12 +155,17 @@ impl Backend for Live {
         )?;
         drop(key_pem);
         drop(id);
-        ui.say("signed");
+        ui.say("Aplicativo assinado.");
         let ipa = self.scratch.path().join("Slashplayed.ipa");
         kit::ipa(&kit.app, &ipa)?;
-        ui.say(&format!("installing on {} ({} MB)", d.name, std::fs::metadata(&ipa)?.len() / 1_000_000));
+        ui.say(&format!("Instalando em {} ({} MB)", d.name, std::fs::metadata(&ipa)?.len() / 1_000_000));
         device::install(self.device(d)?, &ipa, ui).await?;
-        ui.say("installed");
+        ui.say("Aplicativo instalado.");
+        let expires = crate::profile::Profile::parse(&app_profile).ok()
+            .and_then(|profile| profile.expires()).map(|date| plist::Date::from(date).to_xml_format());
+        if let Err(e) = crate::state::save(&crate::state::Installation { bundle_id: bundle_id.into(), team: team.team_id.clone(), expires }) {
+            ui.say(&format!("Falha ao registrar a assinatura local ({})", secret::safe_error(&e)));
+        }
         Ok(())
     }
 

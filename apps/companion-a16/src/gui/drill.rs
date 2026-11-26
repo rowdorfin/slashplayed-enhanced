@@ -17,23 +17,23 @@ fn phone(udid: &str, name: &str, class: &str, os: &str) -> DeviceInfo {
 
 pub fn fill(app: &mut App, state: &str) {
     let mut s = lock(&app.shared);
-    let iphone = phone("A", "Alex's iPhone", "iPhone", "27.1");
+    let iphone = phone("A", "iPhone de Alex", "iPhone", "27.1");
     let lines = [
-        "device kit 1.5.0 from v1.5.0's slashplayed-device-kit.zip",
-        "Alex's iPhone (iPhone, iOS 27.1)",
-        "signing in, with anisette from https://mac-ani.jkcoxson.com",
-        "team Alex Example (Personal Team) (A1B2C3D4E5)",
-        "Alex's iPhone is already registered on the team",
-        "reusing this computer's Slashplayed certificate",
-        "profiles made: a free team, good for 6 more days (run this again within a week to keep Slashplayed opening)",
-        "signed",
-        "installing on Alex's iPhone (61 MB)",
+        "Kit do dispositivo 1.5.0",
+        "iPhone de Alex (iPhone, iOS 27.1)",
+        "Iniciando login na Apple.",
+        "Equipe Alex (A1B2C3D4E5)",
+        "O iPhone já está registrado na equipe.",
+        "Reutilizando o certificado Slashplayed deste computador.",
+        "Perfis preparados.",
+        "Aplicativo assinado.",
+        "Instalando em iPhone de Alex (61 MB)",
     ];
     let numbers = vec![(1, "+1 (•••) •••-••42".to_string()), (2, "+44 ••••• ••••91".to_string())];
     s.step = Some(Step::Device);
     match state {
         "device" => {
-            s.devices = vec![iphone.clone(), phone("B", "Alex's iPad", "iPad", "26.4")];
+            s.devices = vec![iphone.clone(), phone("B", "iPad de Alex", "iPad", "26.4")];
             app.device_choice = Some("A".into());
         }
         "unlock" => {
@@ -58,7 +58,7 @@ pub fn fill(app: &mut App, state: &str) {
         "team" => {
             s.step = Some(Step::SignIn);
             s.question = Some(Question::Team {
-                teams: vec![("Alex Example (Personal Team)".into(), "A1B2C3D4E5".into()), ("Example Studio LLC".into(), "F6G7H8J9K0".into())],
+                teams: vec![("Alex Example (Equipe pessoal)".into(), "A1B2C3D4E5".into()), ("Example Studio LLC".into(), "F6G7H8J9K0".into())],
                 reply: oneshot::channel().0,
             });
             app.team_choice = Some(0);

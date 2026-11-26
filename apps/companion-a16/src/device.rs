@@ -34,6 +34,7 @@ pub struct Device {
     pub usb: UsbmuxdDevice,
     pub name: String,
     pub class: String,
+    pub model: String,
     pub os: String,
 }
 
@@ -44,6 +45,20 @@ impl Device {
 
     pub fn provider(&self) -> UsbmuxdProvider {
         self.usb.to_provider(UsbmuxdAddr::default(), HOST_NAME)
+    }
+}
+
+fn friendly_model(product: &str) -> &str {
+    match product {
+        "iPad15,7" | "iPad15,8" => "iPad (A16)",
+        "iPhone14,7" => "iPhone 14",
+        "iPhone14,8" => "iPhone 14 Plus",
+        "iPhone15,2" => "iPhone 14 Pro",
+        "iPhone15,3" => "iPhone 14 Pro Max",
+        "iPhone15,4" => "iPhone 15",
+        "iPhone15,5" => "iPhone 15 Plus",
+        "iPad13,18" | "iPad13,19" => "iPad (10ª geração)",
+        _ => product,
     }
 }
 
@@ -75,8 +90,10 @@ pub async fn list() -> Result<Vec<Device>, Report> {
         };
         let name = get(&mut l, "DeviceName").await;
         let class = get(&mut l, "DeviceClass").await;
+        let product = get(&mut l, "ProductType").await;
+        let model = if product.is_empty() { class.clone() } else { friendly_model(&product).into() };
         let os = get(&mut l, "ProductVersion").await;
-        out.push(Device { usb, name, class, os });
+        out.push(Device { usb, name, class, model, os });
     }
     Ok(out)
 }
@@ -165,7 +182,7 @@ pub async fn ensure_trusted(d: &Device, ui: &dyn Frontend) -> Result<(), Report>
                 record.udid = Some(d.usb.udid.clone());
                 let bytes = Zeroizing::new(record.serialize()?);
                 mux.save_pair_record(&d.usb.udid, bytes.to_vec()).await.map_err(no_usbmuxd)?;
-                ui.say(&format!("{} trusts this computer", d.name));
+                ui.say(&format!("{} confia neste computador", d.name));
                 return Ok(());
             }
             Err(IdeviceError::PasswordProtected) => {

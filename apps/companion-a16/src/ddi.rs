@@ -89,7 +89,7 @@ pub async fn send_if_needed(afc: &mut idevice::afc::AfcClient, ui: &dyn Frontend
         files.push((f, data));
     }
     for (f, data) in &files {
-        ui.say(&format!("copying the developer disk image's {} ({} bytes)", f.path, data.len()));
+        ui.say(&format!("Copiando {} da imagem de disco de desenvolvedor ({} bytes)", f.path, data.len()));
         device::put(afc, &format!("{DEVICE_DIR}/Restore/{}", f.path), data).await?;
     }
     let list: String = FILES.iter().map(|f| format!("{}\n", f.path)).collect();

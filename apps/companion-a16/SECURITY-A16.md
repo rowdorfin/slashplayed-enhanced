@@ -11,3 +11,11 @@ Antes de pedir senha, o Companion verifica a validade local e consulta `listTeam
 Use `slashplayed-cli logout <apple-id>` para apagar a sessão e a senha deste computador. `forget --apple-id <id>` faz a mesma limpeza. Acrescente `--forget-key` para apagar também a chave RSA local. O serviço da chave continua sendo `com.strawdynamics.slashplayed.companion-rs`, com o Apple ID digitado e o mesmo formato de chave da versão oficial. Esses comandos operam localmente. Se a cota de certificados da equipe estiver cheia, libere uma vaga manualmente no portal Apple Developer.
 
 A validade declarada do token pode chegar a 365 dias. A reutilização em serviços de desenvolvimento foi observada por cerca de 1,1 dia. O prazo real além disso ainda não foi comprovado. A DPAPI protege contra outros usuários do Windows, mas malware executado na mesma conta pode acessar as credenciais dessa conta. O logout local deixa intacto o token que uma instalação já enviou ao dispositivo para renovar perfis.
+
+## GitHub e registro de instalação
+
+O token GitHub é obtido de `GH_TOKEN`, `GITHUB_TOKEN`, `gh auth token` ou da GUI, nessa ordem. A GUI só grava um token colado se o usuário selecionar **Lembrar token no Gerenciador de Credenciais**. O serviço é `com.rowdorfin.slashplayed-a16.github`, com usuário de credencial `github`. Para remover o token guardado, apague essa entrada no gerenciador do sistema. A autorização Bearer é enviada à API GitHub. O redirecionamento HTTPS para o arquivo é seguido sem o cabeçalho de autorização. O token fica fora do log e tem representação `Debug` redigida.
+
+O `state.json` é um registro local de bundle ID, equipe e validade do perfil obtida na última instalação. Ele é gravado em texto claro e não contém Apple ID, senha, sessão, token, chave de assinatura ou registro de emparelhamento. A GUI tem opções independentes para lembrar a sessão e guardar a senha, esta última desativada por padrão. **Desconectar conta** apaga a sessão Apple e a senha guardadas neste computador. A chave RSA local só é apagada ao selecionar a opção adicional no diálogo de confirmação.
+
+O log copiado pela GUI passa pelo sanitizador. Os arquivos baixados do aparelho em **Exportar logs** ou `logs --out` são cópias brutas, com hashes no manifesto. Revise-os antes de compartilhar, pois podem conter dados do dispositivo ou do conteúdo executado.

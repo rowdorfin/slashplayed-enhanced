@@ -38,6 +38,8 @@ Usage:
                                           apaga a sessão e a senha locais
   slashplayed-cli forget --apple-id <id> [--forget-key]
                                           mesmo que logout
+  slashplayed-cli logs --out <dir> [--bundle-id <id>] [--udid <UDID>] [--team <id>] [--jetsam-limit <n>]
+  slashplayed-cli kit-ci [--out <dir>]     consulta a CI; com --out, baixa e valida o kit
   slashplayed-cli --version
 
 Options for install:
@@ -63,7 +65,7 @@ struct Args {
     flags: Vec<String>,
 }
 
-const VALUED: &[&str] = &["--apple-id", "--team", "--udid", "--bundle-id", "--anisette", "--kit"];
+const VALUED: &[&str] = &["--apple-id", "--team", "--udid", "--bundle-id", "--anisette", "--kit", "--out", "--jetsam-limit"];
 const FLAGS: &[&str] = &["--server-client-info", "--pair-again", "--no-remember-session", "--remember-password", "--forget-key"];
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Args, Report> {
@@ -125,6 +127,34 @@ fn main() {
 async fn run(args: &Args) -> Result<(), Report> {
     match args.command.as_str() {
         "install" => install(args).await,
+        "logs" => {
+            let out = args.opt("--out").ok_or_else(|| report!("Informe o diretório com --out."))?;
+            let limit = args.opt("--jetsam-limit").map(str::parse).transpose()
+                .map_err(|_| report!("Informe um número inteiro não negativo em --jetsam-limit."))?
+                .unwrap_or(slashplayed_companion::logs::DEFAULT_JETSAM_LIMIT);
+            let result = slashplayed_companion::logs::export(std::path::Path::new(out), args.opt("--bundle-id"), args.opt("--team"), args.opt("--udid"), limit).await?;
+            for limit in result.limitations {
+                eprintln!("{limit}");
+            }
+            println!("{} arquivo(s) exportado(s). Consulte manifest.txt.", result.copied);
+            Ok(())
+        }
+        "kit-ci" => {
+            use slashplayed_companion::github;
+            let token = github::resolve(None)?;
+            let (run, artifact) = github::latest(token.as_ref()).await?;
+            println!("{}\n{} ({} bytes)", run.summary(), artifact.name, artifact.size_in_bytes);
+            if let Some(out) = args.opt("--out") {
+                let token = token.ok_or_else(|| report!("O download exige um token do GitHub."))?;
+                let download = github::download(&artifact, &token).await?;
+                download.save_to(std::path::Path::new(out))?;
+                if let Some(sha) = download.app_sha {
+                    println!("app_sha: {sha}");
+                }
+                println!("SHA-256 OK. Use install --kit com o ZIP baixado.");
+            }
+            Ok(())
+        }
         "devices" => {
             let devices = device::list().await?;
             if devices.is_empty() {

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use egui_kittest::{
     Harness,
-    kittest::Queryable,
+    kittest::{NodeT, Queryable},
 };
 
 use super::{App, SIZE, front};
@@ -14,8 +14,12 @@ use crate::flow::fake::{Fake, password, team};
 
 /// A window whose runs go to `fake` (a fresh copy each run, sharing its log).
 fn window(fake: impl Fn() -> Fake + Send + Sync + 'static) -> Harness<'static, App> {
-    let starter = front::starter(move || Ok(fake()), None);
-    Harness::builder().with_size(SIZE).build_eframe(move |cc| App::new(&cc.egui_ctx, starter, None))
+    let starter = front::starter(move || Ok(fake()));
+    Harness::builder().with_size(SIZE).build_eframe(move |cc| {
+        let mut app = App::new(&cc.egui_ctx, starter, Some("home"));
+        app.restart(&cc.egui_ctx);
+        app
+    })
 }
 
 /// Steps the window until `label` shows (the run is on its own thread), failing after a while.
@@ -50,12 +54,14 @@ fn sign_in(h: &mut Harness<'_, App>) {
 }
 
 fn sign_in_with(h: &mut Harness<'_, App>, password: &str) {
-    wait_for(h, "Sign in with your Apple ID");
+    wait_for(h, "Entre com seu Apple ID");
+    assert!(h.query_by_label_contains("Código do dispositivo Apple").is_none());
     type_into(h, "Apple ID", "x@example.com");
     h.get_by_label("Continuar").click();
     wait_for(h, "Digite a senha do Apple ID");
-    type_into(h, "Password", password);
-    h.get_by_label("Install").click();
+    type_into(h, "Senha", password);
+    assert!(h.query_by_label_contains("Código do dispositivo Apple").is_none());
+    h.get_by_label("Enviar senha").click();
 }
 
 /// The text field `label` names: what it holds, as the accessibility tree has it.
@@ -69,26 +75,24 @@ fn field_value(h: &Harness<'_, App>, label: &str) -> String {
 #[test]
 fn undo_doesnt_bring_the_password_back() {
     let mut h = window(|| Fake { two_factor: false, ..Default::default() });
-    wait_for(&mut h, "Sign in with your Apple ID");
+    wait_for(&mut h, "Entre com seu Apple ID");
     type_into(&mut h, "Apple ID", "x@example.com");
     h.get_by_label("Continuar").click();
     wait_for(&mut h, "Digite a senha do Apple ID");
-    type_into(&mut h, "Password", "wrong-one");
+    type_into(&mut h, "Senha", "wrong-one");
     // egui's undo keeps text that has stood still a while (a second), as a person's pause before Install.
     for _ in 0..90 {
         h.step();
     }
-    h.get_by_label("Install").click();
-    wait_for(&mut h, "Apple didn't accept the sign-in");
-    h.get_by_label("Try Again").click();
-    wait_for(&mut h, "Sign in with your Apple ID");
-    h.get_by_label("Continuar").click();
+    h.get_by_label("Enviar senha").click();
+    wait_for(&mut h, "Não foi possível entrar na Apple");
+    h.get_by_label("Tentar novamente").click();
     wait_for(&mut h, "Digite a senha do Apple ID");
     h.get_by(|n| n.role() == eframe::egui::accesskit::Role::PasswordInput).focus();
     h.run_steps(2);
     h.key_press_modifiers(eframe::egui::Modifiers::COMMAND, eframe::egui::Key::Z);
     h.run_steps(2);
-    assert!(field_value(&h, "Password").is_empty(), "the password came back with Ctrl+Z");
+    assert!(field_value(&h, "Senha").is_empty(), "the password came back with Ctrl+Z");
 }
 
 /// A wrong code says so, and the next one goes through.
@@ -96,14 +100,14 @@ fn undo_doesnt_bring_the_password_back() {
 fn a_wrong_code_says_so() {
     let mut h = window(|| Fake { wrong_code: true, ..Default::default() });
     sign_in(&mut h);
-    wait_for(&mut h, "Code from your Apple device");
-    assert!(h.query_by_label_contains("That didn't work").is_none());
-    type_into(&mut h, "Code from your Apple device", "111111");
-    h.get_by_label("Continue").click();
-    wait_for(&mut h, "That didn't work");
-    type_into(&mut h, "Code from your Apple device", "123456");
-    h.get_by_label("Continue").click();
-    wait_for(&mut h, "All set");
+    wait_for(&mut h, "Código do dispositivo Apple");
+    assert!(h.query_by_label_contains("Não foi possível verificar").is_none());
+    type_into(&mut h, "Código do dispositivo Apple", "111111");
+    h.get_by_label("Continuar").click();
+    wait_for(&mut h, "Não foi possível verificar");
+    type_into(&mut h, "Código do dispositivo Apple", "123456");
+    h.get_by_label("Continuar").click();
+    wait_for(&mut h, "Instalação concluída");
 }
 
 #[test]
@@ -112,15 +116,15 @@ fn text_me_instead() {
     let shared = log.clone();
     let mut h = window(move || Fake { calls: shared.clone(), ..Default::default() });
     sign_in(&mut h);
-    wait_for(&mut h, "Code from your Apple device");
-    assert!(h.query_by_label_contains("Text +1").is_none(), "the numbers stay folded away until asked for");
-    h.get_by_label("Text me instead").click();
+    wait_for(&mut h, "Código do dispositivo Apple");
+    assert!(h.query_by_label_contains("Enviar SMS para +1").is_none(), "the numbers stay folded away until asked for");
+    h.get_by_label("Receber por SMS").click();
     h.run_steps(2);
-    h.get_by_label("Text +1 (•••) •••-••12").click();
-    wait_for(&mut h, "Code from the text message");
-    type_into(&mut h, "Code from the text message", "123456");
-    h.get_by_label("Continue").click();
-    wait_for(&mut h, "All set");
+    h.get_by_label("Enviar SMS para +1 (•••) •••-••12").click();
+    wait_for(&mut h, "Código recebido por SMS");
+    type_into(&mut h, "Código recebido por SMS", "123456");
+    h.get_by_label("Continuar").click();
+    wait_for(&mut h, "Instalação concluída");
     let calls = log.lock().unwrap().clone();
     assert!(calls.contains(&"sms 3".to_string()), "{calls:?}");
     assert!(calls.contains(&"code sms=true".to_string()), "{calls:?}");
@@ -132,8 +136,8 @@ fn team_screen_only_with_several_teams() {
     let mut h = window(|| Fake { two_factor: false, ..Default::default() });
     sign_in(&mut h);
     let start = Instant::now();
-    while h.query_by_label_contains("All set").is_none() {
-        assert!(h.query_by_label_contains("Pick a team").is_none(), "one team, and the team screen showed");
+    while h.query_by_label_contains("Instalação concluída").is_none() {
+        assert!(h.query_by_label_contains("Escolha uma equipe").is_none(), "one team, and the team screen showed");
         assert!(start.elapsed() < Duration::from_secs(10), "never finished");
         h.step();
         std::thread::sleep(Duration::from_millis(2));
@@ -148,11 +152,11 @@ fn team_screen_only_with_several_teams() {
         ..Default::default()
     });
     sign_in(&mut h);
-    wait_for(&mut h, "Pick a team");
+    wait_for(&mut h, "Escolha uma equipe");
     h.get_by_label("Team T2 (T2)").click();
     h.run_steps(2);
-    h.get_by_label("Continue").click();
-    wait_for(&mut h, "All set");
+    h.get_by_label("Continuar").click();
+    wait_for(&mut h, "Instalação concluída");
     assert!(log.lock().unwrap().contains(&"provision T2 T2.slashplayed".to_string()));
 }
 
@@ -161,26 +165,47 @@ fn certificate_limit_requires_manual_action() {
     let mut h = window(|| Fake { two_factor: false, cert_limit: true, ..Default::default() });
     sign_in(&mut h);
     wait_for(&mut h, "A cota de certificados");
-    assert!(h.query_by_label("Try Again").is_some());
+    assert!(h.query_by_label("Tentar novamente").is_some());
 }
 
 #[test]
 fn every_drill_state_opens() {
     for state in super::drill::STATES {
-        let starter: front::Starter = std::sync::Arc::new(|_, _| panic!("a drill starts no run"));
+        let starter: front::Starter = std::sync::Arc::new(|_, _, _| panic!("a drill starts no run"));
         let mut h = Harness::builder().with_size(SIZE).build_eframe(move |cc| App::new(&cc.egui_ctx, starter, Some(state)));
         h.run_steps(3);
-        assert!(h.query_by_label("…").is_some(), "{state}: no menu");
         let title = match *state {
-            "device" | "unlock" | "developer-mode" => "Connect your device",
-            "sign-in" => "Sign in with your Apple ID",
-            "code" => "Enter the code",
-            "team" => "Pick a team",
-            "installing" => "Installing",
-            "done" => "All set",
-            "error" | "cert-limit" => "Something went wrong",
+            "device" | "unlock" | "developer-mode" => "Conecte o dispositivo",
+            "sign-in" => "Entre com seu Apple ID",
+            "code" => "Digite o código de verificação",
+            "team" => "Escolha uma equipe",
+            "installing" => "Instalando",
+            "done" => "Instalação concluída",
+            "error" | "cert-limit" => "Algo deu errado",
             other => panic!("no title for the drill state {other}"),
         };
         assert!(h.query_by_label(title).is_some(), "{state}: not the {title:?} screen");
     }
+}
+
+#[test]
+fn dashboard_translated_and_mismatched_hash_blocks_install() {
+    let starter: front::Starter = std::sync::Arc::new(|_, _, _| panic!("a divergent ZIP must not start a run"));
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("kit.zip");
+    std::fs::write(&path, b"fake kit").unwrap();
+    let mut h = Harness::builder().with_size(SIZE).build_eframe(move |cc| {
+        let mut app = App::new(&cc.egui_ctx, starter, Some("home"));
+        app.home.kit = path.to_string_lossy().into_owned();
+        app
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("Conta Apple").is_some());
+    assert!(h.query_by_label("Lembrar sessão neste computador").is_some());
+    assert!(h.query_by_label_contains("nenhuma sessão guardada").is_some());
+    assert!(h.query_by_label_contains("Código do dispositivo Apple").is_none());
+    type_into(&mut h, "SHA-256 esperado", &"0".repeat(64));
+    h.get_by_label("Verificar").click();
+    wait_for(&mut h, "SHA-256 divergente");
+    assert!(h.get_by_label("Instalar").accesskit_node().is_disabled());
 }

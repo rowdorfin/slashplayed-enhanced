@@ -10,8 +10,8 @@ fn main() -> std::process::ExitCode {
     // the window: said where the person can see it, as a console program would in its terminal.
     let said = match std::panic::catch_unwind(slashplayed_companion::gui::run) {
         Ok(Ok(())) => return std::process::ExitCode::SUCCESS,
-        Ok(Err(e)) => format!("The window couldn't open: {e}"),
-        Err(_) => "The window stopped unexpectedly.".to_string(),
+        Ok(Err(e)) => format!("Não foi possível abrir a janela.\n{}", slashplayed_companion::secret::sanitize(&e.to_string())),
+        Err(_) => "A janela foi interrompida inesperadamente.".to_string(),
     };
     fatal(&said);
     std::process::ExitCode::FAILURE
