@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum SPGraphicsPreset { SP_GRAPHICS_KEEP, SP_GRAPHICS_PERFORMANCE, SP_GRAPHICS_BALANCED, SP_GRAPHICS_QUALITY };
+enum SPGraphicsPreset { SP_GRAPHICS_KEEP, SP_GRAPHICS_PERFORMANCE, SP_GRAPHICS_BALANCED, SP_GRAPHICS_QUALITY, SP_GRAPHICS_A16 };
 
 typedef struct {
     const char *name;
@@ -131,17 +131,30 @@ static char *sp_wtf_edit(const char *text, SPWTFEdit *edits, size_t count) {
 }
 
 // Gethe/wow-ui-source tag 1.60.1, Interface/AddOns. G = Blizzard_SettingsDefinitions_Shared/Graphics.lua.
-// The RenderScale slider's bounds are queried at runtime. The foreground FPS checkbox gates its cap.
-static const struct { const char *name, *values[3]; } sp_graphics_cvars[] = {
-    {"RenderScale",               {"0.75", "0.85", NULL}}, // G:875-899
-    {"graphicsShadowQuality",     {"0",    "2",    NULL}}, // G:109,134-142
-    {"graphicsParticleDensity",   {"1",    "2",    NULL}}, // G:115,179-196; keeps combat cues
-    {"graphicsSSAO",              {"0",    "1",    NULL}}, // G:116,201-208
-    {"graphicsGroundClutter",     {"0",    "4",    NULL}}, // G:132,441-443,491
-    {"graphicsTextureResolution", {"2",    "2",    NULL}}, // G:120,473; Blizzard_Settings_Shared/Mainline/GraphicsOverrides.lua:67-74
-    {"useMaxFPS",                 {"1",    "1",    NULL}}, // G:1466-1469
-    {"maxFPS",                    {"30",   "45",   "60"}}, // G:1471-1477
+// The launcher already seeds 0.5 on iPhone. Graphics.lua queries GetMinRenderScale()
+// at runtime, so the client's accepted minimum still needs readback.
+static const struct { const char *name, *values[4]; } sp_graphics_cvars[] = {
+    {"RenderScale",               {"0.75", "0.85", NULL, "0.5"}}, // G:875-899
+    {"graphicsShadowQuality",     {"0",    "2",    NULL, "0"}}, // G:109,134-142
+    {"graphicsParticleDensity",   {"1",    "2",    NULL, "1"}}, // G:115,179-196; keeps combat cues
+    {"graphicsSSAO",              {"0",    "1",    NULL, "0"}}, // G:116,201-208
+    {"graphicsGroundClutter",     {"0",    "4",    NULL, "0"}}, // G:132,441-443,491
+    {"graphicsTextureResolution", {"0",    "1",    NULL, "0"}}, // G:120,473; GraphicsOverrides.lua:67-74 (0 low, 1 fair, 2 high)
+    {"useMaxFPS",                 {"1",    "1",    NULL, "1"}}, // G:1466-1469
+    {"maxFPS",                    {"30",   "45",   "60", "30"}}, // G:1471-1477
+    {"graphicsLiquidDetail",      {NULL, NULL, NULL, "0"}},
+    {"graphicsDepthEffects",      {NULL, NULL, NULL, "0"}},
+    {"graphicsComputeEffects",    {NULL, NULL, NULL, "0"}},
+    {"graphicsPBRLiquidDetail",   {NULL, NULL, NULL, "0"}},
+    {"graphicsProjectedTextures", {NULL, NULL, NULL, "0"}},
+    {"graphicsViewDistance",      {NULL, NULL, NULL, "0"}},
+    {"graphicsEnvironmentDetail", {NULL, NULL, NULL, "0"}},
+    {"textureFilteringMode",      {NULL, NULL, NULL, "0"}},
+    {"ffxAntiAliasingMode",        {NULL, NULL, NULL, "0"}},
+    {"MSAAQuality",                {NULL, NULL, NULL, "0"}},
+    {"RAIDsettingsEnabled",       {NULL, NULL, NULL, "0"}},
 };
+enum { SP_GRAPHICS_LEGACY_COUNT = 8 };
 #define SP_GRAPHICS_COUNT (sizeof sp_graphics_cvars / sizeof sp_graphics_cvars[0])
 #define SP_GRAPHICS_BACKUP_HEADER "# Slashplayed graphics backup v1\n"
 
@@ -149,19 +162,19 @@ static void sp_graphics_keys(SPWTFEdit *edits) {
     for (size_t i = 0; i < SP_GRAPHICS_COUNT; i++) edits[i].name = sp_graphics_cvars[i].name;
 }
 
-static char *sp_graphics_backup(const char *text) {
+static char *sp_graphics_backup(const char *text, size_t count) {
     SPWTFEdit edits[SP_GRAPHICS_COUNT] = {0};
     sp_graphics_keys(edits);
-    sp_wtf_find(text, edits, SP_GRAPHICS_COUNT);
+    sp_wtf_find(text, edits, count);
     size_t capacity = sizeof SP_GRAPHICS_BACKUP_HEADER;
-    for (size_t i = 0; i < SP_GRAPHICS_COUNT; i++) {
+    for (size_t i = 0; i < count; i++) {
         capacity += strlen(edits[i].name) + 3;
         if (edits[i].last) capacity += (size_t)(edits[i].end - edits[i].begin);
     }
     char *backup = malloc(capacity);
     if (!backup) return NULL;
     char *out = backup + sprintf(backup, "%s", SP_GRAPHICS_BACKUP_HEADER);
-    for (size_t i = 0; i < SP_GRAPHICS_COUNT; i++) {
+    for (size_t i = 0; i < count; i++) {
         SPWTFEdit *edit = &edits[i];
         out += sprintf(out, "%s\t%c", edit->name, edit->last ? '+' : '-');
         if (edit->last) {
@@ -175,11 +188,12 @@ static char *sp_graphics_backup(const char *text) {
     return backup;
 }
 
-static bool sp_graphics_read_backup(const char *backup, SPWTFEdit *edits) {
+static size_t sp_graphics_read_backup(const char *backup, SPWTFEdit *edits) {
     size_t header = sizeof SP_GRAPHICS_BACKUP_HEADER - 1;
     if (!backup || strncmp(backup, SP_GRAPHICS_BACKUP_HEADER, header)) return false;
     backup += header;
     for (size_t i = 0; i < SP_GRAPHICS_COUNT; i++) {
+        if (!*backup && i == SP_GRAPHICS_LEGACY_COUNT) return i;
         SPWTFEdit *edit = &edits[i];
         size_t name = strlen(edit->name);
         if (strncmp(backup, edit->name, name) || backup[name] != '\t') return false;
@@ -200,26 +214,43 @@ static bool sp_graphics_read_backup(const char *backup, SPWTFEdit *edits) {
         }
         backup = end + 1;
     }
-    return !*backup;
+    return *backup ? 0 : SP_GRAPHICS_COUNT;
+}
+
+// Old backups cover the original eight keys. Capture the additional keys from
+// the current config before an A16 preset first edits them.
+static char *sp_graphics_expand_backup(const char *backup, const char *text) {
+    SPWTFEdit edits[SP_GRAPHICS_COUNT] = {0};
+    sp_graphics_keys(edits);
+    if (sp_graphics_read_backup(backup, edits) != SP_GRAPHICS_LEGACY_COUNT) return NULL;
+    char *full = sp_graphics_backup(text, SP_GRAPHICS_COUNT);
+    if (!full) return NULL;
+    const char *suffix = full + sizeof SP_GRAPHICS_BACKUP_HEADER - 1;
+    for (size_t i = 0; i < SP_GRAPHICS_LEGACY_COUNT; i++) suffix = strchr(suffix, '\n') + 1;
+    char *expanded = malloc(strlen(backup) + strlen(suffix) + 1);
+    if (expanded) sprintf(expanded, "%s%s", backup, suffix);
+    free(full);
+    return expanded;
 }
 
 static char *sp_graphics_edit(const char *text, const char *backup, enum SPGraphicsPreset preset,
-                              bool restoreBaseline, size_t *applied, size_t *unchanged) {
+                              bool restoreBaseline, bool restoreA16, size_t *applied, size_t *unchanged) {
     SPWTFEdit edits[SP_GRAPHICS_COUNT] = {0};
     sp_graphics_keys(edits);
-    if (!sp_graphics_read_backup(backup, edits)) return NULL;
-    for (size_t i = 0; i < SP_GRAPHICS_COUNT && preset != SP_GRAPHICS_KEEP; i++) {
+    size_t count = sp_graphics_read_backup(backup, edits);
+    if (!count || (preset == SP_GRAPHICS_A16 && count != SP_GRAPHICS_COUNT)) return NULL;
+    for (size_t i = 0; i < count && preset != SP_GRAPHICS_KEEP; i++) {
         const char *value = sp_graphics_cvars[i].values[preset - 1];
-        if (value || !restoreBaseline) {
+        if (value || !(i < SP_GRAPHICS_LEGACY_COUNT ? restoreBaseline : restoreA16)) {
             edits[i].value = value;
             edits[i].length = value ? strlen(value) : 0;
             edits[i].remove = false;
         }
     }
-    char *output = sp_wtf_edit(text, edits, SP_GRAPHICS_COUNT);
+    char *output = sp_wtf_edit(text, edits, count);
     if (!output) return NULL;
     *applied = *unchanged = 0;
-    for (size_t i = 0; i < SP_GRAPHICS_COUNT; i++) {
+    for (size_t i = 0; i < count; i++) {
         if (edits[i].changed) (*applied)++;
         else if (edits[i].value || edits[i].remove) (*unchanged)++;
     }

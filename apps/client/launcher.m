@@ -268,14 +268,23 @@ static BOOL graphics_config(enum SPGraphicsPreset preset, NSString *name) {
     if (!missingBackup) status = @"kept";
     if (!config || !saved || (missingBackup && restore)) goto done;
     if (missingBackup) {
-        snapshot = sp_graphics_backup(config.bytes);
+        snapshot = sp_graphics_backup(config.bytes, preset == SP_GRAPHICS_A16 ? SP_GRAPHICS_COUNT : SP_GRAPHICS_LEGACY_COUNT);
         if (!snapshot || !graphics_create_backup(backupPath, snapshot)) goto done;
         status = @"created";
     }
+    if (!snapshot && preset == SP_GRAPHICS_A16) {
+        SPWTFEdit keys[SP_GRAPHICS_COUNT] = {0};
+        sp_graphics_keys(keys);
+        if (sp_graphics_read_backup(saved.bytes, keys) == SP_GRAPHICS_LEGACY_COUNT) {
+            snapshot = sp_graphics_expand_backup(saved.bytes, config.bytes);
+            if (!snapshot || !config_write(backupPath, snapshot)) goto done;
+            status = @"expanded";
+        }
+    }
     NSInteger prior = [defaults integerForKey:graphicsAppliedKey];
     BOOL restoreBaseline = preset == SP_GRAPHICS_QUALITY &&
-                          (prior == SP_GRAPHICS_PERFORMANCE || prior == SP_GRAPHICS_BALANCED);
-    output = sp_graphics_edit(config.bytes, snapshot ? snapshot : saved.bytes, preset, restoreBaseline, &applied, &unchanged);
+                          (prior == SP_GRAPHICS_PERFORMANCE || prior == SP_GRAPHICS_BALANCED || prior == SP_GRAPHICS_A16);
+    output = sp_graphics_edit(config.bytes, snapshot ? snapshot : saved.bytes, preset, restoreBaseline, prior == SP_GRAPHICS_A16, &applied, &unchanged);
     if (!output || (applied && !config_write(path, output))) {
         applied = unchanged = 0;
         goto done;
@@ -301,12 +310,35 @@ BOOL sp_graphics_restore(void) {
     return graphics_config(SP_GRAPHICS_KEEP, @"restore");
 }
 
+static void graphics_observe(NSInteger preset, NSString *phase) {
+    if (preset < SP_GRAPHICS_PERFORMANCE || preset > SP_GRAPHICS_A16) return;
+    BOOL missing;
+    NSData *config = config_read(config_wtf_path(@"forever"), &missing);
+    if (!config || missing) return;
+    SPWTFEdit keys[SP_GRAPHICS_COUNT] = {0};
+    sp_graphics_keys(keys);
+    sp_wtf_find(config.bytes, keys, SP_GRAPHICS_COUNT);
+    NSMutableArray *requested = [NSMutableArray array], *effective = [NSMutableArray array];
+    for (size_t i = 0; i < SP_GRAPHICS_COUNT; i++) {
+        const char *value = sp_graphics_cvars[i].values[preset - 1];
+        if (!value) continue;
+        [requested addObject:[NSString stringWithFormat:@"%s:%s", keys[i].name, value]];
+        [effective addObject:keys[i].begin
+            ? [NSString stringWithFormat:@"%s:%.*s", keys[i].name, (int)(keys[i].end - keys[i].begin), keys[i].begin]
+            : [NSString stringWithFormat:@"%s:absent", keys[i].name]];
+    }
+    say([NSString stringWithFormat:@"SP_GRAPHICS requested=%@ effective=%@ source=Config.wtf phase=%@",
+         [requested componentsJoinedByString:@","], [effective componentsJoinedByString:@","], phase]);
+}
+
 static void graphics_preset(NSString *flavor) {
     if (![flavor isEqualToString:@"forever"]) return;
+    graphics_observe([NSUserDefaults.standardUserDefaults integerForKey:graphicsAppliedKey], @"previous-session");
     NSInteger preset = [NSUserDefaults.standardUserDefaults integerForKey:graphicsChoiceKey];
-    if (preset < SP_GRAPHICS_PERFORMANCE || preset > SP_GRAPHICS_QUALITY) return;
-    NSArray<NSString *> *names = @[@"performance", @"balanced", @"quality"];
-    graphics_config((enum SPGraphicsPreset)preset, names[preset - SP_GRAPHICS_PERFORMANCE]);
+    if (preset < SP_GRAPHICS_PERFORMANCE || preset > SP_GRAPHICS_A16) return;
+    NSArray<NSString *> *names = @[@"performance", @"balanced", @"quality", @"a16-performance"];
+    if (graphics_config((enum SPGraphicsPreset)preset, names[preset - SP_GRAPHICS_PERFORMANCE]))
+        graphics_observe(preset, @"preboot");
 }
 
 // An iPhone renders at 2x by default (spwindow.m), for a readable UI; the game's own render scale at 50%
@@ -915,6 +947,19 @@ int main(int argc, char **argv) {
     game_region(flavor, choice);
     graphics_preset(flavor);
     default_render_scale(flavor);
+    BOOL missingResolutionConfig;
+    NSData *resolutionConfig = config_read(config_wtf_path(flavor), &missingResolutionConfig);
+    SPWTFEdit scaleKeys[] = {{.name = "RenderScale"}, {.name = "uiScale"}, {.name = "useUiScale"}};
+    if (resolutionConfig && !missingResolutionConfig) {
+        sp_wtf_find(resolutionConfig.bytes, scaleKeys, sizeof scaleKeys / sizeof *scaleKeys);
+        const char *envKeys[] = {"SP_CONFIG_RENDER_SCALE", "SP_CONFIG_UI_SCALE", "SP_CONFIG_USE_UI_SCALE"};
+        for (size_t i = 0; i < sizeof scaleKeys / sizeof *scaleKeys; i++)
+            if (scaleKeys[i].begin) {
+                NSString *value = [[NSString alloc] initWithBytes:scaleKeys[i].begin
+                                      length:scaleKeys[i].end - scaleKeys[i].begin encoding:NSUTF8StringEncoding];
+                if (value) setenv(envKeys[i], value.UTF8String, 1);
+            }
+    }
     skip_intro(flavor);
     flavor_info(flavor);
     // The addons the app carries, into the game's folder before the client loads (sp_addons_place): SPMovie
@@ -1037,7 +1082,10 @@ int main(int argc, char **argv) {
     for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const void *)((const char *)lc + lc->cmdsize))
         if (lc->cmd == LC_MAIN) {
             int (*client_main)(int, char **) = (void *)((const char *)mh + ((const struct entry_point_command *)lc)->entryoff);
-            return client_main(argc, argv);
+            int result = client_main(argc, argv);
+            if ([flavor isEqualToString:@"forever"])
+                graphics_observe([NSUserDefaults.standardUserDefaults integerForKey:graphicsAppliedKey], @"client-return");
+            return result;
         }
     say(@"the client has no LC_MAIN");
     return 1;

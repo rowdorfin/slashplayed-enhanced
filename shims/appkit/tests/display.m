@@ -37,6 +37,8 @@ static void sp_test_run(void) {
                   @"1920 preserves the screenshot iPad's aspect ratio with even pixels.");
     sp_test_check(CGSizeEqualToSize(sp_resolution_pixels(CGSizeMake(1024, 1366), 2560.0 / 1366, YES), CGSizeMake(1920, 2560)),
                   @"2560 has the matching portrait dimensions.");
+    sp_test_check(CGSizeEqualToSize(sp_resolution_pixels(CGSizeMake(806, 390), 2560.0 / 806, YES), CGSizeMake(2560, 1238)),
+                  @"A cropped phone game surface can advertise 2560x1238 independently of native screen pixels.");
     sp_test_check(sp_CGDisplayRegisterReconfigurationCallback(NULL, NULL) == 1001, @"Null callbacks are rejected.");
     sp_CGDisplayRegisterReconfigurationCallback(sp_test_display_changed, &sp_test_checks);
     sp_CGDisplayRegisterReconfigurationCallback(sp_test_display_changed, &sp_test_checks);
@@ -157,6 +159,45 @@ static void sp_test_run(void) {
             sp_select_resolution(resolution); sp_window_track_scene();
             CFRelease(mode);
         }
+    }
+    if (!sp_scale_overridden()) {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        NSInteger originalMode = [defaults integerForKey:@"sp_resolution"];
+        CGRect game = sp_game_rect();
+        CGPoint scenePoint = CGPointMake(game.origin.x + game.size.width / 4, game.origin.y + game.size.height * 3 / 4);
+        CGPoint input = sp_from_uikit(scenePoint);
+        for (NSNumber *choice in @[@1280, @1600, @1688, @(SPResolutionNative)]) {
+            [defaults setInteger:choice.integerValue forKey:@"sp_optimized_resolution"];
+            sp_window_track_scene();
+            CGSize pixels = sp_mode_pixels(choice.integerValue);
+            CGSize logical = sp_game_rect().size;
+            CGFloat scale = choice.integerValue == SPResolutionNative
+                          ? sp_window.windowScene.screen.nativeScale : choice.doubleValue / logical.width;
+            sp_test_check(fabs(pixels.width - logical.width * scale) <= 1 &&
+                          fabs(pixels.height - logical.height * scale) <= 1,
+                          @"Both axes use the same scale before rounding to even pixels.");
+            layer.drawableSize = CGSizeMake(2560, 1238);
+            sp_test_check(CGSizeEqualToSize(layer.drawableSize, pixels), @"An oversized drawable request respects the selected ceiling.");
+            if (layer.device) {
+                @autoreleasepool {
+                    id<CAMetalDrawable> drawable = [layer nextDrawable];
+                    sp_test_check(drawable && drawable.texture.width == pixels.width && drawable.texture.height == pixels.height,
+                                  @"The optimized mode allocates a Metal drawable at the requested size.");
+                }
+            }
+            SPDisplayMode *current = CFBridgingRelease(sp_CGDisplayCopyDisplayMode(1));
+            sp_test_check(CGSizeEqualToSize(current->pixels, pixels), @"The optimized mode sets the display ceiling.");
+            sp_test_check(fabs(current->size.width - logical.width) <= 1 / scale &&
+                          fabs(current->size.height - logical.height) <= 1 / scale,
+                          @"The display reports game-sized point bounds, allowing pixel rounding.");
+            NSArray *modes = CFBridgingRelease(sp_CGDisplayCopyAllDisplayModes(1, NULL));
+            sp_test_check(modes.count == 1, @"WoW sees the requested ceiling as a selectable mode.");
+            sp_test_check(CGPointEqualToPoint(sp_from_uikit(scenePoint), input), @"Changing pixels preserves point-space hit locations.");
+            sp_test_check([defaults integerForKey:@"sp_resolution"] == originalMode, @"An override preserves WoW's saved mode.");
+        }
+        [defaults removeObjectForKey:@"sp_optimized_resolution"];
+        sp_window_track_scene();
+        sp_test_check(sp_resolution_now() == resolution, @"Removing the override restores the previously selected mode.");
     }
     sp_test_check(sp_test_resizes >= 3, @"Orientation and resolution changes send resize notifications.");
     sp_test_check(sp_CGDisplaySetDisplayMode(2, snapshot, NULL) == 1001, @"Invalid display selections are rejected.");

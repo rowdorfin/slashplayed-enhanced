@@ -386,6 +386,7 @@ private struct DoneButton: ToolbarContent {
 
 struct SettingsView: View {
     @ObservedObject var settings: Settings
+    @AppStorage("sp_optimized_resolution") private var optimizedResolution = 0
     @AppStorage("sp_forever_graphics_preset") private var graphicsPreset = 0
     @State private var graphicsRestoreFailed = false
     @State private var columns: NavigationSplitViewVisibility = .all
@@ -699,7 +700,14 @@ struct SettingsView: View {
                     settings.reload()
                 }
             ))
-            ForEach(displayChoices) { choice in
+            Picker("Game resolution", selection: $optimizedResolution) {
+                Text("Choose in WoW").tag(0)
+                Text("1280 px").tag(1280)
+                Text("1600 px").tag(1600)
+                Text("1688 px").tag(1688)
+                Text("Native").tag(3)
+            }
+            ForEach(optimizedResolution == 0 ? displayChoices : []) { choice in
                 VStack(alignment: .leading, spacing: 4) {
                     #if os(visionOS)
                     Text(choice.dimensions + " pixels")
@@ -714,7 +722,7 @@ struct SettingsView: View {
             Text("Resolutions in WoW")
         } footer: {
             VStack(alignment: .leading, spacing: 12) {
-                Text("All resolutions are available in WoW’s Graphics menu. Choose there; your last selection is remembered for the next launch. The initial default stays at the device’s recommended resolution.")
+                Text("Choose a resolution for the next launch. “Choose in WoW” uses the game’s Graphics menu and remembers its last selection.")
                 Text("Lower resolutions reduce GPU work and are better suited to battery life; higher resolutions add detail and usually use more power.")
                 Text(UIDevice.current.userInterfaceIdiom == .phone
                      ? "WoW shows the exact dimensions for your game window."
@@ -864,6 +872,7 @@ struct SettingsView: View {
                     Text("Performance").tag(1)
                     Text("Balanceado").tag(2)
                     Text("Qualidade").tag(3)
+                    Text("A16 Performance").tag(4)
                 }
                 Button("Restaurar configuração anterior") {
                     if sp_graphics_restore() {

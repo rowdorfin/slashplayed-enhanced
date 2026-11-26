@@ -23,6 +23,7 @@
 // the screen, as a Stage Manager window is, and the drawable cap is the screen's.
 
 #include <objc/message.h>
+#import <QuartzCore/CAMetalLayer.h>
 #include "spdisplaygeometry.h"
 
 @interface NSScreen (SPUIKitDecl)
@@ -165,17 +166,39 @@ static CGFloat sp_native_scale(void) {
 // Keep the existing default and saved selection, including older backing-scale preferences, but
 // always expose the complete catalog in WoW. Small stable IDs name the screen-relative modes;
 // long-edge IDs name fixed presets. An old availability toggle must never hide a valid game choice.
-enum { SPResolutionFullDetail = 1, SPResolutionLowerPower = 2 };
+enum { SPResolutionFullDetail = 1, SPResolutionLowerPower = 2, SPResolutionNative = 3 };
+
+static NSInteger sp_optimized_resolution(void) {
+    if (sp_scale_overridden()) return 0;
+    NSInteger saved = [NSUserDefaults.standardUserDefaults integerForKey:@"sp_optimized_resolution"];
+    switch (saved) {
+        case 1280: case 1600: case 1688: case SPResolutionNative: return saved;
+        default: return 0;
+    }
+}
+
 static NSArray<NSNumber *> *sp_resolution_catalog(void) {
+    NSInteger optimized = sp_optimized_resolution();
+    if (optimized) return @[@(optimized)];
     return @[@0, @(SPResolutionLowerPower), @1920, @2560, @(SPResolutionFullDetail)];
 }
 
 static BOOL sp_resolution_available(NSInteger resolution) {
+    NSInteger optimized = sp_optimized_resolution();
+    if (optimized) return optimized == resolution;
     if (!resolution) return YES;
     return !sp_scale_overridden() && [sp_resolution_catalog() containsObject:@(resolution)];
 }
 
 static CGFloat sp_resolution_scale(NSInteger resolution, CGSize points) {
+    if (resolution == SPResolutionNative) {
+#if TARGET_OS_VISION
+        return 2;
+#else
+        UIScreen *screen = sp_window.windowScene.screen;
+        return screen ? screen.nativeScale : sp_native_scale();
+#endif
+    }
     if (resolution == SPResolutionLowerPower) return 1;
     if (resolution == SPResolutionFullDetail) {
 #if TARGET_OS_VISION
@@ -186,11 +209,15 @@ static CGFloat sp_resolution_scale(NSInteger resolution, CGSize points) {
         return MAX(1, scale);
 #endif
     }
-    return resolution ? resolution / MAX(1, MAX(points.width, points.height)) : sp_native_scale();
+    if (!resolution) return sp_native_scale();
+    CGFloat edge = resolution == sp_optimized_resolution() ? points.width : MAX(points.width, points.height);
+    return resolution / MAX(1, edge);
 }
 
 static NSInteger sp_selected_resolution = -1;
 static NSInteger sp_resolution_now(void) {
+    NSInteger optimized = sp_optimized_resolution();
+    if (optimized) return optimized;
     if (sp_selected_resolution < 0) {
         NSInteger saved = [NSUserDefaults.standardUserDefaults integerForKey:@"sp_resolution"];
         sp_selected_resolution = sp_resolution_available(saved) ? saved : 0;
@@ -236,6 +263,12 @@ static CGSize sp_mode_pixels(NSInteger resolution) {
 // A virtual screen large enough for every enabled preset, independent of the current low-power
 // drawable. Otherwise WoW clamps a higher selection to the old display ceiling before requesting it.
 static CGRect sp_screen_rect(void) {
+    NSInteger optimized = sp_optimized_resolution();
+    if (optimized) {
+        CGSize pixels = sp_mode_pixels(optimized);
+        CGFloat scale = sp_scale_now();
+        return CGRectMake(0, 0, pixels.width / scale, pixels.height / scale);
+    }
     CGSize device = sp_device_screen_rect().size;
     CGSize pixels = CGSizeMake(device.width * sp_native_scale(), device.height * sp_native_scale());
     for (NSNumber *preset in sp_resolution_catalog()) if (sp_resolution_available(preset.integerValue)) {
@@ -320,21 +353,21 @@ static void sp_set_rect(id obj, void *key, CGRect r) {
     return sp_screen_rect();
 }
 - (CGFloat)backingScaleFactor {
-    return sp_native_scale();
+    return sp_optimized_resolution() ? sp_scale : sp_native_scale();
 }
 - (CGRect)convertRectToBacking:(CGRect)r {
-    CGFloat scale = sp_native_scale();
+    CGFloat scale = self.backingScaleFactor;
     return CGRectMake(r.origin.x * scale, r.origin.y * scale, r.size.width * scale, r.size.height * scale);
 }
 - (CGRect)convertRectFromBacking:(CGRect)r {
-    CGFloat scale = sp_native_scale();
+    CGFloat scale = self.backingScaleFactor;
     return CGRectMake(r.origin.x / scale, r.origin.y / scale, r.size.width / scale, r.size.height / scale);
 }
 - (NSDictionary *)deviceDescription {
     return @{
         @"NSScreenNumber": @1,  // CGDirectDisplayID
         @"NSDeviceSize": [NSValue valueWithCGSize:sp_screen_rect().size],
-        @"NSDeviceResolution": [NSValue valueWithCGSize:CGSizeMake(72 * sp_native_scale(), 72 * sp_native_scale())],
+        @"NSDeviceResolution": [NSValue valueWithCGSize:CGSizeMake(72 * self.backingScaleFactor, 72 * self.backingScaleFactor)],
     };
 }
 @end
@@ -436,8 +469,59 @@ static void sp_set_rect(id obj, void *key, CGRect r) {
 // off screen.
 static CALayer *sp_resolution_layer;
 static void (*sp_drawable_size_orig)(id, SEL, CGSize);
+static void sp_log_resolution(CAMetalLayer *layer) {
+    if (!layer) return;
+    CGRect game = sp_game_rect();
+    CGSize drawable = layer.drawableSize;
+    CGSize physical = CGSizeZero;
+#if !TARGET_OS_VISION
+    UIScreen *screen = sp_window.windowScene.screen;
+    if (screen) physical = sp_screen_in_orientation(screen.nativeBounds.size, game.size).size;
+#endif
+    static uint64_t (*largestRT)(void);
+    static BOOL lookedUpRT;
+    if (!lookedUpRT) {
+        lookedUpRT = YES;
+        largestRT = (uint64_t (*)(void))dlsym(RTLD_DEFAULT, "sp_largest_render_target");
+        NSString *path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/libspMetal.dylib"];
+        void *metal = largestRT ? NULL : dlopen(path.fileSystemRepresentation, RTLD_LAZY | RTLD_NOLOAD);
+        if (metal) {
+            largestRT = (uint64_t (*)(void))dlsym(metal, "sp_largest_render_target");
+            dlclose(metal);
+        }
+    }
+    uint64_t rt = largestRT ? largestRT() : 0;
+    static CGRect lastGame;
+    static CGSize lastDrawable, lastPhysical;
+    static uint64_t lastRT;
+    static NSInteger lastResolution = -1;
+    NSInteger resolution = sp_resolution_now();
+    if (CGRectEqualToRect(game, lastGame) && CGSizeEqualToSize(drawable, lastDrawable) &&
+        CGSizeEqualToSize(physical, lastPhysical) && rt == lastRT && resolution == lastResolution) return;
+    lastGame = game;
+    lastDrawable = drawable;
+    lastPhysical = physical;
+    lastRT = rt;
+    lastResolution = resolution;
+    const char *render = getenv("SP_CONFIG_RENDER_SCALE");
+    const char *ui = getenv("SP_CONFIG_UI_SCALE");
+    const char *useUI = getenv("SP_CONFIG_USE_UI_SCALE");
+    NSString *requested = resolution == SPResolutionNative ? @"native" :
+                          resolution ? @(resolution).stringValue : @"automatic";
+    NSString *line = [NSString stringWithFormat:
+        @"SP_RESOLUTION requested=%@ physical=%gx%g logical=%gx%g drawable=%gx%g renderScale=%s uiScale=%s largestRT=%ux%u useUiScale=%s scaleSource=preboot-config",
+        requested, physical.width, physical.height, game.size.width, game.size.height,
+        drawable.width, drawable.height, render ?: "unknown", ui ?: "unknown",
+        (unsigned)(rt >> 32), (unsigned)rt, useUI ?: "unknown"];
+    sp_stub_log(line.UTF8String);
+}
+
 static void sp_drawable_size(id layer, SEL selector, CGSize size) {
-    if (layer == sp_resolution_layer) sp_select_pixel_size(size);
+    if (layer == sp_resolution_layer && sp_window) {
+        NSInteger optimized = sp_optimized_resolution();
+        if (optimized && size.width > 0 && size.height > 0) size = sp_mode_pixels(optimized);
+        else if (!optimized) sp_select_pixel_size(size);
+    }
     sp_drawable_size_orig(layer, selector, size);
 }
 
@@ -450,6 +534,8 @@ static void sp_layer_show(CALayer *l) {
     });
     l.frame = sp_game_rect();
     l.contentsScale = sp_scale;
+    if ([l isKindOfClass:NSClassFromString(@"CAMetalLayer")] && sp_optimized_resolution())
+        ((CAMetalLayer *)l).drawableSize = sp_mode_pixels(sp_resolution_now());
     [sp_window.rootViewController.view.layer addSublayer:l];
     sp_hover_attach(l);
 }
@@ -618,7 +704,15 @@ static void sp_window_track_scene(void) {
     CGFloat scale = sp_scale;
     BOOL display_changed = !CGRectEqualToRect(screen, sp_told_screen);
     BOOL scale_changed = scale != sp_told_scale;
-    if (!resized && !moved && !layer_off && !display_changed && !scale_changed) return;
+    CAMetalLayer *metal = [layer isKindOfClass:NSClassFromString(@"CAMetalLayer")] ? (CAMetalLayer *)layer : nil;
+    if (metal && sp_optimized_resolution()) {
+        CGSize wanted = sp_mode_pixels(sp_resolution_now());
+        if (!CGSizeEqualToSize(metal.drawableSize, wanted)) metal.drawableSize = wanted;
+    }
+    if (!resized && !moved && !layer_off && !display_changed && !scale_changed) {
+        sp_log_resolution(metal);
+        return;
+    }
     // The first time too: at launch the client sized its layer and drawable for the screen.
     static int layer_fixes;  // logged up to 20 times, in case the client keeps at it
     if (resized || moved) {
@@ -675,6 +769,7 @@ static void sp_window_track_scene(void) {
     }
     if (!resized && !layer_resized && !scale_changed) {
         sp_announcing_display = NO;
+        sp_log_resolution(metal);
         return;  // moved, or the layer displaced, only
     }
     CGRect frame = CGRectMake(0, 0, size.width, size.height);
@@ -689,4 +784,5 @@ static void sp_window_track_scene(void) {
         ((void (*)(id, SEL, id))objc_msgSend)(delegate, @selector(windowDidResize:), n);
     [nc postNotification:n];
     sp_announcing_display = NO;
+    sp_log_resolution(metal);
 }
