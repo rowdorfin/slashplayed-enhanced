@@ -57,7 +57,7 @@
 #import "spcdn.h"  // sp_table_row, sp_build_info_for_image, sp_flavor_info
 #import "spaddons.h"
 #import "spsign.h"
-#include "spgraphics.h"
+#include "spmemory.h"
 
 static void say(NSString *s) {
     fprintf(stderr, "[sp:launch] %s\n", s.UTF8String);
@@ -265,19 +265,23 @@ static NSString *graphics_name(NSInteger preset) {
     return preset >= 0 && preset < (NSInteger)names.count ? names[preset] : names[0];
 }
 
-static NSDictionary<NSString *, NSString *> *graphics_values(NSData *config) {
+static NSDictionary<NSString *, NSString *> *config_values(NSData *config, SPWTFEdit *keys, size_t count) {
     if (!config) return nil;
-    SPWTFEdit keys[SP_GRAPHICS_COUNT] = {0};
-    sp_graphics_keys(keys);
-    sp_wtf_find(config.bytes, keys, SP_GRAPHICS_COUNT);
+    sp_wtf_find(config.bytes, keys, count);
     NSMutableDictionary *values = [NSMutableDictionary dictionary];
-    for (size_t i = 0; i < SP_GRAPHICS_COUNT; i++) {
+    for (size_t i = 0; i < count; i++) {
         if (!keys[i].begin) continue;
         NSString *value = [[NSString alloc] initWithBytes:keys[i].begin length:keys[i].end - keys[i].begin
                                                encoding:NSUTF8StringEncoding];
         values[@(keys[i].name)] = value;
     }
     return values;
+}
+
+static NSDictionary<NSString *, NSString *> *graphics_values(NSData *config) {
+    SPWTFEdit keys[SP_GRAPHICS_COUNT] = {0};
+    sp_graphics_keys(keys);
+    return config_values(config, keys, SP_GRAPHICS_COUNT);
 }
 
 static NSDictionary<NSString *, NSString *> *graphics_requested(NSInteger preset) {
@@ -290,17 +294,21 @@ static NSDictionary<NSString *, NSString *> *graphics_requested(NSInteger preset
     return values;
 }
 
-static void graphics_observe(NSDictionary *session, NSDictionary *effective, NSString *phase) {
+static void graphics_observe(NSDictionary *session, NSDictionary *effective, NSDictionary *effectiveLines, NSString *phase) {
     NSDictionary *requested = session[@"requested"], *before = session[@"before"], *persisted = session[@"persisted"];
+    NSDictionary *persistedLines = session[@"persistedLines"];
     for (NSString *key in [requested.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
         NSString *saved = persisted[key] ?: @"absent";
         NSString *actual = effective[key] ?: (effective ? @"absent" : @"unknown");
         BOOL overridden = effective && persisted && ![saved isEqualToString:actual];
+        BOOL rewritten = effectiveLines && persistedLines &&
+                         ![(persistedLines[key] ?: NSNull.null) isEqual:(effectiveLines[key] ?: NSNull.null)];
         graphics_log([NSString stringWithFormat:
-            @"SP_GRAPHICS phase=%@ cvar=%@ before=%@ requested=%@ persisted=%@ effective=%@%@",
+            @"SP_GRAPHICS phase=%@ cvar=%@ before=%@ requested=%@ persisted=%@ effective=%@%@%@",
             phase, key, before[key] ?: (before ? @"absent" : @"unknown"), requested[key],
             persisted ? saved : @"unknown", actual,
-            overridden ? [@" overridden=" stringByAppendingString:actual] : @""]);
+            overridden ? [@" overridden=" stringByAppendingString:actual] : @"",
+            rewritten ? @" rewritten=1" : @""]);
     }
 }
 
@@ -383,6 +391,81 @@ BOOL sp_graphics_restore(void) {
     return graphics_config(SP_GRAPHICS_KEEP, @"restore");
 }
 
+static NSString *memory_backup_path(NSString *flavor, size_t key) {
+    NSString *name = [NSString stringWithFormat:@"sp-memory-%s.backup", sp_memory_names[key]];
+    return [config_wtf_directory(flavor) stringByAppendingPathComponent:name];
+}
+
+static BOOL memory_write(NSString *path, NSString *backup, NSData *config, size_t key, const char *request) {
+    BOOL missing;
+    NSData *saved = config_read(backup, &missing);
+    if (!config || !saved) return NO;
+    char *output = NULL, *snapshot = NULL;
+    BOOL published = NO;
+    BOOL ok = sp_memory_edit(config.bytes, key, request, missing ? NULL : saved.bytes, &output, &snapshot);
+    if (ok && snapshot) ok = published = graphics_create_backup(backup, snapshot);
+    if (ok && output) ok = config_write(path, output);
+    // Keep the original through repeated overrides and through a failed restore.
+    if ((ok && !request && !missing) || (!ok && published))
+        ok = [NSFileManager.defaultManager removeItemAtPath:backup error:nil] && ok;
+    free(snapshot);
+    free(output);
+    return ok;
+}
+
+static NSDictionary<NSString *, NSString *> *memory_values(NSData *config, NSMutableDictionary *lines) {
+    SPWTFEdit keys[SP_MEMORY_COUNT] = {0};
+    for (size_t i = 0; i < SP_MEMORY_COUNT; i++) keys[i].name = sp_memory_names[i];
+    NSDictionary *values = config_values(config, keys, SP_MEMORY_COUNT);
+    for (size_t i = 0; i < SP_MEMORY_COUNT; i++) {
+        const char *line = keys[i].last;
+        if (!line) continue;
+        const char *newline = strchr(line, '\n');
+        size_t length = newline ? (size_t)(newline + 1 - line) : strlen(line);
+        lines[@(keys[i].name)] = [NSData dataWithBytes:line length:length];
+    }
+    return values;
+}
+
+static NSDictionary<NSString *, NSString *> *memory_config(NSString *flavor) {
+    if (![flavor isEqualToString:@"forever"]) return nil;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *sessionKey = @"sp_forever_memory_session";
+    NSInteger allocator = [defaults integerForKey:@"sp_forever_thread_allocator"];
+    NSInteger limit = [defaults integerForKey:@"sp_forever_low_priority_threads"];
+    NSInteger cacheless = [defaults integerForKey:@"sp_forever_cacheless_shaders"];
+    NSInteger preload = [defaults integerForKey:@"sp_forever_economic_preload"];
+    const char *choices[SP_MEMORY_COUNT];
+    sp_memory_choices(choices, allocator, limit, cacheless, preload);
+    NSString *path = config_wtf_path(flavor);
+    BOOL missing;
+    NSData *config = config_read(path, &missing);
+    NSMutableDictionary *lines = [NSMutableDictionary dictionary];
+    NSDictionary *before = memory_values(config, lines);
+    graphics_observe([defaults dictionaryForKey:sessionKey], before, before ? lines : nil, @"previous-session");
+
+    NSMutableDictionary *requested = [NSMutableDictionary dictionary];
+    for (size_t i = 0; i < SP_MEMORY_COUNT; i++) {
+        const char *choice = choices[i];
+        NSString *name = @(sp_memory_names[i]);
+        requested[name] = choice ? @(choice) : @"client-default";
+        if (!memory_write(path, memory_backup_path(flavor, i), config, i, choice))
+            say([NSString stringWithFormat:@"memory: could not complete Config.wtf transaction for %@", name]);
+        config = config_read(path, &missing);
+    }
+    [lines removeAllObjects];
+    NSDictionary *persisted = memory_values(config, lines);
+    NSMutableDictionary *session = [@{@"requested": requested} mutableCopy];
+    if (before) session[@"before"] = before;
+    if (persisted) {
+        session[@"persisted"] = persisted;
+        session[@"persistedLines"] = lines;
+    }
+    graphics_observe(session, nil, nil, @"preboot");
+    [defaults setObject:session forKey:sessionKey];
+    return requested;
+}
+
 // The shim opens/rotates the diagnostic log on its first device query. Use its
 // normal entry point before writing preflight records, after the experiment flags are set.
 static id<MTLDevice> preflight_device(NSString *bundle) {
@@ -399,7 +482,7 @@ static id<MTLDevice> preflight_device(NSString *bundle) {
     return device;
 }
 
-static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger resolution, BOOL found,
+static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger resolution, BOOL found, NSDictionary *memory,
                            void (^pump)(double)) {
     char machine[128] = {0};
     size_t length = sizeof machine;
@@ -421,9 +504,14 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     const char *budgetEnv = getenv("SP_GPU_WORKING_SET_MIB");
     NSString *budget = budgetEnv ? [NSString stringWithFormat:@"%s MiB", budgetEnv] : @"real";
     graphics_log([NSString stringWithFormat:
-        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s SP_ALLOC_TRACE=%s SP_ALLOC_TRACE_MIN_KIB=%s",
+        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s SP_ALLOC_TRACE=%s SP_ALLOC_TRACE_MIN_KIB=%s ThreadPoolPerThreadAllocator=%@ ThreadPoolLimitLP=%@ "
+         @"GxAllowCachelessShaderMode=%@ worldPreloadNonCritical=%@ worldPreloadHighResTextures=%@",
         machine, device.name ?: @"unknown", nativeBC, backend, profile ? @"a16" : @"native",
-        graphics_name(preset), width, render, textures, found ? @"found" : @"missing", compact, budgetEnv ?: "0", allocTrace, allocMin]);
+        graphics_name(preset), width, render, textures, found ? @"found" : @"missing", compact, budgetEnv ?: "0", allocTrace, allocMin,
+        memory[@"ThreadPoolPerThreadAllocator"] ?: @"client-default", memory[@"ThreadPoolLimitLP"] ?: @"client-default",
+        memory[@"GxAllowCachelessShaderMode"] ?: @"client-default",
+        memory[@"worldPreloadNonCritical"] ?: @"client-default",
+        memory[@"worldPreloadHighResTextures"] ?: @"client-default"]);
 
     if (!pump) return;
     UIWindow *window = nil;
@@ -440,10 +528,16 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     notice.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     notice.textAlignment = NSTextAlignmentCenter;
     notice.numberOfLines = 0;
+    notice.lineBreakMode = NSLineBreakByWordWrapping;
     notice.userInteractionEnabled = NO;
-    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · Orçamento %@\nRastreio %s · Limiar %s KiB",
+    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · Orçamento %@\nRastreio %s · Limiar %s KiB\nAlocador por thread %@ · Threads LP %@\n"
+                    @"Shaders sem cache %@\nPré-carregamento econômico %@",
                    backend, graphics_name(preset), width, render, textures, compact ? @"on" : @"off",
-                   budget, allocTrace, allocMin];
+                   budget, allocTrace, allocMin,
+                   memory[@"ThreadPoolPerThreadAllocator"] ?: @"client-default", memory[@"ThreadPoolLimitLP"] ?: @"client-default",
+                   [memory[@"GxAllowCachelessShaderMode"] isEqual:@"1"] ? @"ativo" : @"padrão",
+                   [memory[@"worldPreloadNonCritical"] isEqual:@"0"] &&
+                       [memory[@"worldPreloadHighResTextures"] isEqual:@"0"] ? @"ativo" : @"padrão"];
     [window addSubview:notice];
     UILayoutGuide *safe = window.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -469,7 +563,7 @@ static NSInteger graphics_preset(NSString *flavor) {
         NSDictionary *requested = graphics_requested([defaults integerForKey:graphicsAppliedKey]);
         if (requested.count) previous = @{@"requested": requested};
     }
-    graphics_observe(previous, before, @"previous-session");
+    graphics_observe(previous, before, nil, @"previous-session");
     NSInteger preset = [defaults integerForKey:graphicsChoiceKey];
     NSDictionary *requested = graphics_requested(preset);
     if (!requested.count) {
@@ -481,7 +575,7 @@ static NSInteger graphics_preset(NSString *flavor) {
     NSMutableDictionary *session = [@{@"requested": requested} mutableCopy];
     if (before) session[@"before"] = before;
     if (persisted) session[@"persisted"] = persisted;
-    graphics_observe(session, nil, @"preboot");
+    graphics_observe(session, nil, nil, @"preboot");
     [defaults setObject:session forKey:graphicsSessionKey];
     return preset;
 }
@@ -1176,6 +1270,7 @@ int main(int argc, char **argv) {
         if (configureAllocationTrace) configureAllocationTrace();
     }
     NSInteger preset = graphics_preset(flavor);
+    NSDictionary *memory = memory_config(flavor);
     default_render_scale(flavor);
     BOOL missingResolutionConfig;
     NSData *resolutionConfig = config_read(config_wtf_path(flavor), &missingResolutionConfig);
@@ -1196,7 +1291,7 @@ int main(int argc, char **argv) {
     void (^preflightPump)(double) = sp_launch_uikit();
     if (loading) loading(sp_flavor_name(flavor).UTF8String);
     else say([NSString stringWithFormat:@"no loading screen: %s", dlerror()]);
-    show_preflight(device, preset, resolution, resolutionConfig && !missingResolutionConfig, preflightPump);
+    show_preflight(device, preset, resolution, resolutionConfig && !missingResolutionConfig, memory, preflightPump);
     if (token) {
         void (*import)(void) = ak ? (void (*)(void))dlsym(ak, "sp_net_battle_import") : NULL;
         if (import) import();

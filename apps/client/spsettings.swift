@@ -388,6 +388,10 @@ struct SettingsView: View {
     @ObservedObject var settings: Settings
     @AppStorage("sp_optimized_resolution") private var optimizedResolution = 0
     @AppStorage("sp_forever_graphics_preset") private var graphicsPreset = 0
+    @AppStorage("sp_forever_thread_allocator") private var threadAllocator = 0
+    @AppStorage("sp_forever_low_priority_threads") private var lowPriorityThreads = 0
+    @AppStorage("sp_forever_cacheless_shaders") private var cachelessShaders = 0
+    @AppStorage("sp_forever_economic_preload") private var economicPreload = 0
     @State private var graphicsRestoreFailed = false
     @State private var columns: NavigationSplitViewVisibility = .all
 
@@ -915,6 +919,26 @@ struct SettingsView: View {
                     Text("A16 Performance").tag(4)
                     Text("A16 Low Memory").tag(5)
                 }
+                Picker("Alocador por thread (experimental)", selection: $threadAllocator) {
+                    Text("Padrão do cliente").tag(0)
+                    Text("Desativado").tag(1)
+                }
+                Picker("Threads de baixa prioridade (experimental)", selection: $lowPriorityThreads) {
+                    Text("Padrão do cliente").tag(0)
+                    Text("1").tag(1)
+                    Text("2").tag(2)
+                }
+                Picker("Shaders sem cache (experimental)", selection: $cachelessShaders) {
+                    Text("Padrão do cliente").tag(0)
+                    Text("Ativo").tag(1)
+                }
+                Picker("Pré-carregamento econômico (experimental)", selection: $economicPreload) {
+                    Text("Padrão do cliente").tag(0)
+                    Text("Ativo").tag(1)
+                }
+                Text("Essas opções podem reduzir o FPS. Shaders sem cache e pré-carregamento econômico podem fazer objetos e texturas aparecerem de repente ou demorarem mais para aparecer pela primeira vez. Os efeitos ainda não foram medidos. Aplicadas na próxima abertura do jogo.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 Button("Restaurar configuração anterior") {
                     if sp_graphics_restore() {
                         graphicsPreset = 0
