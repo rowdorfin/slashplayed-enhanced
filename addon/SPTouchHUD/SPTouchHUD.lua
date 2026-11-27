@@ -534,12 +534,12 @@ local function createHUD()
         return icon
     end
     local target = macro("", "/targetenemy")
-    glyph(target, "Gamepad-Icon-Target", "Interface\\Minimap\\Tracking\\Target")
+    glyph(target, "gamepad-targeting-hostile", "Interface\\CURSOR\\Attack")
     utilities[2] = main
     -- Forever's native interaction control owns interact selection and press/release.
     local interactName = "GamepadMainActionBarFramePageUnitTopCenteredAnchorTopBarActionButton5"
     local interact = macro("", "/click GamepadMainActionBarFramePageUnitTopCenteredAnchorTopBarActionButton5 LeftButton 1\n/click GamepadMainActionBarFramePageUnitTopCenteredAnchorTopBarActionButton5 LeftButton 0")
-    local interactIcon = glyph(interact, "Gamepad-Icon-Interact", "Interface\\CURSOR\\Speak")
+    local interactIcon = glyph(interact, "crosshair_interact_32", "Interface\\CURSOR\\Speak")
     local utilityParent = CreateFrame("Frame", nil, UIParent)
     utilityParent:SetFrameStrata("HIGH")
     utilityParent:SetSize(182, 44)
@@ -547,7 +547,7 @@ local function createHUD()
     menu:SetSize(28, 28)
     menu:SetPoint("CENTER", utilityParent, "CENTER")
     local panel = CreateFrame("Frame", nil, utilityParent)
-    panel:SetSize(176, 162)
+    panel:SetSize(176, layout.auxiliaries and 162 or 40)
     panel:SetPoint("TOP", menu, "BOTTOM", 0, -3)
     panel:Hide()
     menu:SetScript("OnClick", function() panel:SetShown(not panel:IsShown()) end)
@@ -588,7 +588,7 @@ local function placeArcMenu(scale)
     host:SetAlpha(layout.opacity)
     host:SetPoint("CENTER", UIParent, "TOP", 0, -UIParent:GetHeight() * 0.09 / scale)
     host:SetSize(28, 28)
-    panel:SetSize(176, 162)
+    panel:SetSize(176, layout.auxiliaries and 162 or 40)
     panel:ClearAllPoints()
     panel:SetPoint("TOP", menu, "BOTTOM", 0, -3)
     for i = 4, #utilities do
@@ -597,10 +597,11 @@ local function placeArcMenu(scale)
         button:SetSize(82, 36)
         button:SetPoint("TOPLEFT", panel, "TOPLEFT", index % 2 * 90, -math.floor(index / 2) * 39)
         setCircular(button, true)
+        button:SetShown(i == 4 or layout.auxiliaries)
     end
     menu:Show()
     panel:Hide()
-    host:SetShown(account.enabled and layout.auxiliaries)
+    host:SetShown(account.enabled)
 end
 
 local function placeClassic(largest)
@@ -646,6 +647,7 @@ local function placeClassic(largest)
     panel:SetPoint("TOPLEFT", host, "TOPLEFT")
     for i, button in ipairs(utilities) do
         place(button, i, actionRows, i > 3 and panel or root)
+        if i > 3 then button:Show() end
         setCircular(button, false)
     end
     menu:Hide()
@@ -1120,6 +1122,7 @@ local function createEditor()
         return item
     end
     local currentSet, currentBar, slots, selectedButton, entry, currentSlot
+    local visibleEntries, visiblePosition
     local slotControls, earlier, later, clear, confirm = {}
     local bars = {"Principal", "Inf. esq.", "Inf. dir.", "Direita", "Esquerda", "Barra 6", "Barra 7", "Barra 8"}
     local function displaySlots()
@@ -1199,8 +1202,9 @@ local function createEditor()
         slotControls[i] = item
     end
     local function reorder(step)
-        if InCombatLockdown() or not entry or not slots[entry + step] then return end
-        slots[entry], slots[entry + step] = slots[entry + step], slots[entry]
+        local neighbor = visibleEntries and visibleEntries[visiblePosition + step]
+        if InCombatLockdown() or not entry or not neighbor then return end
+        slots[entry], slots[neighbor] = slots[neighbor], slots[entry]
         commitAction()
     end
     clear = pickerButton("", 16, -291, 128, function()
@@ -1228,8 +1232,8 @@ local function createEditor()
     end)
     local function openPicker()
         clear:SetText(selectedButton == 8 and "Ataque automático" or selectedButton and "Remover ação" or "Limpar conjunto")
-        earlier:SetShown(entry ~= nil and entry > 1)
-        later:SetShown(entry ~= nil and entry < #slots)
+        earlier:SetShown(entry ~= nil and visibleEntries[visiblePosition - 1] ~= nil)
+        later:SetShown(entry ~= nil and visibleEntries[visiblePosition + 1] ~= nil)
         confirm:SetShown(not selectedButton)
         displaySlots()
         grip:Hide()
@@ -1245,9 +1249,10 @@ local function createEditor()
         local set, bank = root:GetAttribute("set"), root:GetAttribute("bank")
         currentSet = (set - 1) % 3 + 1
         slots = parseSlots(layout.sets[currentSet].text)
-        local position = math.floor((set - currentSet) / 3) * arcSize + index
+        visiblePosition = math.floor((set - currentSet) / 3) * arcSize + index
+        visibleEntries = compiledEntries[bank * 3 + currentSet]
         selectedButton = index
-        entry = index <= arcSize and compiledEntries[bank * 3 + currentSet][position] or nil
+        entry = index <= arcSize and visibleEntries[visiblePosition] or nil
         currentSlot = index == 8 and layout.mainSlot or (entry and slots[entry])
         currentBar = currentSlot and barForPage[math.ceil(currentSlot / 12)] or 1
         openPicker()
@@ -1271,10 +1276,24 @@ local function createEditor()
         grip:Hide()
     end)
     events.CloseEditor = function() editor:Hide() end
+    events.InvalidateActionPicker = function()
+        if selectedButton and picker:IsShown() then editor:Hide() end
+    end
     SLASH_SPTOUCHHUD1 = "/sphud"
     SlashCmdList.SPTOUCHHUD = function()
         stopEditing()
         editor:SetShown(not editor:IsShown())
+    end
+    SLASH_SPTOUCHHUDPAD1 = "/sphudpad"
+    SlashCmdList.SPTOUCHHUDPAD = function()
+        if not (C_GamePad and C_GamePad.IsEnabled and C_GamePad.GetActiveDeviceID and C_GamePad.GetAllDeviceIDs) then
+            print("SPTouchHUD: API de gamepad indisponível.")
+            return
+        end
+        local devices, active = C_GamePad.GetAllDeviceIDs(), C_GamePad.GetActiveDeviceID()
+        print("SPTouchHUD: gamepad " .. (C_GamePad.IsEnabled() and "ligado" or "desligado")
+            .. " · dispositivos " .. tostring(devices and #devices or 0)
+            .. " · ativo " .. tostring(active or "nenhum"))
     end
     if Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory then
         local panel = CreateFrame("Frame")
@@ -1332,6 +1351,7 @@ events:SetScript("OnEvent", function(_, event, arg)
                 slotsDirty = nil
                 if InCombatLockdown() then pending = true; return end
                 if stopEditing then stopEditing() end
+                events.InvalidateActionPicker()
                 local largest = compileSlots()
                 if layout.classic then placeClassic(largest) end
                 for _, button in ipairs(buttons) do
