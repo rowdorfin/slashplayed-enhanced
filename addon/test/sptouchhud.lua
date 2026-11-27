@@ -1,7 +1,9 @@
 -- Lua 5.1 harness. The secure snippets themselves run with restricted handles and globals.
+local unpack = unpack or table.unpack
 local combat, secure, page, bonus, target = false, false, 1, nil, false
 local frames, nativeWrites, icons, timerCount = {}, 0, {}, 0
-local w, h, empty = 797, 390, {}
+local w, h, empty = 844, 390, {}
+local cursorX, cursorY
 local nativeJoystick = assert(tonumber(arg[2]), "expected UIKit joystick lane fraction")
 local nativeJump = assert(tonumber(arg[3]), "expected UIKit Jump lane fraction")
 local Frame = {}
@@ -22,15 +24,24 @@ for _, name in ipairs({"SetAllPoints", "SetColorTexture", "SetFrameStrata", "Set
     Frame[name] = function() end
 end
 
+local vehicle
 local env = {
     tonumber = tonumber,
     GetActionBarPage = function() return page end,
     HasBonusActionBar = function() return bonus ~= nil end,
     GetBonusBarIndex = function() return bonus end,
+    HasVehicleActionBar = function() return vehicle ~= nil end,
+    GetVehicleBarIndex = function() return vehicle end,
 }
 local function run(snippet, self, input)
-    local chunk = assert(loadstring("return function(self, message, newstate)\n" .. snippet .. "\nend"))
-    setfenv(chunk, env)
+    local source = "return function(self, message, newstate)\n" .. snippet .. "\nend"
+    local chunk
+    if setfenv then
+        chunk = assert(loadstring(source))
+        setfenv(chunk, env)
+    else
+        chunk = assert(load(source, nil, "t", env))
+    end
     local previous = secure
     secure = true
     chunk()(self, input, input)
@@ -41,6 +52,12 @@ function Frame:GetParent() return self.parent end
 function Frame:GetWidth() return self == UIParent and w or self.width end
 function Frame:GetHeight() return self == UIParent and h or self.height end
 function Frame:GetScale() return self.scale or 1 end
+function Frame:GetEffectiveScale() return self:GetScale() end
+function Frame:GetLeft() return self.point[4] end
+function Frame:GetBottom() return self.point[5] end
+function Frame:GetCenter() return self.point[4], self.point[5] end
+function Frame:StartMoving() end
+function GetCursorPosition() return cursorX, cursorY end
 function Frame:SetScale(value) mutation(self); self.scale = value end
 function Frame:SetSize(width, height) mutation(self); self.width, self.height = width, height end
 function Frame:SetPoint(...) mutation(self); self.point = {...} end
@@ -155,9 +172,18 @@ C_ActionBar = {
     IsActionInRange = function() return true end,
 }
 
+SPTouchHUDCharDB = {scale = "invalid", arcX = 0, sets = {
+    [1] = {label = "Principal", color = "abcdef", text = "1,2,3"},
+    [3] = {label = "Manual", color = "123456", text = "8:12,7:2,8:1"},
+}}
 assert(loadfile(assert(arg[1])))("SPTouchHUD")
 fire("ADDON_LOADED", "SPTouchHUD")
 local hud = assert(SPTouchHUDFrame)
+local saved = SPTouchHUDCharDB
+assert(saved.version == 4 and saved.arcX == 1 and saved.scale == 1)
+assert(saved.sets[1].label == "Principal" and saved.sets[1].color == "abcdef")
+assert(saved.sets[3].text == "8:12,7:2,8:1" and saved.sets[2].text == "4,5,6")
+print("sptouchhud: v4 migration preserves sparse saved sets and their order")
 local first, second = unpack(hud.children)
 assert(first:GetAttribute("type") == "action" and first:GetAttribute("action") == 1)
 assert(first.icon:GetTexture() == 1001 and first.count.text == "3" and first.cooldown.timing[1] == 1 and first.charge.timing[2] == 8)
@@ -259,18 +285,18 @@ local function overlaps(a, b)
     return a[1] < b[3] - epsilon and b[1] < a[3] - epsilon
         and a[2] < b[4] - epsilon and b[2] < a[4] - epsilon
 end
-local function checkPreset(name, width, height, leftInset, rightInset, bottomInset, topInset)
+local function checkPreset(name, leftHanded, width, height, leftInset, rightInset, bottomInset, topInset)
     w, h = width, height
     click(editor, name)
+    if leftHanded and name ~= "Canhoto" then click(editor, "Destro") end
     local scale = hud:GetScale()
     local x, y = hud.point[4] * scale, hud.point[5] * scale
     local safe = rect(leftInset, bottomInset, w - leftInset - rightInset, h - bottomInset - topInset)
-    local leftHanded = name == "Canhoto"
     local stickWidth = w * nativeJoystick - (leftHanded and rightInset or leftInset)
     local stick = rect(leftHanded and safe[3] - stickWidth or safe[1], safe[2], stickWidth, safe[4] - safe[2])
     local jumpWidth = math.max(w * nativeJump, 64)
     local jumpLeft = leftHanded and safe[1] or safe[3] - jumpWidth
-    local jumpArea = rect(jumpLeft, safe[2], jumpWidth, 64)
+    local jumpArea = rect(jumpLeft, safe[2], jumpWidth, math.min(64, h * 0.21 + 8 - safe[2]))
     local jump = rect(jumpLeft + (leftHanded and jumpWidth - 56 or 8), safe[2] + 8, 48, 48)
     assert(contains(safe, jumpArea) and contains(jumpArea, jump))
     local bounds = rect(x, y, hud:GetWidth() * scale, hud:GetHeight() * scale)
@@ -281,13 +307,18 @@ local function checkPreset(name, width, height, leftInset, rightInset, bottomIns
         end
     end
     local menuScale = assert(launcher):GetScale()
-    local menuRect = rect((w - 44 * menuScale) / 2, h + launcher.point[5] * menuScale - 44 * menuScale,
-                          44 * menuScale, 44 * menuScale)
+    local menuRect = rect((w - 32 * menuScale) / 2, h + launcher.point[5] * menuScale - 32 * menuScale,
+                          32 * menuScale, 32 * menuScale)
     assert(contains(safe, menuRect) and not overlaps(menuRect, stick) and not overlaps(menuRect, jump))
     assert(contains(safe, bounds) and not overlaps(bounds, stick))
-    local distance = leftHanded and x + first.point[4] * scale - safe[1] or safe[3] - x - first.point[4] * scale
-    local limit = height <= 390 and ((leftHanded and leftInset or rightInset) > 0 and 100 or 110) or 140
-    assert(distance <= limit, "primary attack too far from the skill-side edge")
+    local attack
+    for _, child in ipairs(hud.children) do
+        if child:GetAttribute("macrotext") == "/startattack" then attack = child end
+    end
+    assert(attack and attack:GetWidth() == 74)
+    local attackX = x + attack.point[4] * scale
+    local distance = leftHanded and attackX - safe[1] or safe[3] - attackX
+    assert(distance <= 140, "attack too far from the skill-side edge")
     local buttons = {}
     for _, button in ipairs(hud.children) do
         if button.template and button:IsShown() then
@@ -296,32 +327,40 @@ local function checkPreset(name, width, height, leftInset, rightInset, bottomIns
             local buttonRect = rect(x + button.point[4] * scale - bw / 2,
                                     y + button.point[5] * scale - bh / 2, bw, bh)
             assert(contains(bounds, buttonRect))
-            assert(not overlaps(buttonRect, jump), "Jump overlapped a Lua hit target")
+            assert(not overlaps(buttonRect, jumpArea), "Jump lane overlapped a Lua hit target")
+            assert(not overlaps(buttonRect, menuRect), "menu overlapped a Lua hit target")
             for _, other in ipairs(buttons) do assert(not overlaps(buttonRect, other)) end
             buttons[#buttons + 1] = buttonRect
         end
     end
-    assert(first:GetWidth() == 74 and second:GetWidth() == 56)
-    assert(#buttons == 11, "6 skills, 3 sets, next page, and Interact")
-    if name == "Canhoto" then assert(first.point[4] < second.point[4])
-    else assert(first.point[4] > second.point[4]) end
-    print(string.format("sptouchhud: %s safe, disjoint targets, attack %.1f pt from edge", name, distance))
+    assert(first:GetWidth() == 56 and second:GetWidth() == 56)
+    assert(#buttons == 13, "6 skills, 3 sets, next page, Attack, Target, and Interact")
+    if leftHanded then assert(attack.point[4] < first.point[4])
+    else assert(attack.point[4] > first.point[4]) end
+    print(string.format("sptouchhud: %s %dx%d %s, safe disjoint targets, attack %.1f pt from edge",
+        name, w, h, leftHanded and "left" or "right", distance))
 end
 
 page, bonus = 1, nil
-checkPreset("iPhone MMORPG", 797, 390, 0, 47, 21, 0)
-checkPreset("iPhone MMORPG", 797, 390, 47, 0, 21, 0)
-checkPreset("iPhone compacto", 740, 375, 0, 44, 21, 0)
-checkPreset("iPad touchscreen", 1024, 768, 0, 0, 20, 24)
-checkPreset("Canhoto", 797, 390, 47, 0, 21, 0)
-w, h = 797, 390
+checkPreset("iPhone MMORPG", false, 844, 390, 47, 0, 21, 0)
+checkPreset("Canhoto", true, 844, 390, 0, 47, 21, 0)
+checkPreset("iPhone MMORPG", false, 797, 390, 0, 47, 21, 0)
+checkPreset("Canhoto", true, 797, 390, 47, 0, 21, 0)
+checkPreset("iPhone compacto", false, 797, 390, 0, 47, 21, 0)
+checkPreset("iPhone compacto", true, 797, 390, 47, 0, 21, 0)
+for _, left in ipairs({false, true}) do
+    checkPreset("iPad touchscreen", left, 1280, 800, 0, 0, 20, 24)
+    checkPreset("iPad touchscreen", left, 1024, 768, 0, 0, 20, 24)
+end
+w, h = 844, 390
+click(editor, "iPhone MMORPG")
 
 local visited = {}
 for _, switch in ipairs(hud.children) do
     local group = switch:GetAttribute("select-set")
     if group then
         run(switch:GetAttribute("_onclick"), switch)
-        for _ = 1, hud:GetAttribute("pages-" .. group) do
+        for _ = 1, hud:GetAttribute("pages-1-" .. group) do
             for i = 1, 6 do
                 local slot = assert(hud.children[i]:GetAttribute("action"))
                 assert(not visited[slot])
@@ -338,21 +377,96 @@ assert(positions == 96)
 click(editor, "iPhone MMORPG")
 print("sptouchhud: all 96 slots across the eight bars are reachable")
 
-empty[1] = true
-fire("ACTIONBAR_SLOT_CHANGED", 1)
-assert(not first:IsShown() and first:GetAttribute("action") == nil)
+for i = 1, 180 do empty[i] = true end
+empty[3], empty[11], empty[72], empty[57] = nil, nil, nil, nil
+for i = 97, 108 do empty[i] = nil end
+fire("ACTIONBAR_SLOT_CHANGED", 0)
+assert(first:GetAttribute("action") == 3 and second:GetAttribute("action") == 11)
+assert(hud.children[3]:GetAttribute("action") == 72 and hud.children[4]:GetAttribute("action") == 57)
+assert(not hud.children[5]:IsShown() and hud:GetAttribute("pages-1-1") == 1)
+run(pageButton:GetAttribute("_onclick"), pageButton)
+assert(hud:GetAttribute("set") == 1 and first:GetAttribute("action") == 3)
+print("sptouchhud: occupied main and fixed slots compact in manual order, skipping empty pages")
+
 combat = true
-empty[1], empty[2] = nil, true
+empty[3], empty[11], empty[72], empty[57], empty[1] = true, true, true, true, nil
 fire("ACTIONBAR_SLOT_CHANGED", 0)
 fire("UI_SCALE_CHANGED")
-assert(not first:IsShown() and second:IsShown() and second:GetAttribute("action") == 2)
+assert(first:GetAttribute("action") == 3 and second:GetAttribute("action") == 11)
+page, bonus = 1, 9
+run(hud.driver, hud, "bonus3")
+fire("UPDATE_SHAPESHIFT_FORM")
+assert(first:GetAttribute("action") == 97 and hud:GetAttribute("pages-9-1") == 3)
+run(pageButton:GetAttribute("_onclick"), pageButton)
+assert(first:GetAttribute("action") == 103)
+bonus = nil
+run(hud.driver, hud, "1")
+assert(hud:GetAttribute("set") == 1 and first:GetAttribute("action") == 3)
+vehicle = 15
+run(hud.driver, hud, "vehicle")
+assert(first:GetAttribute("action") == 169 and second:GetAttribute("action") == 170)
+vehicle = nil
+run(hud.driver, hud, "1")
 combat = false
 fire("PLAYER_REGEN_ENABLED")
-assert(first:IsShown() and not second:IsShown() and second:GetAttribute("action") == nil)
-empty[2] = nil
-fire("ACTIONBAR_SLOT_CHANGED", 2)
-assert(second:IsShown() and second:GetAttribute("action") == 2)
-print("sptouchhud: hide and refill empty slots only outside lockdown")
+assert(first:GetAttribute("action") == 1 and not second:IsShown())
+for _, switch in ipairs(hud.children) do
+    if switch:GetAttribute("select-set") == 2 then run(switch:GetAttribute("_onclick"), switch) end
+end
+run(pageButton:GetAttribute("_onclick"), pageButton)
+assert(hud:GetAttribute("set") == 2 and not first:IsShown())
+for _, switch in ipairs(hud.children) do
+    if switch:GetAttribute("select-set") == 1 then run(switch:GetAttribute("_onclick"), switch) end
+end
+bonus = 9
+fire("UPDATE_BONUS_ACTIONBAR")
+assert(first:GetAttribute("action") == 97 and hud:GetAttribute("pages-9-1") == 2)
+bonus = nil
+fire("ACTIONBAR_PAGE_CHANGED")
+assert(first:GetAttribute("action") == 1)
+print("sptouchhud: lockdown queue, compiled stance paging, empty set, positional vehicle fallback")
+
+empty = {}
+click(editor, "iPhone MMORPG")
+click(editor, "Mover botões")
+local overlay
+for _, frame in ipairs(UIParent.children) do
+    for _, child in ipairs(frame.children) do
+        if child:GetText() == "Interagir" and child.scripts.OnDragStop then overlay = frame end
+    end
+end
+assert(overlay and overlay:IsShown() and not editor:IsShown())
+local proxy = findChild(overlay, "1")
+local canvas, toolbar = overlay.children[1], overlay.children[2]
+click(overlay, "1")
+local scale = hud:GetScale()
+cursorX, cursorY = (hud:GetLeft() + 151) * scale, (hud:GetBottom() + 38) * scale
+canvas.scripts.OnClick()
+assert(math.abs(SPTouchHUDCharDB.positions[1][2] - 38) < 0.001)
+proxy.scripts.OnDragStart(proxy)
+proxy.point[5] = proxy.point[5] + 4 * scale
+proxy.scripts.OnDragStop(proxy)
+assert(math.abs(SPTouchHUDCharDB.positions[1][2] - 42) < 0.001)
+click(toolbar, "Maior")
+assert(first:GetWidth() == 60 and SPTouchHUDCharDB.positions[1][3] == 54)
+cursorX, cursorY = 0, 0
+canvas.scripts.OnClick()
+assert(first:GetWidth() == 60 and math.abs(first.point[5] - 42) < 0.001)
+cursorX, cursorY = (hud:GetLeft() + 108) * scale, (hud:GetBottom() + 96) * scale
+canvas.scripts.OnClick()
+assert(math.abs(first.point[5] - 42) < 0.001, "overlapping hitbox should be rejected")
+click(overlay, "Atacar")
+click(toolbar, "Menor")
+assert(SPTouchHUDCharDB.positions[8][3] == 64)
+click(toolbar, "Restaurar botões")
+assert(first:GetWidth() == 56 and first.point[5] == 35 and next(SPTouchHUDCharDB.positions) == nil)
+combat = true
+fire("PLAYER_REGEN_DISABLED")
+assert(not overlay:IsShown())
+combat = false
+fire("PLAYER_REGEN_ENABLED")
+SlashCmdList.SPTOUCHHUD()
+print("sptouchhud: move by drag or tap, resize, reject unsafe geometry, restore, exit on lockdown")
 
 click(editor, "HUD 2.0 clássico")
 assert(SPTouchHUDCharDB.classic and not SPTouchHUDCharDB.hideEmpty)
@@ -360,8 +474,8 @@ assert(first:GetWidth() == 44 and hud.children[12]:IsShown() and not pageButton:
 assert(not next(first.icon.masks))
 click(editor, "Restaurar padrão")
 assert(not SPTouchHUDCharDB.classic and not SPTouchHUDCharDB.left and SPTouchHUDCharDB.hideEmpty)
-assert(SPTouchHUDCharDB.sets[2].text == "4,5,6" and hud:GetAttribute("set") == 1)
-assert(first:GetWidth() == 74 and not hud.children[7]:IsShown() and pageButton:IsShown())
+assert(SPTouchHUDCharDB.sets[2].text == "2" and hud:GetAttribute("set") == 1)
+assert(first:GetWidth() == 56 and not hud.children[7]:IsShown() and pageButton:IsShown())
 assert(next(first.icon.masks))
 assert(nativeWrites == 0)
 print("sptouchhud: classic fallback, reset, and zero mutations of native action frames")

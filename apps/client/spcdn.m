@@ -984,6 +984,8 @@ static NSArray<NSString *> *sp_retire_touch_hud(NSString *game) {
         { @"SPTouchHUD.lua", 27789, @"8a3af81435e895f3cb7462f8d28e5bc6822509a0379043282d0c763138a290e0" },
         { @"SPTouchHUD.toc", 208, @"67f89ec58966cffefa686f91f6bdc6c24a49179866613f6482491ba72ca37446" },
         { @"SPTouchHUD.lua", 40728, @"570130a950012a7b6aa065c73f9f9edf57b6f94a9b4fb9668e463c93da1d128e" },
+        { @"SPTouchHUD.toc", 208, @"985d26618d10f2a45ed77cba056e3a8f33f2d0a53ff42c386cd981c6bfbcdcab" },
+        { @"SPTouchHUD.lua", 48125, @"0f96e04a6737fd1e679e567700535154bb23b6677b959755d739a9e167da4687" },
     };
     return sp_remove_packaged_addon(game, @"SPTouchHUD", shipped, sizeof shipped / sizeof shipped[0]);
 }
