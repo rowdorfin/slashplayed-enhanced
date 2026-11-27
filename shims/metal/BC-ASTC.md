@@ -208,3 +208,136 @@ punch-through. Os testes de referência verificaram alfa exato e erro
 RGB visível de até 1 por canal em linear e sRGB. Um texel transparente
 sintético passou de RGB (0, 0, 0) para (0, 131, 0) com alfa 0 nos
 dois perfis. O maior canal transparente observado foi 255.
+
+## T009-J: BC2/BC3
+
+T009-JC mantém 132–135 em RGBA8 linear/sRGB. A escolha do backing teria
+de ocorrer em `newTexture*`, antes dos dados, para 2D, array, e cube
+standalone com usage restrito a ShaderRead/PixelFormatView. Heap, IOSurface,
+e alias de buffer ficam fora. Uma imagem boa no primeiro upload não
+garante que a mesma representação sirva para mips e replaces posteriores.
+
+- **ASTC 4×4 direto.** O protótipo existente usa CEM 12, um plano RGB e
+  um plano alfa, grade 4×4, e três pesos por plano. São 52 bits de pesos
+  e 19 de cabeçalho/seletor. Dos 57 restantes, 56 armazenam os oito
+  endpoints de 7 bits. O alfa binário é exato, inclusive quando o bloco
+  contém apenas 0 ou 255. Os outros valores sofrem quantização de endpoint
+  e de peso. O RGB aproxima os dois índices intermediários de BC2/BC3
+  pelo mesmo peso. Quatro pesos por plano já custam 64 bits e deixam
+  45 para endpoints. Usar oito níveis para BC3 deixa 13 bits para CEM
+  12, cujo mínimo é 21. Os 16 níveis independentes de BC2 esgotam os
+  128 bits só em pesos. Reduzir a grade economiza bits ao custo de
+  interpolar espacialmente máscaras e detalhes. Partições podem ajudar
+  em certas bordas, sujeitas às máscaras predefinidas e ao custo de
+  endpoints por partição. Luminância/alfa economiza endpoints em
+  blocos compatíveis e restringe o RGB. Essas alternativas de modo não
+  foram prototipadas. ASTC 4×4 tem variantes LDR e sRGB.
+  [Implementação](spbcastc.c#L171) · [Khronos](https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.pdf)
+- **16 bpp.** A tabela Metal marca os formatos empacotados como
+  filtráveis nas famílias Apple2 em diante. ABGR4, A1BGR5 (também
+  BGR5A1 com outra ordem de bits), e B5G6R5 têm somente variantes
+  lineares. Isso limita a alocação a 132/134 e impede a view linear ↔
+  sRGB da família. ABGR4 representa exatamente os 16 níveis do alfa
+  BC2. Em BC3, o arredondamento para o nível de 4 bits mais próximo
+  mantém os extremos e tem erro de até 8. A1BGR5 reduz o alfa a uma
+  máscara e B5G6R5 amostra alfa 1. A avaliação host modela quantização
+  UNorm por canal.
+  [Formatos Metal](https://developer.apple.com/documentation/metal/mtlpixelformat) · [Tabela de capacidades Metal](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf)
+- **RGBA8.** É a referência. O decoder escreve os texels como RGBA8,
+  mantendo o perfil físico linear ou sRGB. O custo lógico é 4 B/texel.
+  [Mapeamento](spbcdecode.c#L28)
+
+### Medições
+
+Ryzen 5 4600G, GCC 15.2 -O1, uma thread, imagens 1024², 16 iterações,
+tempo CPU de BC até o buffer físico, com decode de validação fora do
+cronômetro. RGBA8 mede o mesmo loop de blocos como referência de custo.
+O benchmark gera gradiente opaco, textura granulada, folhagem com máscara
+elíptica binária e grão, rampas de alfa suaves e curtas, e glifos com
+cobertura intermediária. Ajusta os endpoints BC por bloco e quantiza
+os índices contra as paletas BC. A entrada aleatória usa o mesmo
+xorshift e seed do benchmark acima. Todo erro é relativo a BC
+decodificado em bytes, antes da transferência sRGB.
+
+ASTC linear e sRGB deram os mesmos resultados à precisão da tabela
+abaixo. Cada célula de erro é PSNR em dB / erro máximo por canal.
+O erro de alfa nos texels de referência 0 e 255 foi zero no ASTC,
+ABGR4, A1BGR5, e RGBA8 em todas as imagens.
+
+| Imagem | ASTC RGB | ASTC alfa BC2 | ASTC alfa BC3 | ASTC MPix/s BC2 / BC3 | ABGR4 RGB | ABGR4 alfa BC3 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Gradiente | 49,99 / 2 | ∞ / 0 | ∞ / 0 | 60,25 / 57,32 | 34,61 / 8 | ∞ / 0 |
+| Ruído | 32,60 / 10 | ∞ / 0 | ∞ / 0 | 59,15 / 58,64 | 34,52 / 8 | ∞ / 0 |
+| Folhagem | 32,63 / 9 | ∞ / 0 | ∞ / 0 | 57,38 / 56,30 | 33,82 / 8 | ∞ / 0 |
+| Rampa alfa | 49,15 / 2 | 50,88 / 1 | 39,64 / 6 | 60,84 / 60,40 | 36,35 / 8 | 34,61 / 8 |
+| Texto/UI | 52,90 / 1 | 26,22 / 43 | 23,59 / 56 | 58,20 / 56,74 | 33,58 / 8 | 42,99 / 4 |
+| Aleatória | 25,83 / 44 | 18,04 / 60 | 20,75 / 64 | 46,21 / 46,65 | 34,49 / 8 | 34,92 / 8 |
+
+ABGR4 deu alfa BC2 ∞ / 0 em todas as imagens. Em A1BGR5, RGB ficou
+em 41,62–46,13 dB com erro ≤ 4 nas realistas e 42,39 / 4 na aleatória.
+Na rampa, alfa BC2/BC3 ficou em 10,95 dB / 119 e 10,86 dB / 127. Na
+aleatória, 11,10 dB / 119 e 10,48 dB / 127. B5G6R5 deu RGB ≥ 43,38 dB
+com erro ≤ 4 nas realistas e 44,78 / 4 na aleatória. Na folhagem, o
+alfa ficou em 2,00 dB / 255, inclusive erro 255 na máscara. Na
+aleatória, deu 4,63 dB / 255 em BC2 e 4,77 dB / 255 em BC3. RGBA8
+deu ∞ / 0 nos dois canais de medição, com erro zero na máscara.
+
+| Codec | MPix/s realistas BC2 / BC3 | MPix/s aleatória BC2 / BC3 |
+| --- | ---: | ---: |
+| RGBA8 | 337–360 / 269–300 | 340 / 266 |
+| ABGR4 | 190–192 / 170–173 | 193 / 160 |
+| A1BGR5 | 189–199 / 173–177 | 196 / 170 |
+| B5G6R5 | 198–213 / 178–193 | 208 / 180 |
+
+Para o modo ASTC medido, 14,06% dos blocos BC2 e 50,00% dos BC3 de
+texto/UI excedem o limite de alfa. No ruído e na folhagem, mesmo uma
+correção perfeita precisaria substituir pelo menos 72,69% dos blocos
+para alcançar 40 dB. Esse limite resulta da remoção dos blocos em ordem
+decrescente de erro RGB quadrático até atingir o orçamento global da
+imagem. Só essa parcela exige pelo menos 36,35 MPix/s do fallback
+para alcançar 50 MPix/s no total, mesmo com custo direto zero.
+Usando como referência o throughput histórico de astcenc
+fastest em blocos aleatórios (1,14/1,25 MPix/s), codificar só 72,69% dos
+blocos já projetaria cerca de 1,6/1,7 MPix/s, antes do custo direto.
+Essa é uma projeção, pois o custo do fallback varia com o conteúdo.
+O ambiente não conseguiu baixar astcenc para uma medição híbrida.
+Um fallback por bloco teria de emitir ASTC válido no mesmo backing e
+demonstrar qualidade e velocidade no conjunto. Mantendo RGBA8 nas
+texturas inteiras, o shim nunca depende dessa correção.
+
+### Decisão e memória
+
+Nenhum candidato medido satisfaz os gates. O ASTC direto perde textura
+fina e altera a cobertura de bordas antialias. ABGR4 introduz degraus
+de cor, A1BGR5 recorta o alfa gradual, e B5G6R5 torna opacas as máscaras.
+A escolha mantém o runtime e a validação Metal existentes.
+
+Se `R = R132 + R133 + R134 + R135` for a soma lógica dos bytes RGBA8
+das raízes elegíveis, o ganho entregue é zero. Para um ASTC futuro, a
+economia lógica exata é `R − Σ(16 × ceil(w/4) × ceil(h/4))`, somando
+por mip e slice. Para dimensões alinhadas, isso é `0,75R`, com redução
+de 4:1. Uma opção 16 bpp teria economia `0,5 × (R132 + R134)` e
+redução 2:1 nessa parcela linear. As fórmulas excluem padding Metal.
+O iPad precisa fornecer `SP_BC_HIST bc=132..135` para estimar o
+volume por formato e categoria. Validação, bytes físicos, latência,
+e impacto visual da amostragem de um candidato futuro exigiriam
+execução no dispositivo.
+
+Reprodução do microbench a partir da raiz:
+
+```sh
+bench=$(mktemp -d)
+gcc -std=c11 -Wall -Wextra -Werror -O1 -Ishims/metal \
+    shims/metal/{spbcdecode,spbclayout,spbcastc}.c \
+    shims/metal/tests/bench_bc_alpha.c -lm -o "$bench/bench"
+"$bench/bench"
+```
+
+BC1 passou pela suíte existente antes e depois. Um comparador compilado
+contra `b687ee1` e contra a worktree produziu 16.000.000 bytes
+idênticos por `cmp`, com um milhão de blocos, seed `0x18092001`,
+e casos de quatro cores, três cores, punch-through, e endpoints iguais.
+O SHA-256 de ambas as saídas foi
+`65047ca9c105277f374eb104de00744947a252f0af9e1b3fc29952428ab4f05c`.
+`git diff` contra `b687ee1` confirma que os arquivos de runtime e
+testes BC1 permanecem byte a byte iguais.
