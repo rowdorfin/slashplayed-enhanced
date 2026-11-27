@@ -707,13 +707,6 @@ struct SettingsView: View {
                     settings.reload()
                 }
             ))
-            Toggle("Texturas BC2/BC3 compactas (experimental)", isOn: Binding(
-                get: { UserDefaults.standard.bool(forKey: "sp_bc_compact_alpha") },
-                set: {
-                    UserDefaults.standard.set($0, forKey: "sp_bc_compact_alpha")
-                    settings.reload()
-                }
-            ))
             Picker("Rastreio de alocações (diagnóstico)", selection: Binding(
                 get: { UserDefaults.standard.integer(forKey: "sp_alloc_trace") },
                 set: {

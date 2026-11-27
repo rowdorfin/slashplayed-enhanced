@@ -416,15 +416,14 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     NSString *render = requested[@"RenderScale"] ?: (configRender ? @(configRender) : @"game");
     NSString *textures = requested[@"graphicsTextureResolution"] ?: @"game";
     BOOL compact = getenv("SP_BC_COMPACT") != NULL;
-    BOOL compactAlpha = getenv("SP_BC_COMPACT_ALPHA") != NULL;
     const char *allocTrace = getenv("SP_ALLOC_TRACE") ?: "0";
     const char *allocMin = getenv("SP_ALLOC_TRACE_MIN_KIB") ?: "256";
     const char *budgetEnv = getenv("SP_GPU_WORKING_SET_MIB");
     NSString *budget = budgetEnv ? [NSString stringWithFormat:@"%s MiB", budgetEnv] : @"real";
     graphics_log([NSString stringWithFormat:
-        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s SP_ALLOC_TRACE=%s SP_ALLOC_TRACE_MIN_KIB=%s SP_BC_COMPACT_ALPHA=%d",
+        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s SP_ALLOC_TRACE=%s SP_ALLOC_TRACE_MIN_KIB=%s",
         machine, device.name ?: @"unknown", nativeBC, backend, profile ? @"a16" : @"native",
-        graphics_name(preset), width, render, textures, found ? @"found" : @"missing", compact, budgetEnv ?: "0", allocTrace, allocMin, compactAlpha]);
+        graphics_name(preset), width, render, textures, found ? @"found" : @"missing", compact, budgetEnv ?: "0", allocTrace, allocMin]);
 
     if (!pump) return;
     UIWindow *window = nil;
@@ -442,9 +441,9 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     notice.textAlignment = NSTextAlignmentCenter;
     notice.numberOfLines = 0;
     notice.userInteractionEnabled = NO;
-    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · BC2/BC3 compacto %@ · Orçamento %@\nRastreio %s · Limiar %s KiB",
+    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · Orçamento %@\nRastreio %s · Limiar %s KiB",
                    backend, graphics_name(preset), width, render, textures, compact ? @"on" : @"off",
-                   compactAlpha ? @"on" : @"off", budget, allocTrace, allocMin];
+                   budget, allocTrace, allocMin];
     [window addSubview:notice];
     UILayoutGuide *safe = window.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -1140,10 +1139,6 @@ int main(int argc, char **argv) {
         setenv("SP_BC_COMPACT", "1", 1);
     else
         unsetenv("SP_BC_COMPACT");
-    if ([defaults boolForKey:@"sp_bc_compact_alpha"])
-        setenv("SP_BC_COMPACT_ALPHA", "1", 1);
-    else
-        unsetenv("SP_BC_COMPACT_ALPHA");
     NSInteger allocTrace = [defaults integerForKey:@"sp_alloc_trace"];
     if (allocTrace == 1 || allocTrace == 2)
         setenv("SP_ALLOC_TRACE", allocTrace == 1 ? "1" : "2", 1);
