@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #import <ptrauth.h>
 #import "spbclayout.h"
+#import "spbcastc.h"
 #import "spbcstaging.h"
 #import "spmetalmeter.h"
 #import "spmemorymeter.h"
@@ -28,6 +29,10 @@
 // The host layout tests use the public enum values without importing Metal.
 _Static_assert(MTLTextureType2D == 2 && MTLTextureType2DArray == 3 && MTLTextureTypeCube == 5 &&
                MTLTextureTypeCubeArray == 6 && MTLTextureType3D == 7, "Metal texture types changed");
+_Static_assert(MTLTextureUsageShaderRead == 1 && MTLTextureUsagePixelFormatView == 16 &&
+               MTLStorageModeShared == 0 && MTLStorageModePrivate == 2 && MTLStorageModeMemoryless == 3,
+               "Metal usage or storage values changed");
+_Static_assert(MTLPixelFormatASTC_4x4_sRGB < MTLPixelFormatASTC_4x4_LDR, "Metal ASTC format order changed");
 #define SPBC_CHECK_FORMAT(name) _Static_assert((unsigned long)MTLPixelFormat##name == (unsigned long)SPPixelFormat##name, "Metal format changed")
 SPBC_CHECK_FORMAT(BC1_RGBA);
 SPBC_CHECK_FORMAT(BC1_RGBA_sRGB);
@@ -58,10 +63,29 @@ typedef enum {
     SPBCReadSlice, SPBCView, SPBCViewRange, SPBCViewSwizzle, SPBCViewDescriptor,
     SPBCBufferCopy, SPBCBufferCopyOptions, SPBCPrivateSource, SPBCPrivateSourceOptions,
     SPBCReadBlit, SPBCReadBlitOptions, SPBCTextureCopy, SPBCTextureRegion,
-    SPBCTextureLevels, SPBCUnsupportedCount
+    SPBCTextureLevels, SPBCMipgen, SPBCUnsupportedCount
 } SPBCUnsupported;
 
 static _Atomic unsigned long long spBCUnsupported[SPBCUnsupportedCount];
+static atomic_ullong spBCMipgenCount, spBCCompactRejects[SPBCUnsupportedCount];
+static atomic_ullong spBCCompactOpaque, spBCCompactPunch, spBCCompactTicks;
+static char spBCCompactDeviceKey;
+static bool spBCCompactActive(id device) {
+    return objc_getAssociatedObject(device, &spBCCompactDeviceKey) != nil;
+}
+
+static const char *const spBCCompactOperations[SPBCUnsupportedCount] = {
+    [SPBCReplace] = "replace", [SPBCReplaceSlice] = "replaceSlice",
+    [SPBCPrivateReplace] = "privateReplace", [SPBCPrivateReplaceSlice] = "privateReplaceSlice",
+    [SPBCRead] = "getBytes", [SPBCReadSlice] = "getBytesSlice",
+    [SPBCView] = "view", [SPBCViewRange] = "viewRange", [SPBCViewSwizzle] = "viewSwizzle",
+    [SPBCViewDescriptor] = "viewDescriptor",
+    [SPBCBufferCopy] = "bufferCopy", [SPBCBufferCopyOptions] = "bufferCopyOptions",
+    [SPBCPrivateSource] = "privateSource", [SPBCPrivateSourceOptions] = "privateSourceOptions",
+    [SPBCReadBlit] = "readBlit", [SPBCReadBlitOptions] = "readBlitOptions",
+    [SPBCTextureCopy] = "copy", [SPBCTextureRegion] = "copyRegion",
+    [SPBCTextureLevels] = "copyLevels", [SPBCMipgen] = "mipgen",
+};
 static _Atomic unsigned long long spBCFormats[24], spBCCompressed, spBCDecoded;
 static os_unfair_lock spBCDecodeLock = OS_UNFAIR_LOCK_INIT;
 typedef struct { unsigned long long count, total, max; } SPBCDecodeStats;
@@ -145,7 +169,8 @@ static void spBCRecordRenderTarget(id<MTLTexture> texture, MTLTextureUsage usage
 @interface SPBCTextureInfo : NSObject
 @property (nonatomic) MTLPixelFormat requested;
 @property (nonatomic) SPBCKind kind;
-@property (nonatomic) BOOL root;
+@property (nonatomic) BOOL root, compact;
+@property (nonatomic) size_t rgbaBytes;
 @property (nonatomic) NSUInteger dimensionBucket, mipBucket;
 @property (nonatomic) size_t trackedBytes, standaloneAllocatedBytes, histogramAllocatedBytes;
 @property (nonatomic) SPMemoryBin *histogramBin;
@@ -155,10 +180,11 @@ static void spBCRecordRenderTarget(id<MTLTexture> texture, MTLTextureUsage usage
 
 typedef struct {
     unsigned long long allocated, rootsCreated, rootsFreed, freed, liveBytes, standaloneAllocatedBytes, peakBytes;
+    unsigned long long compactLive, compactTotal, compactAllocatedBytes, compactRGBABytes;
     unsigned long long dimensionBytes[5], mipBytes[5];
-    unsigned long long liveBytesByFormat[MTLPixelFormatRGBA16Float + 1];
+    unsigned long long liveBytesByFormat[MTLPixelFormatASTC_4x4_LDR + 1];
     unsigned long long liveBytesByStorage[MTLStorageModeMemoryless + 1];
-    unsigned long long standaloneByFormat[MTLPixelFormatRGBA16Float + 1];
+    unsigned long long standaloneByFormat[MTLPixelFormatASTC_4x4_LDR + 1];
     unsigned long long standaloneByStorage[MTLStorageModeMemoryless + 1];
 } SPBCTextureStats;
 static SPBCTextureStats spBCTextureStats;
@@ -169,11 +195,16 @@ static SPBCTextureStats spBCTextureStats;
     @synchronized ([SPBCTextureInfo class]) {
         spBCTextureStats.freed++;
         spBCTextureStats.rootsFreed += _root;
+        if (_root && _compact) {
+            spBCTextureStats.compactLive--;
+            spBCTextureStats.compactAllocatedBytes -= _histogramAllocatedBytes;
+            spBCTextureStats.compactRGBABytes -= _rgbaBytes;
+        }
         spBCTextureStats.dimensionBytes[_dimensionBucket] -= _trackedBytes;
         spBCTextureStats.mipBytes[_mipBucket] -= _trackedBytes;
         spBCTextureStats.liveBytes -= _trackedBytes;
         spBCTextureStats.standaloneAllocatedBytes -= _standaloneAllocatedBytes;
-        if (_physicalFormat <= MTLPixelFormatRGBA16Float) {
+        if (_physicalFormat <= MTLPixelFormatASTC_4x4_LDR) {
             spBCTextureStats.liveBytesByFormat[_physicalFormat] -= _trackedBytes;
             spBCTextureStats.standaloneByFormat[_physicalFormat] -= _standaloneAllocatedBytes;
         }
@@ -420,7 +451,7 @@ static void spBCSummary(id<MTLDevice> device) {
     unsigned long long metalFailures = atomic_load(&spBCMetalAllocationFailures);
     unsigned long long cpuFailures = atomic_load(&spBCCPUAllocationFailures);
     spBCLog(@"SP_BC_FALLBACK summary textures=%llu textureFrees=%llu textureLive=%llu textureLiveBytes=%llu "
-            @"sizingQueries=%llu formats=%@ compressed=%llu decoded=%llu stagingLiveBytes=%llu stagingPeakBytes=%llu "
+            @"sizingQueries=%llu mipgenBC=%llu formats=%@ compressed=%llu decoded=%llu stagingLiveBytes=%llu stagingPeakBytes=%llu "
             @"stagingReserved=%llu stagingReservedPeak=%llu decodeTicks=%llu maxDecodeTicks=%llu unsupported=%@ "
             @"stagingFailures=%llu textureFailures=%llu heaps=%lu heapBytes=%llu "
             @"heapCurrentAllocatedSize=%llu heapAllocatedSamples=%lu heapUsedSize=%llu heapUsedSamples=%lu "
@@ -431,7 +462,7 @@ static void spBCSummary(id<MTLDevice> device) {
             @"textureLiveBytesByPhysicalFormat=%@ textureLiveBytesByStorageMode=%@ "
             @"textureStandaloneAllocatedBytes=%llu stagingAllocatedLiveBytes=%llu stagingAllocatedPeakBytes=%llu%@",
             textures.allocated, textures.freed, textures.allocated - textures.freed, textures.liveBytes,
-            atomic_load(&spBCSizingQueries), formats, atomic_load(&spBCCompressed), atomic_load(&spBCDecoded),
+            atomic_load(&spBCSizingQueries), atomic_load(&spBCMipgenCount), formats, atomic_load(&spBCCompressed), atomic_load(&spBCDecoded),
             atomic_load(&spBCStagingLive),
             atomic_load(&spBCStagingPeak), SPBCStagingReserved(&staging), staging.reservedPeak,
             lifetime.total, lifetime.max, unsupported,
@@ -472,7 +503,7 @@ static void spBCSummary(id<MTLDevice> device) {
             @"heapAllocatedSamplePeak=%llu shimCompressedCopyBytes=0",
             created ? "loading-resources" : "no-new-resources", created, decode.count,
             decode.total * tickUs, decode.count ? decode.total * tickUs / decode.count : 0.0, decode.max * tickUs,
-            spBCByteBreakdown(textures.standaloneByFormat, MTLPixelFormatRGBA16Float + 1),
+            spBCByteBreakdown(textures.standaloneByFormat, MTLPixelFormatASTC_4x4_LDR + 1),
             spBCByteBreakdown(textures.standaloneByStorage, MTLStorageModeMemoryless + 1),
             spBCByteBreakdown(native[SPBCDepth], SPBCFormatCount + 1),
             spBCByteBreakdown(native[SPBCTarget], SPBCFormatCount + 1),
@@ -498,6 +529,22 @@ static void spBCSummary(id<MTLDevice> device) {
             staging.maxBatchBytes, staging.uploadsAtMaxBatch, atomic_load(&spBCUploadBatchMax),
             staging.batchUploads ? (double)staging.batchBytes / staging.batchUploads : 0.0,
             atomic_load(&spBCSmallStagingAllocations), atomic_load(&spBCStagingPadding));
+    if (spBCCompactActive(device)) {
+        unsigned long long opaque = atomic_load(&spBCCompactOpaque), punch = atomic_load(&spBCCompactPunch);
+        double ms = atomic_load(&spBCCompactTicks) * tickUs / 1000.0;
+        double mib = (opaque + punch) * (double)SPBCASTCBlockBytes / (1024 * 1024);
+        NSMutableString *rejects = [NSMutableString string];
+        for (unsigned op = 0; op < SPBCUnsupportedCount; op++) {
+            unsigned long long count = atomic_load(&spBCCompactRejects[op]);
+            if (count) [rejects appendFormat:@"%s%s=%llu", rejects.length ? "," : "",
+                                             spBCCompactOperations[op], count];
+        }
+        spBCLog(@"SP_BC_COMPACT live=%llu total=%llu opaque=%llu punch=%llu astcAllocated=%llu "
+                @"rgbaLayout=%llu savedEstimate=%lld transcodeMs=%.3f msPerOutputMiB=%.3f rejects=%@",
+                textures.compactLive, textures.compactTotal, opaque, punch, textures.compactAllocatedBytes,
+                textures.compactRGBABytes, (long long)textures.compactRGBABytes - (long long)textures.compactAllocatedBytes,
+                ms, mib ? ms / mib : 0.0, rejects.length ? rejects : @"0");
+    }
     spBCHistogramSummary(&spBCTextureHistogram, true);
     spBCHistogramSummary(&spBCRenderTargetHistogram, false);
 }
@@ -521,6 +568,14 @@ static void spBCReject(SPBCUnsupported operation, SEL selector, MTLPixelFormat f
     if (atomic_fetch_add(&spBCUnsupported[operation], 1) == 0)
         spBCLog(@"SP_BC_FALLBACK unsupported op=%u selector=%s format=%lu reason=%s",
                 (unsigned)operation, sel_getName(selector), (unsigned long)format, reason);
+}
+
+static void spBCRejectTexture(SPBCTextureInfo *info, SPBCUnsupported operation, SEL selector,
+                              MTLPixelFormat format, const char *reason) {
+    if (info.compact && atomic_fetch_add(&spBCCompactRejects[operation], 1) == 0)
+        spBCLog(@"SP_BC_COMPACT reject op=%s selector=%s format=%lu reason=%s",
+                spBCCompactOperations[operation], sel_getName(selector), (unsigned long)format, reason);
+    spBCReject(operation, selector, format, reason);
 }
 
 static void spBCRecordDecode(SPBCKind kind, SPBCTile tile, uint64_t ticks) {
@@ -648,11 +703,28 @@ static void spBCDropLayout(SEL selector) {
     spBCDrop(selector, "invalid upload layout");
 }
 
-static bool spBCDecodeTile(SPBCKind kind, const uint8_t *source, SPBCLayout layout,
+static bool spBCNextUploadTile(SPBCKind kind, bool compact, SPBCSize size, size_t alignment,
+                               SPBCOrigin *cursor, SPBCTile *tile) {
+    if (compact) return SPBCNextASTCTile(size, SPBCTileLimit, cursor, tile);
+    return SPBCNextTile(kind, size, alignment, SPBCTileLimit, cursor, tile);
+}
+
+static bool spBCConvertTile(SPBCKind kind, bool compact, const uint8_t *source, SPBCLayout layout,
                             SPBCTile tile, uint8_t *target) {
     size_t offset = layout.offset + tile.origin.z * layout.image +
                     (tile.origin.y / 4) * layout.row + (tile.origin.x / 4) * SPBCBlockBytes(kind);
     uint64_t start = mach_absolute_time();
+    if (compact) {
+        size_t punch;
+        if (!SPBC1RectToASTCCounted(source + offset, layout.row, tile.size.width, tile.size.height,
+                                   target, tile.row, &punch)) return false;
+        uint64_t ticks = mach_absolute_time() - start;
+        size_t blocks = SPBCBlockCount(tile.size.width) * SPBCBlockCount(tile.size.height);
+        atomic_fetch_add_explicit(&spBCCompactTicks, ticks, memory_order_relaxed);
+        atomic_fetch_add_explicit(&spBCCompactOpaque, blocks - punch, memory_order_relaxed);
+        atomic_fetch_add_explicit(&spBCCompactPunch, punch, memory_order_relaxed);
+        return true;
+    }
     bool ok = SPBCDecodeRect(kind, source + offset, layout.row, (uint32_t)tile.size.width,
                              (uint32_t)tile.size.height, target, tile.row);
     if (ok) spBCRecordDecode(kind, tile, mach_absolute_time() - start);
@@ -769,18 +841,18 @@ static void spBCStartMemoryPressure(void) {
     dispatch_resume(source);
 }
 
-static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo *info, MTLRegion region,
-                          NSUInteger level, NSUInteger slice, const void *source,
-                          NSUInteger row, NSUInteger image, bool implicitImage) {
+static void uploadBC(id<MTLTexture> texture, SEL selector, SPBCTextureInfo *info, MTLRegion region,
+                     NSUInteger level, NSUInteger slice, const void *source,
+                     NSUInteger row, NSUInteger image, bool implicitImage) {
     if (texture.storageMode == MTLStorageModePrivate) {
-        spBCReject(implicitImage ? SPBCPrivateReplace : SPBCPrivateReplaceSlice, selector, info.requested,
-                   "Private texture requires a blit upload");
+        spBCRejectTexture(info, implicitImage ? SPBCPrivateReplace : SPBCPrivateReplaceSlice, selector, info.requested,
+                          "Private texture requires a blit upload");
         spBCDrop(selector, "private texture");
         return;
     }
     size_t rows = SPBCBlockCount(region.size.height);
     if (implicitImage && (!rows || row > SIZE_MAX / rows)) {
-        spBCReject(SPBCReplace, selector, info.requested, "invalid implicit image pitch");
+        spBCRejectTexture(info, SPBCReplace, selector, info.requested, "invalid implicit image pitch");
         spBCDropLayout(selector);
         return;
     }
@@ -789,20 +861,21 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
     SPBCLayout layout;
     if (!source || !spBCRegion(texture, level, slice, &mip) ||
         !SPBCMakeLayout(info.kind, mip, spBCOrigin(region.origin), spBCSize(region.size), 0, row, image, &layout)) {
-        spBCReject(implicitImage ? SPBCReplace : SPBCReplaceSlice, selector, info.requested, "invalid region or pitch");
+        spBCRejectTexture(info, implicitImage ? SPBCReplace : SPBCReplaceSlice, selector, info.requested,
+                          "invalid region or pitch");
         spBCDropLayout(selector);
         return;
     }
     SPBCOrigin cursor = {0};
     SPBCTile tile;
-    if (!SPBCNextTile(info.kind, layout.size, 1, SPBCTileLimit, &cursor, &tile)) {
+    if (!spBCNextUploadTile(info.kind, info.compact, layout.size, 1, &cursor, &tile)) {
         spBCDropLayout(selector);
         return;
     }
     size_t capacity = tile.bytes;
     SPBCScratchSlot *cached;
-    uint8_t *decoded = spBCScratch(capacity, &cached);
-    if (!decoded) {
+    uint8_t *scratch = spBCScratch(capacity, &cached);
+    if (!scratch) {
         atomic_fetch_add(&spBCCPUAllocationFailures, 1);
         spBCDrop(selector, "CPU scratch allocation failed");
         return;
@@ -814,17 +887,17 @@ static void uploadDecoded(id<MTLTexture> texture, SEL selector, SPBCTextureInfo 
     [condition unlock];
     ReplaceRegion real = (ReplaceRegion)superIMP(texture, replaceSlice());
     do {
-        if (!spBCDecodeTile(info.kind, source, layout, tile, decoded)) {
+        if (!spBCConvertTile(info.kind, info.compact, source, layout, tile, scratch)) {
             spBCDropLayout(selector);
             break;
         }
         MTLRegion part = spBCPart(region.origin, tile);
         insideTexture++;
-        real(texture, replaceSlice(), part, level, slice, decoded, tile.row,
+        real(texture, replaceSlice(), part, level, slice, scratch, tile.row,
              texture.textureType == MTLTextureType3D ? tile.bytes : 0);
         insideTexture--;
-    } while (SPBCNextTile(info.kind, layout.size, 1, SPBCTileLimit, &cursor, &tile));
-    spBCReleaseScratch(decoded, cached);
+    } while (spBCNextUploadTile(info.kind, info.compact, layout.size, 1, &cursor, &tile));
+    spBCReleaseScratch(scratch, cached);
     [condition lock];
     SPBCStagingReleaseScratch(&spBCStaging, capacity);
     [condition unlock];
@@ -837,7 +910,7 @@ static void textureReplaceSlice(id self, SEL selector, MTLRegion region, NSUInte
         return;
     }
     @autoreleasepool {
-        uploadDecoded(self, selector, infoOf(self), region, level, slice, bytes, row, image, false);
+        uploadBC(self, selector, infoOf(self), region, level, slice, bytes, row, image, false);
     }
 }
 static void textureReplace(id self, SEL selector, MTLRegion region, NSUInteger level, const void *bytes, NSUInteger row) {
@@ -847,7 +920,7 @@ static void textureReplace(id self, SEL selector, MTLRegion region, NSUInteger l
         return;
     }
     @autoreleasepool {
-        uploadDecoded(self, selector, infoOf(self), region, level, 0, bytes, row, 0, true);
+        uploadBC(self, selector, infoOf(self), region, level, 0, bytes, row, 0, true);
     }
 }
 
@@ -858,7 +931,8 @@ static void textureGetSlice(id self, SEL selector, void *bytes, NSUInteger row, 
             (self, selector, bytes, row, image, region, level, slice);
         return;
     }
-    spBCReject(SPBCReadSlice, selector, infoOf(self).requested, "BC readback needs an encoder");
+    SPBCTextureInfo *info = infoOf(self);
+    spBCRejectTexture(info, SPBCReadSlice, selector, info.requested, "BC readback needs an encoder");
 }
 static void textureGet(id self, SEL selector, void *bytes, NSUInteger row, MTLRegion region, NSUInteger level) {
     if (insideTexture || calledBySystem(__builtin_return_address(0))) {
@@ -866,7 +940,8 @@ static void textureGet(id self, SEL selector, void *bytes, NSUInteger row, MTLRe
             (self, selector, bytes, row, region, level);
         return;
     }
-    spBCReject(SPBCRead, selector, infoOf(self).requested, "BC readback needs an encoder");
+    SPBCTextureInfo *info = infoOf(self);
+    spBCRejectTexture(info, SPBCRead, selector, info.requested, "BC readback needs an encoder");
 }
 
 static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view);
@@ -878,11 +953,19 @@ typedef id (*CreateAtOffset)(id, SEL, id, NSUInteger) RETAINED;
 typedef id (*SPBCSurfaceFactory)(id, SEL, id, IOSurfaceRef, NSUInteger) RETAINED;
 typedef id (*SPBCBufferTextureFactory)(id, SEL, id, NSUInteger, NSUInteger) RETAINED;
 
+static MTLPixelFormat spBCCompactFormat(MTLPixelFormat requested) {
+    return requested == MTLPixelFormatBC1_RGBA_sRGB ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatASTC_4x4_LDR;
+}
+
+static MTLPixelFormat spBCViewFormat(id texture, MTLPixelFormat requested) {
+    return infoOf(texture).compact ? spBCCompactFormat(requested) : (MTLPixelFormat)SPBCDecodedPixelFormat(requested);
+}
+
 // sRGB and linear variants of the same block encoding can alias the same texels.
 static bool spBCViewAllowed(id texture, SEL selector, MTLPixelFormat format, SPBCUnsupported operation) {
     SPBCTextureInfo *info = infoOf(texture);
     if (SPBCKindOfPixelFormat(format) == info.kind) return true;
-    spBCReject(operation, selector, format, "view would reinterpret BC storage");
+    spBCRejectTexture(info, operation, selector, format, "view would reinterpret BC storage");
     return false;
 }
 
@@ -891,7 +974,7 @@ static id textureView(id self, SEL selector, MTLPixelFormat format) {
     ViewFormat real = (ViewFormat)superIMP(self, selector);
     if (insideTexture || calledBySystem(__builtin_return_address(0))) return real(self, selector, format);
     if (!spBCViewAllowed(self, selector, format, SPBCView)) return nil;
-    MTLPixelFormat stored = (MTLPixelFormat)SPBCDecodedPixelFormat(format);
+    MTLPixelFormat stored = spBCViewFormat(self, format);
     insideTexture++; id view = real(self, selector, (MTLPixelFormat)stored); insideTexture--;
     return converted(view, format, true);
 }
@@ -900,7 +983,7 @@ static id textureViewRange(id self, SEL selector, MTLPixelFormat format, MTLText
     ViewRange real = (ViewRange)superIMP(self, selector);
     if (insideTexture || calledBySystem(__builtin_return_address(0))) return real(self, selector, format, type, levels, slices);
     if (!spBCViewAllowed(self, selector, format, SPBCViewRange)) return nil;
-    MTLPixelFormat stored = (MTLPixelFormat)SPBCDecodedPixelFormat(format);
+    MTLPixelFormat stored = spBCViewFormat(self, format);
     insideTexture++; id view = real(self, selector, (MTLPixelFormat)stored, type, levels, slices); insideTexture--;
     return converted(view, format, true);
 }
@@ -911,7 +994,7 @@ static id textureViewSwizzle(id self, SEL selector, MTLPixelFormat format, MTLTe
     ViewSwizzle real = (ViewSwizzle)superIMP(self, selector);
     if (insideTexture || calledBySystem(__builtin_return_address(0))) return real(self, selector, format, type, levels, slices, swizzle);
     if (!spBCViewAllowed(self, selector, format, SPBCViewSwizzle)) return nil;
-    MTLPixelFormat stored = (MTLPixelFormat)SPBCDecodedPixelFormat(format);
+    MTLPixelFormat stored = spBCViewFormat(self, format);
     insideTexture++; id view = real(self, selector, (MTLPixelFormat)stored, type, levels, slices, swizzle); insideTexture--;
     return converted(view, format, true);
 }
@@ -927,7 +1010,7 @@ static id textureViewDescriptor(id self, SEL selector, id descriptor) {
     if (format == MTLPixelFormatInvalid) format = infoOf(self).requested;
     if (!spBCViewAllowed(self, selector, format, SPBCViewDescriptor)) return nil;
     id copy = [descriptor copy];
-    setFormat(copy, @selector(setPixelFormat:), (MTLPixelFormat)SPBCDecodedPixelFormat(format));
+    setFormat(copy, @selector(setPixelFormat:), spBCViewFormat(self, format));
     insideTexture++;
     id result = real(self, selector, copy);
     insideTexture--;
@@ -981,16 +1064,22 @@ static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view)
     SPBCTextureInfo *info = [SPBCTextureInfo new];
     info.requested = requested;
     info.kind = SPBCKindOfPixelFormat(requested);
+    insideTexture++;
+    info.physicalFormat = texture.pixelFormat;
+    insideTexture--;
+    info.compact = info.physicalFormat == MTLPixelFormatASTC_4x4_LDR ||
+                   info.physicalFormat == MTLPixelFormatASTC_4x4_sRGB;
     if (!view) {
         info.root = YES;
         NSUInteger edge = MAX(texture.width, MAX(texture.height, texture.depth));
         info.dimensionBucket = edge <= 256 ? 0 : edge <= 512 ? 1 : edge <= 1024 ? 2 : edge <= 2048 ? 3 : 4;
         NSUInteger mips = texture.mipmapLevelCount;
         info.mipBucket = mips <= 1 ? 0 : mips <= 4 ? 1 : mips <= 8 ? 2 : mips <= 12 ? 3 : 4;
-        info.trackedBytes = SPBCTextureBytes(info.kind, (SPBCSize){texture.width, texture.height, texture.depth},
-                                             texture.textureType, texture.mipmapLevelCount, texture.arrayLength,
-                                             texture.sampleCount);
-        info.physicalFormat = texture.pixelFormat;
+        SPBCSize base = {texture.width, texture.height, texture.depth};
+        info.rgbaBytes = SPBCTextureBytes(info.kind, base, texture.textureType, mips, texture.arrayLength,
+                                         texture.sampleCount);
+        info.trackedBytes = info.compact ? SPBCASTCTextureBytes(base, texture.textureType, mips, texture.arrayLength)
+                                        : info.rgbaBytes;
         info.storageMode = texture.storageMode;
         // Metal's heap metrics already cover heap backing. Views share their parent's allocation.
         info.histogramAllocatedBytes = texture.allocatedSize;
@@ -1006,12 +1095,18 @@ static id converted(id<MTLTexture> texture, MTLPixelFormat requested, bool view)
     @synchronized ([SPBCTextureInfo class]) {
         spBCTextureStats.allocated++;
         spBCTextureStats.rootsCreated += !view;
+        if (info.root && info.compact) {
+            spBCTextureStats.compactLive++;
+            spBCTextureStats.compactTotal++;
+            spBCTextureStats.compactAllocatedBytes += info.histogramAllocatedBytes;
+            spBCTextureStats.compactRGBABytes += info.rgbaBytes;
+        }
         spBCTextureStats.liveBytes += info.trackedBytes;
         spBCTextureStats.peakBytes = MAX(spBCTextureStats.peakBytes, spBCTextureStats.liveBytes);
         spBCTextureStats.dimensionBytes[info.dimensionBucket] += info.trackedBytes;
         spBCTextureStats.mipBytes[info.mipBucket] += info.trackedBytes;
         spBCTextureStats.standaloneAllocatedBytes += info.standaloneAllocatedBytes;
-        if (info.physicalFormat <= MTLPixelFormatRGBA16Float) {
+        if (info.physicalFormat <= MTLPixelFormatASTC_4x4_LDR) {
             spBCTextureStats.liveBytesByFormat[info.physicalFormat] += info.trackedBytes;
             spBCTextureStats.standaloneByFormat[info.physicalFormat] += info.standaloneAllocatedBytes;
         }
@@ -1123,11 +1218,19 @@ static id newTexture(id owner, SEL selector, MTLTextureDescriptor *descriptor) {
     }
     if (spBCCreating && !spA16Profile()) return real(owner, selector, descriptor);
     // This selector is shared by MTLDevice and MTLHeap.
-    if (!spBCActive(owner) && !([owner respondsToSelector:@selector(device)] &&
-                                spBCActive([(id<MTLHeap>)owner device])))
+    bool deviceFactory = spBCActive(owner);
+    if (!deviceFactory && !([owner respondsToSelector:@selector(device)] &&
+                            spBCActive([(id<MTLHeap>)owner device])))
         return real(owner, selector, descriptor);
     @autoreleasepool {
         MTLTextureDescriptor *stored = spBCStoredDescriptor(descriptor);
+        // Only the device factory can select ASTC. Heap allocation and the
+        // device's heap sizing query must continue to agree on RGBA8.
+        bool standalone = deviceFactory && !spBCCreating;
+        if (spBCCompactActive(owner) &&
+            SPBC1CompactEligible(descriptor.pixelFormat, descriptor.textureType, descriptor.usage,
+                                 descriptor.storageMode, standalone, true))
+            stored.pixelFormat = spBCCompactFormat(descriptor.pixelFormat);
         spBCCreating++;
         id texture = real(owner, selector, stored);
         spBCCreating--;
@@ -1299,6 +1402,7 @@ static void spBCTrackStaging(id<MTLBuffer> buffer) {
     NSMutableArray<SPBCUploadTile *> *tiles;
     SPBCLayout layout;
     SPBCKind kind;
+    bool compact;
     SEL uploadSelector;
     SPBCStagingReservation reservation;
     uint64_t encodedAt;
@@ -1311,7 +1415,7 @@ static void spBCTrackStaging(id<MTLBuffer> buffer) {
 - (void)decode {
     const uint8_t *bytes = source.contents;
     for (SPBCUploadTile *part in tiles) {
-        if (!spBCDecodeTile(kind, bytes, layout, part->tile, (uint8_t *)part->staging.contents + part->offset)) {
+        if (!spBCConvertTile(kind, compact, bytes, layout, part->tile, (uint8_t *)part->staging.contents + part->offset)) {
             spBCDropLayout(uploadSelector);
             break;
         }
@@ -1424,8 +1528,8 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
                         NSUInteger image, MTLSize size, id<MTLTexture> texture, NSUInteger slice, NSUInteger level,
                         MTLOrigin origin, MTLBlitOption options, bool withOptions, SPBCTextureInfo *info) {
     if (source.storageMode == MTLStorageModePrivate || !source.contents) {
-        spBCReject(withOptions ? SPBCPrivateSourceOptions : SPBCPrivateSource, selector, info.requested,
-                   "source buffer is not CPU visible");
+        spBCRejectTexture(info, withOptions ? SPBCPrivateSourceOptions : SPBCPrivateSource, selector, info.requested,
+                          "source buffer is not CPU visible");
         spBCDrop(selector, "source buffer is not CPU visible");
         return;
     }
@@ -1434,7 +1538,7 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
     SPBCUnsupported operation = withOptions ? SPBCBufferCopyOptions : SPBCBufferCopy;
     if (!commandBuffer || options) {
         const char *reason = commandBuffer ? "unsupported blit options" : "missing command buffer";
-        spBCReject(operation, selector, info.requested, reason);
+        spBCRejectTexture(info, operation, selector, info.requested, reason);
         spBCDrop(selector, reason);
         return;
     }
@@ -1443,20 +1547,20 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
     if (!spBCRegion(texture, level, slice, &mip) ||
         !SPBCMakeLayout(info.kind, mip, spBCOrigin(origin), spBCSize(size), offset, row, image, &layout) ||
         layout.end > source.length) {
-        spBCReject(operation, selector, info.requested, "invalid region, pitch, or source range");
+        spBCRejectTexture(info, operation, selector, info.requested, "invalid region, pitch, or source range");
         spBCDropLayout(selector);
         return;
     }
 
     // Reserve once for the whole copy. Waiting between tiles would keep this
     // uncommitted copy's allocations live and repeat the stall for each tile.
-    // Buffer-to-texture blits require a whole-texel row pitch. The stricter
+    // Buffer-to-texture blits require whole texels or blocks. The stricter
     // alignment for buffer-backed texture views does not apply to these copies.
     size_t alignment = SPBCTexelBytes(info.kind);
     size_t bytes = 0, tileCount = 0;
     SPBCOrigin cursor = {0};
     SPBCTile tile;
-    while (SPBCNextTile(info.kind, layout.size, alignment, SPBCTileLimit, &cursor, &tile)) {
+    while (spBCNextUploadTile(info.kind, info.compact, layout.size, alignment, &cursor, &tile)) {
         if (tile.bytes > SIZE_MAX - bytes) {
             spBCDropLayout(selector);
             return;
@@ -1476,6 +1580,7 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
     if (!commandBuffer.retainedReferences) upload->destination = texture;
     upload->layout = layout;
     upload->kind = info.kind;
+    upload->compact = info.compact;
     upload->uploadSelector = selector;
     upload->tiles = [NSMutableArray new];
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.002];
@@ -1493,7 +1598,7 @@ static void stageUpload(id encoder, SEL selector, id<MTLBuffer> source, NSUInteg
     }
     size_t offsetInBuffer = 0;
     cursor = (SPBCOrigin){0};
-    while (SPBCNextTile(info.kind, layout.size, alignment, SPBCTileLimit, &cursor, &tile)) {
+    while (spBCNextUploadTile(info.kind, info.compact, layout.size, alignment, &cursor, &tile)) {
         SPBCUploadTile *part = [SPBCUploadTile new];
         part->tile = tile;
         part->staging = packed ?: spBCAllocateStaging(texture.device, tile.bytes, deadline);
@@ -1558,9 +1663,10 @@ static void copyBufferToTextureOptions(id encoder, SEL selector, id<MTLBuffer> s
 }
 
 static bool spBCCopyAllowed(SPBCTextureInfo *source, SPBCTextureInfo *destination, SEL selector, SPBCUnsupported operation) {
-    if ((!source && !destination) || (source && destination &&
-        SPBCDecodedPixelFormat(source.requested) == SPBCDecodedPixelFormat(destination.requested))) return true;
-    spBCReject(operation, selector, (source ?: destination).requested, "copy requires matching physical BC textures");
+    if ((!source && !destination) ||
+        (source && destination && source.physicalFormat == destination.physicalFormat)) return true;
+    SPBCTextureInfo *info = source.compact ? source : (destination ?: source);
+    spBCRejectTexture(info, operation, selector, info.requested, "copy requires matching physical BC textures");
     return false;
 }
 
@@ -1573,6 +1679,10 @@ static bool spBCCopyLayout(id<MTLTexture> texture, NSUInteger slice, NSUInteger 
     return SPBCMakeLayout(kind, mip, spBCOrigin(origin), spBCSize(size), 0, row, image, layout);
 }
 
+static bool spBCSameSize(SPBCSize a, SPBCSize b) {
+    return a.width == b.width && a.height == b.height && a.depth == b.depth;
+}
+
 static void copyTextureRegion(id encoder, SEL selector, id<MTLTexture> source, NSUInteger sourceSlice, NSUInteger sourceLevel,
                               MTLOrigin sourceOrigin, MTLSize size, id<MTLTexture> destination, NSUInteger destinationSlice,
                               NSUInteger destinationLevel, MTLOrigin destinationOrigin) {
@@ -1582,8 +1692,8 @@ static void copyTextureRegion(id encoder, SEL selector, id<MTLTexture> source, N
         SPBCLayout input, output;
         if (!spBCCopyLayout(source, sourceSlice, sourceLevel, sourceOrigin, size, from.kind, &input) ||
             !spBCCopyLayout(destination, destinationSlice, destinationLevel, destinationOrigin, size, to.kind, &output) ||
-            input.size.width != output.size.width || input.size.height != output.size.height) {
-            spBCReject(SPBCTextureRegion, selector, from.requested, "incompatible region or mip edges");
+            !spBCSameSize(input.size, output.size)) {
+            spBCRejectTexture(from, SPBCTextureRegion, selector, from.requested, "incompatible region or mip edges");
             return;
         }
         size = MTLSizeMake(input.size.width, input.size.height, input.size.depth);
@@ -1594,16 +1704,49 @@ static void copyTextureRegion(id encoder, SEL selector, id<MTLTexture> source, N
                                       size, destination, destinationSlice, destinationLevel, destinationOrigin);
     insideTexture--;
 }
-static void copyTextureLevels(id encoder, SEL selector, id source, NSUInteger sourceSlice, NSUInteger sourceLevel, id destination,
-                              NSUInteger destinationSlice, NSUInteger destinationLevel, NSUInteger sliceCount, NSUInteger levelCount) {
-    if (!insideTexture && !spBCCopyAllowed(infoOf(source), infoOf(destination), selector, SPBCTextureLevels)) return;
+static bool spBCCopyRangeFits(id<MTLTexture> texture, NSUInteger slice, NSUInteger level,
+                              NSUInteger slices, NSUInteger levels, SPBCSize *mip) {
+    return slices && levels && slices - 1 <= NSUIntegerMax - slice &&
+           SPBCValidSlice(texture.textureType, texture.arrayLength, slice + (slices - 1)) &&
+           spBCRegion(texture, level, slice, mip) && levels <= texture.mipmapLevelCount - level;
+}
+
+static void copyTextureLevels(id encoder, SEL selector, id<MTLTexture> source, NSUInteger sourceSlice,
+                              NSUInteger sourceLevel, id<MTLTexture> destination, NSUInteger destinationSlice,
+                              NSUInteger destinationLevel, NSUInteger sliceCount, NSUInteger levelCount) {
+    SPBCTextureInfo *from = insideTexture ? nil : infoOf(source), *to = insideTexture ? nil : infoOf(destination);
+    if (!spBCCopyAllowed(from, to, selector, SPBCTextureLevels)) return;
+    if (from.compact) {
+        SPBCSize input, output;
+        if (!spBCCopyRangeFits(source, sourceSlice, sourceLevel, sliceCount, levelCount, &input) ||
+            !spBCCopyRangeFits(destination, destinationSlice, destinationLevel, sliceCount, levelCount, &output) ||
+            !spBCSameSize(input, output)) {
+            spBCRejectTexture(from, SPBCTextureLevels, selector, from.requested, "incompatible slice or mip range");
+            return;
+        }
+    }
     insideTexture++;
     ((void (*)(id, SEL, id, NSUInteger, NSUInteger, id, NSUInteger, NSUInteger, NSUInteger, NSUInteger))original(encoder, selector))
         (encoder, selector, source, sourceSlice, sourceLevel, destination, destinationSlice, destinationLevel, sliceCount, levelCount);
     insideTexture--;
 }
-static void copyTexture(id encoder, SEL selector, id source, id destination) {
-    if (!insideTexture && !spBCCopyAllowed(infoOf(source), infoOf(destination), selector, SPBCTextureCopy)) return;
+static bool spBCHasMipSize(id<MTLTexture> texture, NSUInteger level, SPBCSize base, SPBCSize wanted) {
+    for (; level < texture.mipmapLevelCount; level++)
+        if (spBCSameSize(SPBCMipSize(base, level), wanted)) return true;
+    return false;
+}
+
+static void copyTexture(id encoder, SEL selector, id<MTLTexture> source, id<MTLTexture> destination) {
+    SPBCTextureInfo *from = insideTexture ? nil : infoOf(source), *to = insideTexture ? nil : infoOf(destination);
+    if (!spBCCopyAllowed(from, to, selector, SPBCTextureCopy)) return;
+    if (from.compact) {
+        SPBCSize input = {source.width, source.height, source.depth};
+        SPBCSize output = {destination.width, destination.height, destination.depth};
+        if (!spBCHasMipSize(source, 0, input, output) && !spBCHasMipSize(destination, 1, output, input)) {
+            spBCRejectTexture(from, SPBCTextureCopy, selector, from.requested, "no matching mip dimensions");
+            return;
+        }
+    }
     insideTexture++;
     ((void (*)(id, SEL, id, id))original(encoder, selector))(encoder, selector, source, destination);
     insideTexture--;
@@ -1612,19 +1755,31 @@ static void copyTexture(id encoder, SEL selector, id source, id destination) {
 static void copyTextureToBuffer(id encoder, SEL selector, id source, NSUInteger slice, NSUInteger level, MTLOrigin origin,
                                 MTLSize size, id buffer, NSUInteger offset, NSUInteger row, NSUInteger image) {
     SPBCTextureInfo *info = insideTexture ? nil : infoOf(source);
-    if (info) { spBCReject(SPBCReadBlit, selector, info.requested, "BC readback needs an encoder"); return; }
+    if (info) { spBCRejectTexture(info, SPBCReadBlit, selector, info.requested, "BC readback needs an encoder"); return; }
     ((void (*)(id, SEL, id, NSUInteger, NSUInteger, MTLOrigin, MTLSize, id, NSUInteger, NSUInteger, NSUInteger))original(encoder, selector))
         (encoder, selector, source, slice, level, origin, size, buffer, offset, row, image);
 }
 static void copyTextureToBufferOptions(id encoder, SEL selector, id source, NSUInteger slice, NSUInteger level, MTLOrigin origin,
                                        MTLSize size, id buffer, NSUInteger offset, NSUInteger row, NSUInteger image, MTLBlitOption options) {
     SPBCTextureInfo *info = insideTexture ? nil : infoOf(source);
-    if (info) { spBCReject(SPBCReadBlitOptions, selector, info.requested, "BC readback needs an encoder"); return; }
+    if (info) { spBCRejectTexture(info, SPBCReadBlitOptions, selector, info.requested, "BC readback needs an encoder"); return; }
     ((void (*)(id, SEL, id, NSUInteger, NSUInteger, MTLOrigin, MTLSize, id, NSUInteger, NSUInteger, NSUInteger, MTLBlitOption))
         original(encoder, selector))(encoder, selector, source, slice, level, origin, size, buffer, offset, row, image, options);
 }
 
-static void spBCGenerateMipmaps(id encoder, SEL selector, id texture) {
+static void spBCGenerateMipmaps(id encoder, SEL selector, id<MTLTexture> texture) {
+    SPBCTextureInfo *info = infoOf(texture);
+    MTLPixelFormat format = info ? info.requested : texture.pixelFormat;
+    if (!insideTexture && SPBCKindOfPixelFormat(format)) {
+        if (atomic_fetch_add(&spBCMipgenCount, 1) == 0)
+            spBCLog(@"SP_BC_FALLBACK mipgenBC format=%lu size=%lux%lux%lu mips=%lu",
+                    (unsigned long)format, (unsigned long)texture.width, (unsigned long)texture.height,
+                    (unsigned long)texture.depth, (unsigned long)texture.mipmapLevelCount);
+        if (info.compact) {
+            spBCRejectTexture(info, SPBCMipgen, selector, format, "ASTC cannot generate mipmaps");
+            return;
+        }
+    }
     insideTexture++;
     ((void (*)(id, SEL, id))original(encoder, selector))(encoder, selector, texture);
     insideTexture--;
@@ -1794,7 +1949,10 @@ static bool spBCShouldEnable(id<MTLDevice> device) {
                               !device.supportsBCTextureCompression);
 }
 
-// Texture backend IDs reserved for session logs: bc-native, bc-fallback-rgba8, astc.
+static bool spBCCompactRequested(id<MTLDevice> device) {
+    const char *flag = getenv("SP_BC_COMPACT");
+    return flag && strcmp(flag, "1") == 0 && [device supportsFamily:MTLGPUFamilyApple2];
+}
 static void spA16Session(id<MTLDevice> device) {
     bool profile = spA16Profile();
     char machine[128] = "unknown";
@@ -1810,12 +1968,15 @@ static void spA16Session(id<MTLDevice> device) {
     uint64_t footprint = 0;
     bool measured = spA16Footprint(&footprint);
     size_t available = os_proc_available_memory();
+    const char *backend = "bc-native";
+    if (spBCShouldEnable(device))
+        backend = spBCCompactRequested(device) ? "bc-fallback-rgba8+astc-bc1" : "bc-fallback-rgba8";
     NSString *line = [NSString stringWithFormat:
         @"SP_A16_PROFILE session build=%s profile=%s textureBackend=%s "
         @"real={hw.machine=%s device=\"%@\" Apple7=%d Apple8=%d Apple9=%d Mac2=%d BC=%s "
         @"phys_footprint=%@ os_proc_available_memory=%zu footprintPlusAvailable=%@ drawable=pending} "
         @"%s={Apple7=%d Apple8=%d Apple9=%d Mac2=%d BC=%s budgetMiB=%s}",
-        SP_A16_BUILD_SHA, profile ? "A16" : "native", spBCShouldEnable(device) ? "bc-fallback-rgba8" : "bc-native",
+        SP_A16_BUILD_SHA, profile ? "A16" : "native", backend,
         machine, device.name, apple7, apple8, apple9, mac2, haveBC ? (nativeBC ? "1" : "0") : "n/a",
         measured ? @(footprint) : @"n/a", available, measured ? @(footprint + available) : @"n/a",
         profile ? "simulated" : "effective", apple7, apple8,
@@ -1835,6 +1996,8 @@ static void spBCInstall(id<MTLDevice> device, Class cls) {
             spA16Profile() ? "a16-profile" : enabled ? "no-native-BC" : haveProperty ? "native-BC" : "capability-unavailable");
     hook(cls, @selector(newTextureWithDescriptor:), (IMP)newTexture);
     if (!enabled) return;
+    if (spBCCompactRequested(device))
+        objc_setAssociatedObject(device, &spBCCompactDeviceKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     spBCInstallMemoryQueries(cls);
     findSharedCache();
     spBCUploadMarker = sel_registerName(SP_BC_UPLOAD_CB_KEY);

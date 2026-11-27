@@ -3,6 +3,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static unsigned getBits(const uint8_t *block, unsigned at, unsigned count, bool reverse) {
@@ -115,7 +116,7 @@ static void testBlocks(void) {
             }
         }
     }
-    assert(maxOpaque <= 1 && maxVisible <= 2);
+    assert(maxOpaque <= 1 && maxVisible <= 1);
 }
 
 static void measureAlphaBlocks(SPBCKind kind, bool srgb) {
@@ -190,9 +191,164 @@ static void testMipsAndEdges(void) {
     assert(!SPBC1RectToASTC(bc, 8, 4, 8, astc, SIZE_MAX));
 }
 
+static void testEligibility(void) {
+    for (unsigned format = 129; format <= 153; format++)
+        for (unsigned type = 0; type <= 10; type++)
+            for (unsigned usage = 0; usage <= 0x20; usage++)
+                for (unsigned storage = 0; storage <= 4; storage++) {
+                    bool expected = (format == 130 || format == 131) &&
+                                    (type == 2 || type == 3 || type == 5 || type == 6) &&
+                                    (usage == 0 || usage == 1 || usage == 16 || usage == 17) &&
+                                    storage < 3;
+                    assert(SPBC1CompactEligible(format, type, usage, storage, true, true) == expected);
+                }
+    // IOSurface, buffer, and heap factories are all non-standalone.
+    assert(!SPBC1CompactEligible(130, 2, 1, 2, false, true));
+    assert(!SPBC1CompactEligible(130, 2, 1, 2, true, false));
+    assert(!SPBC1CompactEligible(130, 2, 0x10001, 2, true, true));
+}
+
+static void makeBlock(uint8_t block[8], size_t n) {
+    for (unsigned i = 0; i < 8; i++) block[i] = (uint8_t)randomWord();
+    unsigned a = block[0] | (unsigned)block[1] << 8;
+    unsigned b = block[2] | (unsigned)block[3] << 8;
+    bool four = n % 3 == 0;
+    if (four && a == b) a ^= 1;
+    if ((four && a < b) || (!four && a > b)) {
+        unsigned temp = a;
+        a = b;
+        b = temp;
+    }
+    block[0] = (uint8_t)a;
+    block[1] = (uint8_t)(a >> 8);
+    block[2] = (uint8_t)b;
+    block[3] = (uint8_t)(b >> 8);
+    if (n % 3 == 1) memset(block + 4, 0xa4, 4); // three colors without index 3
+    if (n % 3 == 2) block[4] |= 3;              // force punch-through
+}
+
+static void checkBC1(const uint8_t *source, const uint8_t *astc, bool srgb, unsigned *transparentMax) {
+    uint8_t ref[64], rgba[64];
+    SPBCDecodeBlock(SPBC1, source, ref, 16);
+    decodeASTC(astc, rgba, srgb);
+    for (unsigned i = 0; i < sizeof rgba; i += 4) {
+        assert(ref[i + 3] == rgba[i + 3]);
+        for (unsigned ch = 0; ch < 3; ch++) {
+            if (ref[i + 3]) {
+                assert(abs((int)ref[i + ch] - rgba[i + ch]) <= 1);
+                if (srgb && astc[0] == 0x42) assert(ref[i + ch] == rgba[i + ch]);
+            } else {
+                assert(ref[i + ch] == 0);
+                if (rgba[i + ch] > *transparentMax) *transparentMax = rgba[i + ch];
+            }
+        }
+    }
+}
+
+static void testCompactRegion(SPBCSize mip, SPBCOrigin origin, SPBCSize requested, unsigned *transparentMax) {
+    size_t cols = SPBCBlockCount(requested.width), rows = SPBCBlockCount(requested.height);
+    size_t sourceRow = cols * 8 + 13;
+    SPBCLayout layout;
+    assert(SPBCMakeLayout(SPBC1, mip, origin, requested, 19, sourceRow, 0, &layout));
+    uint8_t *source = calloc(layout.end, 1);
+    assert(source);
+    for (size_t y = 0; y < rows; y++)
+        for (size_t x = 0; x < cols; x++)
+            makeBlock(source + layout.offset + y * sourceRow + x * 8, y * cols + x);
+    enum { TileLimit = 1008 }; // force horizontal and vertical seams in different mips
+    uint8_t staging[TileLimit];
+    SPBCOrigin cursor = {0};
+    SPBCTile tile;
+    size_t blocks = 0, punch = 0;
+    while (SPBCNextASTCTile(layout.size, TileLimit, &cursor, &tile)) {
+        const uint8_t *start = source + layout.offset + tile.origin.y / 4 * sourceRow + tile.origin.x / 4 * 8;
+        assert(tile.bytes <= sizeof staging && tile.row % 16 == 0);
+        assert(tile.origin.x % 4 == 0 && tile.origin.y % 4 == 0);
+        assert(tile.size.width % 4 == 0 || tile.origin.x + tile.size.width == layout.size.width);
+        assert(tile.size.height % 4 == 0 || tile.origin.y + tile.size.height == layout.size.height);
+        size_t tilePunch;
+        assert(SPBC1RectToASTCCounted(start, sourceRow, tile.size.width, tile.size.height,
+                                    staging, tile.row, &tilePunch));
+        punch += tilePunch;
+        for (size_t y = 0; y < SPBCBlockCount(tile.size.height); y++) {
+            for (size_t x = 0; x < SPBCBlockCount(tile.size.width); x++) {
+                const uint8_t *bc = start + y * sourceRow + 8 * x;
+                const uint8_t *astc = staging + y * tile.row + 16 * x;
+                uint8_t expected[16];
+                SPBC1ToASTC(bc, expected);
+                assert(memcmp(astc, expected, sizeof expected) == 0);
+                checkBC1(bc, astc, false, &transparentMax[0]);
+                checkBC1(bc, astc, true, &transparentMax[1]);
+                blocks++;
+            }
+        }
+    }
+    assert(blocks == cols * rows && punch == blocks / 3);
+    free(source);
+}
+
+static void testCompactLayouts(void) {
+    unsigned transparentMax[2] = {0};
+    const SPBCSize base = {512, 512, 1};
+    assert(SPBCTextureBytes(SPBC1, base, 2, 2, 1, 1) == 1310720);
+    assert(SPBCASTCTextureBytes(base, 2, 2, 1) == 327680);
+    assert(SPBCASTCTextureBytes(base, 2, 10, 1) == 349552);
+    assert(SPBCASTCTextureBytes(base, 3, 2, 3) == 3 * 327680);
+    assert(SPBCASTCTextureBytes(base, 5, 2, 1) == 6 * 327680);
+    assert(SPBCASTCTextureBytes(base, 6, 2, 2) == 12 * 327680);
+    assert(SPBCASTCTextureBytes((SPBCSize){1, 2, 1}, 2, 2, 1) == 32);
+    assert(SPBCASTCTextureBytes((SPBCSize){SIZE_MAX, SIZE_MAX, 1}, 2, 1, 1) == 0);
+    SPBCOrigin cursor = {0};
+    SPBCTile rgbaTile, astcTile;
+    assert(SPBCNextTile(SPBC1, base, 4, 4 * 1024 * 1024, &cursor, &rgbaTile));
+    cursor = (SPBCOrigin){0};
+    assert(SPBCNextASTCTile(base, 4 * 1024 * 1024, &cursor, &astcTile));
+    assert(rgbaTile.bytes == 4 * astcTile.bytes);
+    for (size_t edge = 512, levels = 10; edge >= 128; edge /= 2, levels--) {
+        const size_t chains[] = {2, levels};
+        for (unsigned i = 0; i < sizeof chains / sizeof *chains; i++) {
+            size_t chain = chains[i];
+            for (size_t level = 0; level < chain; level++) {
+                SPBCSize mip = SPBCMipSize((SPBCSize){edge, edge, 1}, level);
+                testCompactRegion(mip, (SPBCOrigin){0}, mip, transparentMax);
+            }
+        }
+    }
+    for (size_t edge = 1; edge <= 3; edge++) {
+        testCompactRegion((SPBCSize){8 + edge, 8 + edge, 1}, (SPBCOrigin){4, 4, 0},
+                          (SPBCSize){8, 8, 1}, transparentMax); // block-rounded clip
+        testCompactRegion((SPBCSize){8 + edge, 8 + edge, 1}, (SPBCOrigin){4, 4, 0},
+                          (SPBCSize){4, 4, 1}, transparentMax); // interior partial update
+    }
+    const unsigned types[] = {3, 5, 6};
+    const size_t arrays[] = {3, 1, 2};
+    const size_t slices[] = {3, 6, 12};
+    for (unsigned i = 0; i < sizeof types / sizeof *types; i++) {
+        for (size_t slice = 0; slice < slices[i]; slice++) {
+            assert(SPBCValidSlice(types[i], arrays[i], slice));
+            testCompactRegion((SPBCSize){7, 7, 1}, (SPBCOrigin){4, 4, 0},
+                              (SPBCSize){3, 3, 1}, transparentMax);
+        }
+        assert(!SPBCValidSlice(types[i], arrays[i], slices[i]));
+    }
+    assert(transparentMax[0] && transparentMax[1]);
+    const uint8_t punch[] = {0x00, 0x04, 0x00, 0xf8, 0x03, 0, 0, 0};
+    uint8_t astc[16], rgba[64];
+    SPBC1ToASTC(punch, astc);
+    for (unsigned srgb = 0; srgb < 2; srgb++) {
+        decodeASTC(astc, rgba, srgb);
+        assert(rgba[0] == 0 && rgba[1] == 131 && rgba[2] == 0 && rgba[3] == 0);
+    }
+    printf("BC1 compact transparent RGB sample (0,0,0) -> (%u,%u,%u), max channel linear=%u sRGB=%u\n",
+           (unsigned)rgba[0], (unsigned)rgba[1], (unsigned)rgba[2],
+           transparentMax[0], transparentMax[1]);
+}
+
 int main(void) {
     testBlocks();
     testMipsAndEdges();
+    testEligibility();
+    testCompactLayouts();
     for (SPBCKind kind = SPBC1; kind <= SPBC3; kind++) {
         measureAlphaBlocks(kind, false);
         measureAlphaBlocks(kind, true);

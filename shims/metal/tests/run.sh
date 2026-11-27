@@ -18,6 +18,9 @@ fi
 "$out/staging"
 "${CC:-cc}" "${flags[@]}" spbcdecode.c spbclayout.c spbcastc.c tests/test_bc_astc.c -o "$out/astc"
 "$out/astc"
+# Time the codec at the runtime's optimization level, without sanitizer overhead.
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O1 -I. spbcdecode.c spbclayout.c spbcastc.c tests/bench_bc1_compact.c -o "$out/astc-bench"
+"$out/astc-bench"
 "${CC:-cc}" "${flags[@]}" tests/test_a16_profile.c -o "$out/a16-profile"
 "$out/a16-profile"
 "${CC:-cc}" "${flags[@]}" tests/test_metal_meter.c -o "$out/metal-meter"

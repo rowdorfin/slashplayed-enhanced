@@ -34,4 +34,6 @@ bool SPBCMakeLayout(SPBCKind kind, SPBCSize mip, SPBCOrigin origin, SPBCSize req
 // starts, and a padded output row for Metal buffer copies.
 bool SPBCNextTile(SPBCKind kind, SPBCSize size, size_t alignment, size_t limit,
                   SPBCOrigin *cursor, SPBCTile *tile);
+bool SPBCNextASTCTile(SPBCSize size, size_t limit, SPBCOrigin *cursor, SPBCTile *tile);
+size_t SPBCASTCTextureBytes(SPBCSize base, unsigned long type, size_t levels, size_t arrayLength);
 size_t SPBCBlockCount(size_t texels);
