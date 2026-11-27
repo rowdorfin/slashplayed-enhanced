@@ -576,7 +576,7 @@ struct SettingsView: View {
             } header: {
                 Text("On-screen controls")
             } footer: {
-                Text("O HUD 5.0 carrega ao iniciar Forever. No jogo, a engrenagem do HUD abre o editor. A engrenagem dos controles abre as opções de toque.")
+                Text("O HUD 5.0 carrega ao iniciar Forever. No jogo, a engrenagem do HUD abre o editor. O menu ··· abre as opções de toque.")
             }
             Section {
                 LabeledContent("Click With") {

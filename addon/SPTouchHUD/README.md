@@ -9,7 +9,7 @@ Abra **⚙ → Editar HUD**, **Settings → AddOns → SPTouchHUD** ou digite **
 - **Mover botões** abre a edição de geometria. Arraste um botão ou toque nele e depois numa posição livre. **Menor**, **Maior** e **Opacidade** alteram o botão selecionado. **Restaurar botões** repõe as posições, tamanhos e transparências individuais.
 - **Avançado** edita o nome, a cor e as posições de cada conjunto. O campo aceita listas como `1:3,2:1-4,5:9` com até 48 posições por conjunto.
 - Use o puxador para mover o grupo e **Escala**, **Opacidade** e **Aplicar** para ajustar o HUD. Os presets **iPhone MMORPG**, **iPhone compacto**, **iPad touchscreen**, **Canhoto** e **HUD 2.0 clássico** aplicam a geometria e mantêm as escolhas de ações.
-- Para jogar com a mão esquerda, selecione **Canhoto** também na engrenagem UIKit. No UIKit, use **Mover botões** e segure a alça do joystick para reposicioná-lo. Em **Settings → Controls → Joystick** ficam tamanho, zona morta, centro fixo ou flutuante e modo analógico.
+- Para jogar com a mão esquerda, selecione **Canhoto** também no menu **···** dos controles de toque. Nesse menu, use **Mover controles de toque** e segure a alça do joystick para reposicioná-lo. Em **Settings → Controls → Joystick** ficam tamanho, zona morta, centro fixo ou flutuante e modo analógico.
 
 A migração da 4.0 preserva os conjuntos e a ordem, o lado, a escala, a opacidade e a habilitação. Os deslocamentos e tamanhos individuais são restaurados para acomodar a nova geometria. O chat, o rastreador e as barras originais continuam sob controle do jogo. Use as opções de chat e o Edit Mode disponíveis no cliente para mudanças de layout.
 

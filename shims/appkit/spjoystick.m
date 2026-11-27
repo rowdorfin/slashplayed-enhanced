@@ -311,9 +311,9 @@ static CGPoint sp_stick_value(CGPoint offset, CGFloat travel, CGFloat deadzone) 
 
 - (void)updateConnection {
     if (!_analog) return;
-    BOOL want = _gameReady && _requested && self.window && !self.hidden && !_suspended &&
-                self.window.windowScene.activationState == UISceneActivationStateForegroundActive;
-    if (!want) {
+    BOOL active = self.window && !self.hidden && !_suspended &&
+                  self.window.windowScene.activationState == UISceneActivationStateForegroundActive;
+    if (!active) {
         [self cancelInput];
         BOOL wasConnected = _connected;
         [self disconnectController];
@@ -322,7 +322,8 @@ static CGPoint sp_stick_value(CGPoint offset, CGFloat travel, CGFloat deadzone) 
         if (wasConnected) [self.superview setNeedsLayout];
         return;
     }
-    if (_virtualController) return;  // includes an asynchronous connect already in progress
+    // Layout can run while WASD is holding a contact after a connection failure.
+    if (!_gameReady || !_requested || _virtualController) return;
     GCVirtualControllerConfiguration *config = [GCVirtualControllerConfiguration new];
     NSMutableSet<NSString *> *elements = [NSMutableSet setWithObject:GCInputLeftThumbstick];
     if (_fullGamepad) {
@@ -506,7 +507,7 @@ static CGPoint sp_stick_value(CGPoint offset, CGFloat travel, CGFloat deadzone) 
             _stickOrigin = [touch locationInView:self];
         _stickTouch = touch;
         if (_analog && !_gameReady) _analogFallback = YES;
-        _requested = YES;
+        else _requested = YES;
         [self updateConnection];
         if (_stickTouch == touch) [self updateTouch:touch];
         break;

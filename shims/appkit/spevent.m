@@ -982,7 +982,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
 
 - (void)sp_refresh_overlay_menu {
     BOOL hud = sp_touch_hud();
-    [_overlayMenu setTitle:_editingControls ? @"✓" : (hud ? @"⚙" : @"···") forState:UIControlStateNormal];
+    [_overlayMenu setTitle:_editingControls ? @"✓" : @"···" forState:UIControlStateNormal];
     __weak SPInputView *weak = self;
     UIAction *visibility = [UIAction actionWithTitle:_overlayHidden ? @"Mostrar controles" : @"Esconder controles"
                                          image:nil identifier:nil handler:^(__kindof UIAction *action) {
@@ -993,7 +993,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
         [view sp_refresh_overlay_menu];
         [view setNeedsLayout];
     }];
-    UIAction *edit = [UIAction actionWithTitle:_editingControls ? @"Concluir edição" : @"Mover botões"
+    UIAction *edit = [UIAction actionWithTitle:_editingControls ? @"Concluir edição" : @"Mover controles de toque"
                                    image:nil identifier:nil handler:^(__kindof UIAction *action) {
         SPInputView *view = weak;
         if (!view) return;
