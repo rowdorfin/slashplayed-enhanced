@@ -1,6 +1,6 @@
 ## Interface: 16001
 ## Title: SPTouchHUD
-## Version: 4.0
+## Version: 5.0
 ## Notes: Touch controls for your existing action slots
 ## SavedVariables: SPTouchHUDDB
 ## SavedVariablesPerCharacter: SPTouchHUDCharDB

@@ -540,7 +540,7 @@ struct SettingsView: View {
                     settings.reload()
                 })) {
                     Text("Botões 1–0 (T008-B)").tag(0)
-                    Text("HUD 3.0 (addon SPTouchHUD)").tag(1)
+                    Text("HUD 5.0 (addon SPTouchHUD)").tag(1)
                 }
                 Picker("Lado dos controles", selection: Binding(get: { settings.now.touchLeftHanded }, set: {
                     UserDefaults.standard.set($0, forKey: touchLeftHandedKey)
@@ -573,7 +573,7 @@ struct SettingsView: View {
             } header: {
                 Text("On-screen controls")
             } footer: {
-                Text("O HUD 2.0 carrega ao iniciar Forever. Em jogo, use ··· para esconder, mostrar ou mover os controles nativos.")
+                Text("O HUD 5.0 carrega ao iniciar Forever. No jogo, a engrenagem do HUD abre o editor. A engrenagem dos controles abre as opções de toque.")
             }
             Section {
                 LabeledContent("Click With") {

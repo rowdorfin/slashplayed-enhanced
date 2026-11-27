@@ -8,16 +8,16 @@ local presets = {
     {"HUD 2.0 clássico", 1, 6, "1", "2", "3,6"},
 }
 local arcSize = 6
-local arcWidth, arcHeight = 278, 216
-local layoutVersion = 4
+local arcWidth, arcHeight = 274, 166
+local layoutVersion = 5
 -- Match UIKit's lane fractions (checked by addon/test/test.sh).
 local joystickLane = 0.23
 -- Each face has three additional units of hit area on each side.
-local arc = {{151, 35, 50}, {90, 64, 50}, {85, 124, 50},
-             {124, 184, 50}, {185, 184, 50}, {242, 119, 50},
-             {24, 40, 40}, {236, 40, 68}, {28, 98, 44}}
-local controls = {{18, 168, 20}, {49, 168, 20}, {18, 196, 20}, {49, 199, 26}}
-local editNames = {"1", "2", "3", "4", "5", "6", "Alvo", "Atacar", "Interagir"}
+local arc = {{139, 30, 42}, {88, 30, 42}, {74, 82, 42},
+             {108, 136, 42}, {160, 136, 42}, {212, 136, 42},
+             {31, 37, 29}, {220, 64, 66}, {32, 118, 29}}
+local pageCell = {253, 143, 28}
+local editNames = {"1", "2", "3", "4", "5", "6", "Alvo", "Principal", "Interagir"}
 local border = {0.64, 0.77, 0.79}
 local dark = {0.06, 0.09, 0.12}
 local circleFile = "Interface\\CharacterFrame\\TempPortraitAlphaMask"
@@ -29,6 +29,10 @@ local layoutFields = {
 }
 local colors = {"4bdace", "ffba60", "c9a2ff"}
 local root, buttons, switches, utilities, editor, pending, ticker
+local main, compiledEntries, slotsDirty
+local attackIcon = "Interface\\Icons\\Ability_MeleeDamage"
+local barForPage = {}
+for index, page in ipairs(barPages) do barForPage[page] = index end
 local account, layout, menu, nextPage, appliedClassic, resetSelection
 local stopEditing, updateView
 local events = CreateFrame("Frame")
@@ -64,11 +68,19 @@ local function parseSlots(text)
     return slots
 end
 
+local function encodeSlots(slots)
+    local tokens = {}
+    for i, slot in ipairs(slots) do
+        tokens[i] = barForPage[math.ceil(slot / 12)] .. ":" .. ((slot - 1) % 12 + 1)
+    end
+    return table.concat(tokens, ",")
+end
+
 local function resetGeometry(index)
     local preset = presets[index]
     layout.version = layoutVersion
     layout.x, layout.y = 0.79, 0.39
-    layout.arcX, layout.arcY, layout.positions = 1, 0, {}
+    layout.arcX, layout.arcY, layout.positions, layout.buttonOpacity = 1, 0, {}, {}
     layout.scale, layout.opacity, layout.spacing, layout.columns = preset[2], 0.94, 5, preset[3]
 end
 
@@ -96,10 +108,7 @@ local function fits(index, cell)
     for i, default in ipairs(arc) do
         if i ~= index and collides(cell, layout.positions[i] or default) then return false end
     end
-    for _, control in ipairs(controls) do
-        if collides(cell, control) then return false end
-    end
-    return true
+    return not collides(cell, pageCell)
 end
 
 local function validColor(color)
@@ -117,7 +126,22 @@ local function loadLayout()
         usePreset(2)
         return
     end
-    if layout.version ~= layoutVersion then resetGeometry(layout.classic and 5 or 2) end
+    if layout.version ~= layoutVersion then
+        local scale, opacity = layout.scale, layout.opacity
+        resetGeometry(layout.classic and 5 or 2)
+        layout.scale, layout.opacity = scale, opacity
+    end
+    local mainSlot = tonumber(layout.mainSlot)
+    if not mainSlot or mainSlot % 1 ~= 0 or not barForPage[math.ceil(mainSlot / 12)] then
+        layout.mainSlot = nil
+    else
+        layout.mainSlot = mainSlot
+    end
+    local opacity = type(layout.buttonOpacity) == "table" and layout.buttonOpacity or {}
+    layout.buttonOpacity = {}
+    for i = 1, #arc do
+        layout.buttonOpacity[i] = bound(opacity[i], 1, 0.25, 1)
+    end
     local saved = layout.positions
     layout.positions = {}
     if type(saved) == "table" then
@@ -233,7 +257,13 @@ end
 local function refresh(button)
     local slot = button:GetAttribute("action")
     local texture = api.GetActionTexture or GetActionTexture
-    button.icon:SetTexture(slot and texture and texture(slot) or nil)
+    local icon = slot and texture and texture(slot)
+    if not readable(icon) then icon = nil end
+    if not slot and button == main then icon = attackIcon end
+    button.icon:SetTexture(icon or nil)
+    if button == main then
+        button.emptyIcon:SetShown(slot ~= nil and not icon)
+    end
     updateCooldown(button)
     updateTint(button, true)
 end
@@ -275,6 +305,13 @@ local updateSlot = [=[
     if slot ~= self:GetAttribute("action") then self:SetAttribute("action", slot) end
     if slot then self:Show() else self:Hide() end
 ]=]
+local updateMain = [=[
+    local slot = self:GetAttribute("main-slot")
+    local page = self:GetParent():GetAttribute("mainpage")
+    if slot and slot <= 12 then slot = slot + (page - 1) * 12 end
+    self:SetAttribute("type", slot and "action" or "macro")
+    if slot ~= self:GetAttribute("action") then self:SetAttribute("action", slot) end
+]=]
 local selectSet = [=[
     local hud = self:GetParent()
     local set = self:GetAttribute("select-set")
@@ -286,9 +323,17 @@ local cyclePage = [=[
     local hud = self:GetParent()
     local active = hud:GetAttribute("set")
     local group = (active - 1) % 3 + 1
-    local pages = hud:GetAttribute("pages-" .. hud:GetAttribute("bank") .. "-" .. group)
+    local prefix = "pages-" .. hud:GetAttribute("bank") .. "-"
+    local pages = hud:GetAttribute(prefix .. group)
     local set = active + 3
-    if set >= group + pages * 3 then set = group end
+    if set >= group + pages * 3 then
+        set = group
+        for i = 1, 3 do
+            set = set % 3 + 1
+            if hud:GetAttribute("used-" .. hud:GetAttribute("bank") .. "-" .. set) then break end
+        end
+        if not hud:GetAttribute("used-" .. hud:GetAttribute("bank") .. "-" .. set) then set = group end
+    end
     hud:SetAttribute("set", set)
     hud:ChildUpdate("slots", set)
 ]=]
@@ -406,7 +451,7 @@ local function createHUD()
     root:SetAttribute("set", 1)
     root:SetAttribute("_onstate-hudpage", updatePage)
     buttons, switches, utilities = {}, {}, {}
-    for i = 1, maxButtons do
+    local function actionButton()
         local button = CreateFrame("Button", nil, root, "SecureActionButtonTemplate")
         button:RegisterForClicks("LeftButtonUp")
         button:SetAttribute("useOnKeyDown", false)
@@ -429,8 +474,17 @@ local function createHUD()
         button:HookScript("OnAttributeChanged", function(self, name)
             if name == "action" then refresh(self) end
         end)
-        buttons[i] = button
+        return button
     end
+    for i = 1, maxButtons do buttons[i] = actionButton() end
+    main = actionButton()
+    main:SetAttribute("_childupdate-slots", updateMain)
+    main:SetAttribute("macrotext", "/startattack")
+    main.emptyIcon = main:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    main.emptyIcon:SetPoint("CENTER")
+    main.emptyIcon:SetText("—")
+    refresh(main)
+    buttons[maxButtons + 1] = main
     for i = 1, 3 do
         local button = textButton(root, "", nil, "SecureHandlerClickTemplate")
         button:SetAttribute("select-set", i)
@@ -446,9 +500,16 @@ local function createHUD()
             if i == group then button.bg:SetColorTexture(0.22, 0.33, 0.36, 1)
             else button.bg:SetColorTexture(dark[1], dark[2], dark[3], 0.82) end
         end
-        local pages = root:GetAttribute("pages-" .. (root:GetAttribute("bank") or 0) .. "-" .. group)
-        nextPage.label:SetText(math.floor((active - group) / 3) + 1 .. " ›")
-        nextPage.bg:SetColorTexture(dark[1], dark[2], dark[3], pages and pages > 1 and 0.82 or 0.50)
+        local bank = root:GetAttribute("bank") or 0
+        local total, before = 0, 0
+        for i = 1, 3 do
+            local pages = root:GetAttribute("pages-" .. bank .. "-" .. i) or 1
+            if i == group or root:GetAttribute("used-" .. bank .. "-" .. i) then
+                total = total + pages
+                if i < group then before = before + pages end
+            end
+        end
+        nextPage.label:SetText(before + math.floor((active - group) / 3) + 1 .. "/" .. total)
     end
     root:HookScript("OnAttributeChanged", function(_, name)
         if name == "set" or name == "bank" then updateView() end
@@ -461,20 +522,33 @@ local function createHUD()
         utilities[#utilities + 1] = button
         return button
     end
-    macro("Alvo", "/targetenemy")
-    macro("Atacar", "/startattack")
+    local function glyph(button, atlasName, fallback)
+        local icon = button:CreateTexture(nil, "ARTWORK")
+        icon:SetSize(15, 15)
+        icon:SetPoint("CENTER")
+        if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(atlasName) then
+            icon:SetAtlas(atlasName)
+        else
+            icon:SetTexture(fallback)
+        end
+        return icon
+    end
+    local target = macro("", "/targetenemy")
+    glyph(target, "Gamepad-Icon-Target", "Interface\\Minimap\\Tracking\\Target")
+    utilities[2] = main
     -- Forever's native interaction control owns interact selection and press/release.
     local interactName = "GamepadMainActionBarFramePageUnitTopCenteredAnchorTopBarActionButton5"
-    local interact = macro("Interagir", "/click GamepadMainActionBarFramePageUnitTopCenteredAnchorTopBarActionButton5 LeftButton 1\n/click GamepadMainActionBarFramePageUnitTopCenteredAnchorTopBarActionButton5 LeftButton 0")
+    local interact = macro("", "/click GamepadMainActionBarFramePageUnitTopCenteredAnchorTopBarActionButton5 LeftButton 1\n/click GamepadMainActionBarFramePageUnitTopCenteredAnchorTopBarActionButton5 LeftButton 0")
+    local interactIcon = glyph(interact, "Gamepad-Icon-Interact", "Interface\\CURSOR\\Speak")
     local utilityParent = CreateFrame("Frame", nil, UIParent)
     utilityParent:SetFrameStrata("HIGH")
     utilityParent:SetSize(182, 44)
-    menu = textButton(utilityParent, "···", nil, "BackdropTemplate")
-    menu:SetSize(32, 32)
-    menu:SetPoint("TOP", utilityParent, "TOP")
+    menu = textButton(utilityParent, "⚙", nil, "BackdropTemplate")
+    menu:SetSize(28, 28)
+    menu:SetPoint("CENTER", utilityParent, "CENTER")
     local panel = CreateFrame("Frame", nil, utilityParent)
     panel:SetSize(176, 162)
-    panel:SetPoint("TOP", menu, "BOTTOM", 0, -2)
+    panel:SetPoint("TOP", menu, "BOTTOM", 0, -3)
     panel:Hide()
     menu:SetScript("OnClick", function() panel:SetShown(not panel:IsShown()) end)
     utilityParent:SetScript("OnHide", function() panel:Hide() end)
@@ -487,6 +561,7 @@ local function createHUD()
         utilities[#utilities + 1] = button
         return button
     end
+    utility("Editar HUD", function() editor:SetShown(not editor:IsShown()) end)
     utility("Bolsas", command("ToggleAllBags"))
     utility("Mapa", command("ToggleWorldMap"))
     utility("Personagem", function() if ToggleCharacter then ToggleCharacter("PaperDollFrame") end end)
@@ -496,12 +571,12 @@ local function createHUD()
     end)
     utility("Chat", function() if ChatFrameUtil and ChatFrameUtil.OpenChat then ChatFrameUtil.OpenChat(nil) end end)
     utility("Opções", command("ToggleGameMenu"))
-    utility("Editar HUD", function() editor:SetShown(not editor:IsShown()) end)
     menu.panel = panel
     root.UpdateInteract = function()
         local available = _G[interactName] ~= nil
         interact:SetAttribute("type", available and "macro" or nil)
-        interact.label:SetText(available and "Interagir" or "|cff879496Interagir|r")
+        local tint = available and 1 or 0.42
+        interactIcon:SetVertexColor(tint, tint, tint)
     end
     RegisterStateDriver(root, "hudpage", "[vehicleui]vehicle; [overridebar]override; [shapeshift]temp; [bar:2]2; [bar:3]3; [bar:4]4; [bar:5]5; [bar:6]6; [bonusbar:1]bonus1; [bonusbar:2]bonus2; [bonusbar:3]bonus3; [bonusbar:4]bonus4; [bonusbar:5]bonus5; 1")
 end
@@ -511,11 +586,11 @@ local function placeArcMenu(scale)
     host:ClearAllPoints()
     host:SetScale(scale)
     host:SetAlpha(layout.opacity)
-    host:SetPoint("TOP", UIParent, "TOP", 0, -UIParent:GetHeight() * 0.06 / scale)
-    host:SetSize(182, 44)
+    host:SetPoint("CENTER", UIParent, "TOP", 0, -UIParent:GetHeight() * 0.09 / scale)
+    host:SetSize(28, 28)
     panel:SetSize(176, 162)
     panel:ClearAllPoints()
-    panel:SetPoint("TOP", menu, "BOTTOM", 0, -2)
+    panel:SetPoint("TOP", menu, "BOTTOM", 0, -3)
     for i = 4, #utilities do
         local button, index = utilities[i], i - 4
         button:ClearAllPoints()
@@ -594,6 +669,7 @@ end
 
 local function placeArc()
     local w, h = UIParent:GetWidth(), UIParent:GetHeight()
+    if w <= 0 or h <= 0 then return end
     local left, bottom, width, height = arcSpace(w, h)
     local scale = math.min(layout.scale * pointScale(w, h), width / arcWidth, height / arcHeight)
     root:SetScale(scale)
@@ -612,18 +688,17 @@ local function placeArc()
     for i, cell in ipairs(arc) do
         local button = i <= arcSize and buttons[i] or utilities[i - arcSize]
         place(button, layout.positions[i] or cell)
-        if i <= arcSize then styleAction(button, true) else setCircular(button, true) end
+        button:SetAlpha(layout.buttonOpacity[i] or 1)
+        if i <= arcSize or button == main then styleAction(button, true) else setCircular(button, true) end
     end
-    for i, button in ipairs(switches) do
-        place(button, controls[i])
-        setCircular(button, true)
-    end
-    place(nextPage, controls[4])
+    place(nextPage, pageCell)
     placeArcMenu(math.min(pointScale(w, h), w / 320, h / 400))
 end
 
 local function compileSlots()
     local lists, occupied, largest = {}, {}, 0
+    compiledEntries = {}
+    main:SetAttribute("main-slot", layout.mainSlot)
     local hasAction = api.HasAction or HasAction
     for i, set in ipairs(layout.sets) do lists[i] = parseSlots(set.text) end
     local function include(slot)
@@ -639,14 +714,18 @@ local function compileSlots()
     local maxPages = maxButtons / pageSize
     for bank = 0, lastPage do
         for group, list in ipairs(lists) do
-            local compact = {}
+            local compact, source = {}, {}
+            compiledEntries[bank * 3 + group] = source
             for i = 1, math.min(#list, limit) do
                 local slot = list[i]
                 local main = slot <= 12
                 if main then slot = slot + math.max(0, bank - 1) * 12 end
-                if (main and bank == 0) or include(slot) then compact[#compact + 1] = slot end
+                if (main and bank == 0) or include(slot) then
+                    compact[#compact + 1], source[#source + 1] = slot, i
+                end
             end
             largest = math.max(largest, #compact)
+            root:SetAttribute("used-" .. bank .. "-" .. group, #compact > 0)
             root:SetAttribute("pages-" .. bank .. "-" .. group, math.max(1, math.ceil(#compact / pageSize)))
             for page = 0, maxPages - 1 do
                 local key = "slot-" .. bank .. "-" .. (group + page * 3)
@@ -670,24 +749,27 @@ end
 
 local function applyLayout()
     if InCombatLockdown() then pending = true; return end
-    pending = false
+    pending, slotsDirty = false, nil
     if not root then createHUD() end
     local largest = compileSlots()
     for i, set in ipairs(layout.sets) do
         local label = layout.classic and set.label or tostring(i)
         switches[i].label:SetText("|cff" .. set.color .. label .. "|r")
+        switches[i]:SetShown(layout.classic)
     end
+    for _, button in ipairs(buttons) do button:SetAlpha(1) end
+    for i = 1, 3 do utilities[i]:SetAlpha(1) end
     root:SetAlpha(layout.opacity)
     if layout.classic then placeClassic(largest) else placeArc() end
     appliedClassic = layout.classic
     nextPage:SetShown(not layout.classic)
-    for i = 1, 3 do utilities[i]:SetShown(not layout.classic or layout.auxiliaries) end
+    for i = 1, 3 do utilities[i]:SetShown(i == 2 or layout.auxiliaries) end
     root:UpdateInteract()
     root:SetShown(account.enabled)
     syncTicker()
 end
 
-local function createPositionEditor(reopen)
+local function createPositionEditor(reopen, chooseAction)
     -- Independent preview targets intercept input so editing cannot cast an action.
     local overlay = CreateFrame("Frame", nil, UIParent)
     overlay:SetAllPoints(UIParent)
@@ -697,14 +779,14 @@ local function createPositionEditor(reopen)
     canvas:SetAllPoints()
     canvas:RegisterForClicks("LeftButtonUp")
     local toolbar = CreateFrame("Frame", nil, overlay, "BackdropTemplate")
-    toolbar:SetSize(342, 60)
+    toolbar:SetSize(438, 64)
     toolbar:SetPoint("BOTTOM", 0, UIParent:GetHeight() * 0.065)
     toolbar:SetBackdrop({bgFile = "Interface\\Buttons\\WHITE8X8"})
     toolbar:SetBackdropColor(0.07, 0.08, 0.11, 0.97)
     toolbar:EnableMouse(true)
     local status = toolbar:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     status:SetPoint("TOP", 0, -7)
-    local selected, moving
+    local selected, moving, selectingAction
     local proxies = {}
     local function position()
         local scale = root:GetScale()
@@ -715,14 +797,17 @@ local function createPositionEditor(reopen)
             proxy:SetSize((size + 6) * scale, (size + 6) * scale)
             proxy:SetPoint("CENTER", UIParent, "BOTTOMLEFT",
                 left + (layout.left and arcWidth - x or x) * scale, bottom + y * scale)
+            local action = i == 8 and main or buttons[i]
+            local texture = (i == 8 or i <= arcSize) and action.icon:GetTexture()
+            proxy.icon:SetTexture(texture or nil)
         end
     end
     local function select(index)
         selected = index
-        status:SetText(editNames[index] .. " · arraste ou toque no destino")
+        status:SetText(editNames[index] .. (selectingAction and " · toque para escolher" or " · arraste ou toque no destino"))
     end
     local function save(x, y, size)
-        if InCombatLockdown() then return end
+        if InCombatLockdown() or selectingAction then return end
         local cell = {x, y, size}
         if fits(selected, cell) then
             layout.positions[selected] = cell
@@ -740,18 +825,25 @@ local function createPositionEditor(reopen)
         save(x, y, (layout.positions[selected] or arc[selected])[3])
     end
     canvas:SetScript("OnClick", function()
+        if selectingAction then return end
         local x, y = GetCursorPosition()
         local scale = UIParent:GetEffectiveScale()
         move(x / scale, y / scale)
     end)
     for i, name in ipairs(editNames) do
         local index = i
-        local proxy = textButton(overlay, name, function() select(index) end)
+        local proxy = textButton(overlay, name, function()
+            select(index)
+            if selectingAction and (index <= arcSize or index == 8) then chooseAction(index) end
+        end)
+        proxy.icon = proxy:CreateTexture(nil, "ARTWORK")
+        proxy.icon:SetSize(20, 20)
+        proxy.icon:SetPoint("TOPLEFT", 4, -4)
         proxy:SetMovable(true)
         -- UIKit emulates a right drag for one-finger movement. Taps can also place a button.
         proxy:RegisterForDrag("LeftButton", "RightButton")
         proxy:SetScript("OnDragStart", function(self)
-            if InCombatLockdown() then return end
+            if InCombatLockdown() or selectingAction then return end
             select(index)
             moving = self
             self:StartMoving()
@@ -778,7 +870,7 @@ local function createPositionEditor(reopen)
     toolbarButton("Maior", 75, 69, function() resize(4) end)
     toolbarButton("Restaurar botões", 146, 116, function()
         if InCombatLockdown() then return end
-        layout.positions = {}
+        layout.positions, layout.buttonOpacity = {}, {}
         placeArc()
         position()
         select(selected)
@@ -787,15 +879,41 @@ local function createPositionEditor(reopen)
         if moving then moving:StopMovingOrSizing(); moving = nil end
         overlay:Hide()
     end
-    toolbarButton("Voltar", 264, 74, function() stopEditing(); reopen() end)
-    return function()
+    toolbarButton("Opacidade", 264, 92, function()
+        if InCombatLockdown() or selectingAction then return end
+        local opacity = (layout.buttonOpacity[selected] or 1) - 0.15
+        layout.buttonOpacity[selected] = opacity < 0.3 and 1 or opacity
+        placeArc()
+        status:SetText(editNames[selected] .. " · " .. math.floor(layout.buttonOpacity[selected] * 100 + 0.5) .. "%")
+    end)
+    toolbarButton("Voltar", 358, 74, function() stopEditing(); reopen() end)
+    return function(choose)
+        selectingAction = choose == true
         if InCombatLockdown() or not root or layout.classic then return end
         editor:Hide()
-        toolbar:SetScale(math.min(1, UIParent:GetWidth() / 350))
+        toolbar:SetScale(math.min(1, UIParent:GetWidth() / 445))
         select(1)
         position()
         overlay:Show()
     end
+end
+
+local function actionDetails(slot)
+    local texture = api.GetActionTexture or GetActionTexture
+    local icon = texture and texture(slot)
+    local info = api.GetActionInfo or GetActionInfo
+    local kind, id, name
+    if info then kind, id = info(slot) end
+    if readable(kind) and readable(id) and id then
+        if kind == "spell" and C_Spell and C_Spell.GetSpellName then name = C_Spell.GetSpellName(id)
+        elseif kind == "macro" and GetMacroInfo then name = GetMacroInfo(id)
+        elseif kind == "item" and C_Item and C_Item.GetItemNameByID then name = C_Item.GetItemNameByID(id)
+        elseif kind == "equipmentset" and C_EquipmentSet and C_EquipmentSet.GetEquipmentSetInfo then
+            name = C_EquipmentSet.GetEquipmentSetInfo(id)
+        end
+    end
+    if not readable(icon) then icon = nil end
+    return icon, readable(name) and name or nil
 end
 
 local function createEditor()
@@ -829,17 +947,29 @@ local function createEditor()
         item:SetPoint("TOPLEFT", x, y)
         return item
     end
-    local editPositions = createPositionEditor(function() editor:Show() end)
-    local editButtons = button("Mover botões", 286, -6, 120, editPositions)
-    label("SPTouchHUD", 16, -12)
-    label("Conjunto                           Cor RGB     Barras e slots", 16, -52)
+    local showPicker, hidePicker, showActionPicker
+    local editPositions = createPositionEditor(function() editor:Show() end, function(index)
+        editor:Show()
+        showActionPicker(index)
+    end)
+    local editActions = button("Escolher ações", 142, -6, 137, function() editPositions(true) end)
+    local editButtons = button("Mover botões", 286, -6, 120, function() editPositions(false) end)
+    label("SPTouchHUD 5.0", 16, -12)
+    local advanced = {label("Conjunto                           Cor RGB     Barras e slots", 16, -52)}
+    local advancedShown = false
+    local function toggleAdvanced(value)
+        advancedShown = value
+        for _, item in ipairs(advanced) do item:SetShown(value) end
+    end
+    button("Avançado", 16, -36, 90, function() toggleAdvanced(not advancedShown) end)
+    advanced[1]:SetPoint("TOPLEFT", 16, -66)
     local labels, tones, lists = {}, {}, {}
-    local showPicker, hidePicker
     for i = 1, 3 do
-        local y = -48 - i * 30
+        local y = -62 - i * 30
         local index = i
         labels[i], tones[i], lists[i] = field(20, y, 118, 24), field(149, y, 62, 6), field(225, y, 153, 400)
-        button("Cor", 382, y, 46, function()
+        for _, item in ipairs({labels[i], tones[i], lists[i]}) do advanced[#advanced + 1] = item end
+        advanced[#advanced + 1] = button("Cor", 382, y, 46, function()
             local palette = {"4bdace", "ffba60", "c9a2ff", "f98484", "99d97f", "ffffff"}
             local color = tones[index]:GetText():lower()
             for j, value in ipairs(palette) do
@@ -850,7 +980,7 @@ local function createEditor()
             end
             tones[index]:SetText(palette[1])
         end)
-        button("Slots", 434, y, 60, function() showPicker(index) end)
+        advanced[#advanced + 1] = button("Slots", 434, y, 60, function() showPicker(index) end)
     end
     local headings = {"Escala", "Opacidade", "Espaço", "Colunas", "Slots por conjunto"}
     local order = {0, 1, 3, 4, 2}
@@ -890,6 +1020,8 @@ local function createEditor()
         aux:SetText(layout.auxiliaries and "Auxiliares ✓" or "Auxiliares")
         grip:SetShown(not InCombatLockdown())
         editButtons:SetShown(not layout.classic and not InCombatLockdown())
+        editActions:SetShown(not layout.classic and not InCombatLockdown())
+        toggleAdvanced(advancedShown)
     end
     button("Fechar", 415, -6, 80, function() editor:Hide() end)
     button("Aplicar", 16, -231, 88, function()
@@ -917,6 +1049,7 @@ local function createEditor()
     button("Restaurar padrão", 358, -231, 137, function()
         account.enabled = true
         layout.left, layout.classic, layout.hideEmpty = false, false, true
+        layout.auxiliaries = true
         resetGeometry(2)
         applyLayout()
         load()
@@ -924,7 +1057,13 @@ local function createEditor()
     for i, preset in ipairs(presets) do
         local index = i
         button(preset[1], 16 + (i - 1) % 3 * 162, -264 - math.floor((i - 1) / 3) * 30, 156,
-            function() usePreset(index); applyLayout(); load() end)
+            function()
+                layout.left, layout.classic = index == 4, index == 5
+                layout.hideEmpty = not layout.classic
+                resetGeometry(index)
+                applyLayout()
+                load()
+            end)
     end
     aux = button("", 340, -294, 78, function() layout.auxiliaries = not layout.auxiliaries; applyLayout(); load() end)
     empty = button("", 420, -294, 78, function() layout.hideEmpty = not layout.hideEmpty; applyLayout(); load() end)
@@ -980,30 +1119,65 @@ local function createEditor()
         item:SetPoint("TOPLEFT", x, y)
         return item
     end
-    local currentSet, currentBar, slots
-    local slotControls = {}
+    local currentSet, currentBar, slots, selectedButton, entry, currentSlot
+    local slotControls, earlier, later, clear, confirm = {}
     local bars = {"Principal", "Inf. esq.", "Inf. dir.", "Direita", "Esquerda", "Barra 6", "Barra 7", "Barra 8"}
     local function displaySlots()
         local selected = {}
         for _, slot in ipairs(slots) do selected[slot] = true end
         local offset = (barPages[currentBar] - 1) * 12
-        title:SetText("Conjunto " .. currentSet .. " · " .. bars[currentBar])
-        note:SetText(#slots .. " / " .. maxButtons .. " posições selecionadas")
+        local caption = selectedButton and editNames[selectedButton] or layout.sets[currentSet].label
+        title:SetText(caption .. " · " .. bars[currentBar])
+        note:SetText(selectedButton and "As posições vazias da barra principal acompanham a postura." or
+            #slots .. " / " .. maxButtons .. " posições selecionadas")
         for i, item in ipairs(slotControls) do
-            item:SetText(selected[offset + i] and "|cff4bdace" .. i .. " ✓|r" or tostring(i))
+            local slot = offset + i
+            local displayed = currentBar == 1 and slot + (root:GetAttribute("mainpage") - 1) * 12 or slot
+            local icon, actionName = actionDetails(displayed)
+            item.icon:SetTexture(icon)
+            local mark = ((selectedButton and slot == currentSlot) or (not selectedButton and selected[slot])) and "✓ " or ""
+            item.name:SetText(mark .. (actionName or (icon and ("Ação " .. i) or ("Vazio " .. i))))
         end
     end
     for i, name in ipairs(bars) do
         local index = i
-        pickerButton(name, 16 + (i - 1) % 4 * 123, -50 - math.floor((i - 1) / 4) * 41, 110, function()
+        pickerButton(name, 16 + (i - 1) % 4 * 123, -44 - math.floor((i - 1) / 4) * 38, 110, function()
             currentBar = index
             displaySlots()
         end)
     end
+    local function commitAction()
+        if selectedButton ~= 8 then layout.sets[currentSet].text = encodeSlots(slots) end
+        applyLayout()
+        hidePicker()
+        editor:Hide()
+        editPositions(true)
+    end
     for i = 1, 12 do
         local index = i
-        slotControls[i] = pickerButton(tostring(i), 16 + (i - 1) % 6 * 81, -145 - math.floor((i - 1) / 6) * 43, 68, function()
+        local item = pickerButton("", 16 + (i - 1) % 3 * 162, -126 - math.floor((i - 1) / 3) * 40, 154, function()
+            if InCombatLockdown() then return end
             local slot = 12 * (barPages[currentBar] - 1) + index
+            if selectedButton == 8 then
+                layout.mainSlot = slot
+                commitAction()
+                return
+            end
+            if selectedButton then
+                for position, value in ipairs(slots) do
+                    if value == slot then
+                        if entry then slots[position], slots[entry] = slots[entry], slots[position]
+                        else table.remove(slots, position); slots[#slots + 1] = slot end
+                        commitAction()
+                        return
+                    end
+                end
+                if entry then slots[entry] = slot
+                elseif #slots < maxButtons then slots[#slots + 1] = slot
+                else note:SetText("O conjunto está cheio. Remova uma ação."); return end
+                commitAction()
+                return
+            end
             for position, value in ipairs(slots) do
                 if value == slot then
                     table.remove(slots, position)
@@ -1014,25 +1188,69 @@ local function createEditor()
             if #slots < maxButtons then slots[#slots + 1] = slot end
             displaySlots()
         end)
+        item.icon = item:CreateTexture(nil, "ARTWORK")
+        item.icon:SetSize(26, 26)
+        item.icon:SetPoint("LEFT", 5, 0)
+        item.name = item:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        item.name:SetPoint("LEFT", 35, 0)
+        item.name:SetPoint("RIGHT", -5, 0)
+        item.name:SetJustifyH("LEFT")
+        item.name:SetWordWrap(false)
+        slotControls[i] = item
     end
-    pickerButton("Limpar conjunto", 16, -242, 130, function() slots = {}; displaySlots() end)
-    pickerButton("Voltar", 269, -242, 98, function() hidePicker() end)
-    pickerButton("Usar seleção", 376, -242, 118, function()
-        local byPage, tokens = {}, {}
-        for i, page in ipairs(barPages) do byPage[page] = i end
-        for i, slot in ipairs(slots) do
-            local page, index = math.ceil(slot / 12), (slot - 1) % 12 + 1
-            tokens[i] = byPage[page] .. ":" .. index
+    local function reorder(step)
+        if InCombatLockdown() or not entry or not slots[entry + step] then return end
+        slots[entry], slots[entry + step] = slots[entry + step], slots[entry]
+        commitAction()
+    end
+    clear = pickerButton("", 16, -291, 128, function()
+        if InCombatLockdown() then return end
+        if selectedButton == 8 then
+            layout.mainSlot = nil
+            commitAction()
+        elseif selectedButton then
+            if entry then table.remove(slots, entry); commitAction() end
+        else
+            slots = {}
+            displaySlots()
         end
-        lists[currentSet]:SetText(table.concat(tokens, ","))
+    end)
+    earlier = pickerButton("Mover antes", 149, -291, 104, function() reorder(-1) end)
+    later = pickerButton("Mover depois", 259, -291, 112, function() reorder(1) end)
+    pickerButton("Voltar", 379, -291, 115, function()
+        local choosing = selectedButton
+        hidePicker()
+        if choosing then editor:Hide(); editPositions(true) end
+    end)
+    confirm = pickerButton("Usar seleção", 259, -291, 112, function()
+        lists[currentSet]:SetText(encodeSlots(slots))
         hidePicker()
     end)
-    showPicker = function(index)
-        currentSet, currentBar = index, 1
-        slots = parseSlots(lists[index]:GetText()) or {}
+    local function openPicker()
+        clear:SetText(selectedButton == 8 and "Ataque automático" or selectedButton and "Remover ação" or "Limpar conjunto")
+        earlier:SetShown(entry ~= nil and entry > 1)
+        later:SetShown(entry ~= nil and entry < #slots)
+        confirm:SetShown(not selectedButton)
         displaySlots()
         grip:Hide()
         picker:Show()
+    end
+    showPicker = function(index)
+        currentSet, currentBar, selectedButton, entry = index, 1, nil, nil
+        slots = parseSlots(lists[index]:GetText()) or {}
+        openPicker()
+    end
+    showActionPicker = function(index)
+        if InCombatLockdown() then return end
+        local set, bank = root:GetAttribute("set"), root:GetAttribute("bank")
+        currentSet = (set - 1) % 3 + 1
+        slots = parseSlots(layout.sets[currentSet].text)
+        local position = math.floor((set - currentSet) / 3) * arcSize + index
+        selectedButton = index
+        entry = index <= arcSize and compiledEntries[bank * 3 + currentSet][position] or nil
+        currentSlot = index == 8 and layout.mainSlot or (entry and slots[entry])
+        currentBar = currentSlot and barForPage[math.ceil(currentSlot / 12)] or 1
+        openPicker()
     end
     hidePicker = function()
         picker:Hide()
@@ -1087,7 +1305,7 @@ events:SetScript("OnEvent", function(_, event, arg)
             "PLAYER_ENTERING_WORLD", "PLAYER_REGEN_ENABLED", "PLAYER_REGEN_DISABLED", "UI_SCALE_CHANGED", "DISPLAY_SIZE_CHANGED",
             "ACTIONBAR_SLOT_CHANGED", "ACTIONBAR_UPDATE_COOLDOWN", "ACTIONBAR_UPDATE_USABLE",
             "SPELL_UPDATE_USABLE", "SPELL_UPDATE_CHARGES", "PLAYER_TARGET_CHANGED", "UPDATE_SHAPESHIFT_FORM",
-            "ACTIONBAR_PAGE_CHANGED", "UPDATE_BONUS_ACTIONBAR", "UPDATE_STEALTH",
+            "ACTIONBAR_PAGE_CHANGED", "UPDATE_BONUS_ACTIONBAR", "UPDATE_STEALTH", "PLAYER_TALENT_UPDATE", "SPELLS_CHANGED",
         }) do events:RegisterEvent(name) end
         applyLayout()
         return
@@ -1100,13 +1318,27 @@ events:SetScript("OnEvent", function(_, event, arg)
     if event == "PLAYER_ENTERING_WORLD" or event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED"
         or event == "PLAYER_REGEN_ENABLED" then
         if stopEditing then stopEditing() end
+        if event ~= "PLAYER_REGEN_ENABLED" then events.CloseEditor() end
         applyLayout()
     elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "ACTIONBAR_PAGE_CHANGED"
-        or event == "UPDATE_BONUS_ACTIONBAR" or event == "UPDATE_SHAPESHIFT_FORM" or event == "UPDATE_STEALTH" then
+        or event == "UPDATE_BONUS_ACTIONBAR" or event == "UPDATE_SHAPESHIFT_FORM" or event == "UPDATE_STEALTH"
+        or event == "PLAYER_TALENT_UPDATE" or event == "SPELLS_CHANGED" then
         if InCombatLockdown() then pending = true
-        elseif root then
-            local largest = compileSlots()
-            if layout.classic then placeClassic(largest) end
+        elseif root and not slotsDirty then
+            local ticket = {}
+            slotsDirty = ticket
+            local function recompile()
+                if slotsDirty ~= ticket then return end
+                slotsDirty = nil
+                if InCombatLockdown() then pending = true; return end
+                if stopEditing then stopEditing() end
+                local largest = compileSlots()
+                if layout.classic then placeClassic(largest) end
+                for _, button in ipairs(buttons) do
+                    if button:IsShown() then refresh(button) end
+                end
+            end
+            if C_Timer and C_Timer.After then C_Timer.After(0, recompile) else recompile() end
         end
     end
     if not root or not root:IsShown() then return end
