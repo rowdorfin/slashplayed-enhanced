@@ -87,7 +87,7 @@ static void site5_cases(void) {
     // Eighteen live sub-sites fall below the full-stack top 16. One more
     // sub-site has been freed and still contributes to the cumulative sums.
     for (unsigned i = 0; i < 19; i++)
-        snapshot[i] = (struct sp_alloc_site){.pc = {0, 0, 0, 0, 0, i + 1},
+        snapshot[i] = (struct sp_alloc_site){.pc = {1, 2, 3, 4, 5, i + 1},
             .live = i < 18 ? 10 : 0, .blocks = i < 18, .total = 20, .allocs = 2,
             .frees = i < 18 ? 1 : 2};
     for (unsigned i = 19; i < 35; i++)
@@ -97,7 +97,10 @@ static void site5_cases(void) {
     for (unsigned i = 0; i < 16; i++) assert(top[i] >= 19 && top[i] < 35);
     sp_alloc_rank_site5(snapshot, &scratch, groups);
     const struct sp_alloc_site5 *family = &groups[0];
-    assert(family->hash == 0 && family->sub_sites == 19 && family->live == 180 && family->blocks == 18);
+    const uintptr_t prefix[SP_ALLOC_SITE5_FRAMES] = {1, 2, 3, 4, 5};
+    assert(!memcmp(family->pc, prefix, sizeof prefix));
+    assert(family->hash == sp_alloc_stack_hash(prefix, SP_ALLOC_SITE5_FRAMES));
+    assert(family->sub_sites == 19 && family->live == 180 && family->blocks == 18);
     assert(family->total == 380 && family->allocs == 38 && family->frees == 20);
     for (unsigned i = 1; i < SP_ALLOC_SITE5_TOP; i++)
         assert(groups[i].sub_sites == 1 && groups[i].live == 35 - i);
