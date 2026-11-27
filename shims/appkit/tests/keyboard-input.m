@@ -74,11 +74,16 @@ static void sp_test_hud_multitouch(SPInputView *view, SPJoystick *stick) {
     CGRect rightJump = sp_hud_jump_area(game, safe, YES);
     CGRect leftJump = sp_hud_jump_area(game, safe, NO);
     SPKeyboardButton *jump = sp_test_keyboard_button(view, @"space");
-    sp_test_check(CGRectContainsRect(leftLane, CGRectInset(stick.frame, -7.99, -7.99)) &&
+    CGRect stickBand = sp_hud_band(leftLane, game, 0.43, 0.83);
+    CGPoint besideStick = CGPointMake(CGRectGetMaxX(stick.frame) + 2, CGRectGetMidY(stick.frame));
+    sp_test_check(CGRectContainsRect(stickBand, stick.frame) &&
+                  [view hitTest:besideStick withEvent:nil] == view &&
+                  CGRectGetMaxY(stick.frame) <= CGRectGetMinY(game) + game.size.height * 0.83 - 7.99 &&
+                  stick.bounds.size.width == 108 &&
                   !jump.hidden && CGRectContainsRect(rightJump, jump.frame) && jump.bounds.size.width == 48 &&
                   rightJump.size.width < rightLane.size.width &&
                   fabs(CGRectGetMaxY(safe) - CGRectGetMaxY(jump.frame) - 8) < 0.01,
-                  @"Jump uses the narrow right lane and sits 8 points above the safe bottom.");
+                  @"The stick leaves the lower chat strip and its outer margin tappable. Jump is inside the opposite safe lane.");
 
     SPKeyboardButton *run = sp_test_keyboard_button(view, @"autorun");
     sp_test_check(!run.hidden, @"The explicit autorun control is available with WASD.");

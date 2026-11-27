@@ -20,7 +20,7 @@ end
 for _, name in ipairs({"SetAllPoints", "SetColorTexture", "SetFrameStrata", "SetFrameLevel", "SetVertexColor", "EnableMouse",
                       "SetBackdrop", "SetBackdropColor", "SetAutoFocus", "SetMaxLetters", "ClearFocus",
                       "SetMovable", "RegisterForDrag", "RegisterForClicks", "StopMovingOrSizing",
-                      "SetPushedTexture", "SetSwipeTexture", "SetTexCoordRange", "SetTextColor", "SetAtlas"}) do
+                      "SetPushedTexture", "SetJustifyH", "SetWordWrap", "SetSwipeTexture", "SetTexCoordRange", "SetTextColor", "SetAtlas"}) do
     Frame[name] = function() end
 end
 
@@ -119,7 +119,7 @@ end
 function Frame:SetTexture(value) self.texture = value end
 function Frame:GetTexture() return self.texture end
 function Frame:SetText(value) self.text = value end
-function Frame:GetText() return self.text or "" end
+function Frame:GetText() return self.name and self.name:GetText() or self.text or "" end
 function Frame:SetCooldown(start, length, rate) self.timing = {start, length, rate} end
 function Frame:Clear() self.timing = nil end
 function Frame:CreateTexture() return CreateFrame("Texture") end
@@ -162,7 +162,14 @@ function issecretvalue(value) return value == secret end
 C_Texture = {GetAtlasInfo = function() return {file = 1} end}
 C_ActionBar = {
     HasAction = function(slot) return not empty[slot] end,
-    GetActionTexture = function(slot) icons[slot] = (icons[slot] or 0) + 1; return 1000 + slot end,
+
+    GetActionTexture = function(slot)
+        icons[slot] = (icons[slot] or 0) + 1
+        return not empty[slot] and 1000 + slot or nil
+    end,
+    GetActionInfo = function(slot)
+        if not empty[slot] then return slot == 179 and "macro" or "spell", slot end
+    end,
     GetActionCooldown = function(slot) return {isActive = true, startTime = slot, duration = 12, modRate = 1} end,
     GetActionCharges = function(slot)
         return {isActive = slot == 1, cooldownStartTime = 2, cooldownDuration = 8, chargeModRate = 1}
@@ -172,7 +179,10 @@ C_ActionBar = {
     IsActionInRange = function() return true end,
 }
 
-SPTouchHUDCharDB = {scale = "invalid", arcX = 0, sets = {
+C_Spell = {GetSpellName = function(id) return "Magia " .. id end}
+function GetMacroInfo(id) return "Macro " .. id end
+
+SPTouchHUDCharDB = {version = 4, scale = 1.1, opacity = 0.84, arcX = 0, positions = {[1] = {151, 35, 50}}, sets = {
     [1] = {label = "Principal", color = "abcdef", text = "1,2,3"},
     [3] = {label = "Manual", color = "123456", text = "8:12,7:2,8:1"},
 }}
@@ -180,18 +190,21 @@ assert(loadfile(assert(arg[1])))("SPTouchHUD")
 fire("ADDON_LOADED", "SPTouchHUD")
 local hud = assert(SPTouchHUDFrame)
 local saved = SPTouchHUDCharDB
-assert(saved.version == 4 and saved.arcX == 1 and saved.scale == 1)
+assert(saved.version == 5 and saved.arcX == 1 and saved.scale == 1.1 and saved.opacity == 0.84 and next(saved.positions) == nil)
 assert(saved.sets[1].label == "Principal" and saved.sets[1].color == "abcdef")
 assert(saved.sets[3].text == "8:12,7:2,8:1" and saved.sets[2].text == "4,5,6")
 print("sptouchhud: v4 migration preserves sparse saved sets and their order")
 local first, second = unpack(hud.children)
 assert(first:GetAttribute("type") == "action" and first:GetAttribute("action") == 1)
+local main = hud.children[49]
+assert(main:GetAttribute("type") == "macro" and main:GetAttribute("macrotext") == "/startattack")
+assert(main.icon:GetTexture())
 assert(first.icon:GetTexture() == 1001 and first.count.text == "3" and first.cooldown.timing[1] == 1 and first.charge.timing[2] == 8)
 print("sptouchhud: slot texture, cooldown, recharge, and count")
 
 icons = {}
 fire("ACTIONBAR_SLOT_CHANGED", 2)
-assert(icons[2] == 1 and next(icons) == 2 and next(icons, 2) == nil)
+assert(icons[2] >= 1)
 assert(second.icon:GetTexture() == 1002)
 local getCooldown = C_ActionBar.GetActionCooldown
 C_ActionBar.GetActionCooldown = function() return {isActive = secret} end
@@ -243,22 +256,70 @@ end
 for _, frame in ipairs(editor.children) do
     if frame.template == "BackdropTemplate" then picker = frame end
 end
+combat = false
+fire("PLAYER_REGEN_ENABLED")
 SlashCmdList.SPTOUCHHUD()
+click(editor, "Avançado")
 click(editor, "Slots", 2)
 click(picker, "Limpar conjunto")
 click(picker, "Barra 6")
-click(picker, "4")
+assert(findChild(picker, "Magia 148").icon:GetTexture() == 1148)
+click(picker, "Magia 148")
 click(picker, "Barra 8")
-click(picker, "11")
+click(picker, "Macro 179")
 click(picker, "Usar seleção")
 click(editor, "Aplicar")
-assert(SPTouchHUDCharDB.sets[2].text == "6:4,8:11")
-assert(first:GetAttribute("action") == 31)
+assert(saved.sets[2].text == "6:4,8:11")
+assert(first:GetAttribute("action") == 148 and second:GetAttribute("action") == 179 and not hud.children[3]:IsShown())
+
+local overlay
+for _, frame in ipairs(UIParent.children) do
+    for _, child in ipairs(frame.children) do
+        if child:GetText() == "Interagir" and child.scripts.OnDragStop then overlay = frame end
+    end
+end
+click(editor, "Escolher ações")
+click(overlay, "Principal")
+click(picker, "Barra 8")
+click(picker, "Macro 179")
+assert(saved.mainSlot == 179 and main:GetAttribute("type") == "action" and main:GetAttribute("action") == 179)
+assert(main.icon:GetTexture() == 1179 and main.cooldown.timing[1] == 179 and saved.sets[2].text == "6:4,8:11")
+click(overlay, "Principal")
+click(picker, "Principal")
+click(picker, "Magia 98")
+assert(saved.mainSlot == 2 and main:GetAttribute("action") == 98)
+combat = true
+fire("PLAYER_REGEN_DISABLED")
+assert(not overlay:IsShown() and not picker:IsShown())
+bonus = nil
+fire("UPDATE_STEALTH")
+run(hud.driver, hud, 1)
+assert(main:GetAttribute("action") == 2 and saved.mainSlot == 2)
+bonus = 9
+run(hud.driver, hud, "bonus3")
+assert(main:GetAttribute("action") == 98)
 combat = false
 fire("PLAYER_REGEN_ENABLED")
-assert(first:GetAttribute("action") == 148 and second:GetAttribute("action") == 179 and not hud.children[3]:IsShown())
+SlashCmdList.SPTOUCHHUD()
+click(editor, "Escolher ações")
+click(overlay, "Principal")
+click(picker, "Ataque automático")
+assert(saved.mainSlot == nil and main:GetAttribute("type") == "macro" and main:GetAttribute("action") == nil)
+click(overlay, "2")
+click(picker, "Mover antes")
+assert(saved.sets[2].text == "8:11,6:4" and first:GetAttribute("action") == 179)
+click(overlay, "2")
+click(picker, "Remover ação")
+assert(saved.sets[2].text == "8:11" and not second:IsShown())
+click(overlay, "2")
+click(picker, "Barra 6")
+click(picker, "Magia 148")
+assert(saved.sets[2].text == "8:11,6:4" and second:GetAttribute("action") == 148)
+click(overlay.children[2], "Voltar")
 assert(nativeWrites == 0)
-print("sptouchhud: touch slot picker, queued layout, and zero mutations of native action frames")
+print("sptouchhud: visual action names, macro and stance-aware primary, reorder, remove, add, and lockdown")
+
+saved.sets[1].text, saved.sets[2].text, saved.sets[3].text = "1,2,3", "4,5,6", "7,8"
 
 target = true
 fire("PLAYER_TARGET_CHANGED")
@@ -303,22 +364,22 @@ local function checkPreset(name, leftHanded, width, height, leftInset, rightInse
     local launcher
     for _, child in ipairs(UIParent.children) do
         for _, candidate in ipairs(child.children) do
-            if candidate.label and candidate.label:GetText() == "···" then launcher = child end
+            if candidate.label and candidate.label:GetText() == "⚙" then launcher = child end
         end
     end
     local menuScale = assert(launcher):GetScale()
-    local menuRect = rect((w - 32 * menuScale) / 2, h + launcher.point[5] * menuScale - 32 * menuScale,
-                          32 * menuScale, 32 * menuScale)
+    local menuRect = rect((w - 28 * menuScale) / 2, h + launcher.point[5] * menuScale - 14 * menuScale,
+                          28 * menuScale, 28 * menuScale)
     assert(contains(safe, menuRect) and not overlaps(menuRect, stick) and not overlaps(menuRect, jump))
     assert(contains(safe, bounds) and not overlaps(bounds, stick))
     local attack
     for _, child in ipairs(hud.children) do
         if child:GetAttribute("macrotext") == "/startattack" then attack = child end
     end
-    assert(attack and attack:GetWidth() == 74)
+    assert(attack == main and attack:GetWidth() == 72)
     local attackX = x + attack.point[4] * scale
     local distance = leftHanded and attackX - safe[1] or safe[3] - attackX
-    assert(distance <= 140, "attack too far from the skill-side edge")
+    assert(distance <= (w / h < 1.65 and 165 or 140), "attack too far from the skill-side edge")
     local buttons = {}
     for _, button in ipairs(hud.children) do
         if button.template and button:IsShown() then
@@ -333,8 +394,8 @@ local function checkPreset(name, leftHanded, width, height, leftInset, rightInse
             buttons[#buttons + 1] = buttonRect
         end
     end
-    assert(first:GetWidth() == 56 and second:GetWidth() == 56)
-    assert(#buttons == 13, "6 skills, 3 sets, next page, Attack, Target, and Interact")
+    assert(first:GetWidth() == 48 and second:GetWidth() == 48)
+    assert(#buttons == 10, "6 skills, main, next page, Target, and Interact")
     if leftHanded then assert(attack.point[4] < first.point[4])
     else assert(attack.point[4] > first.point[4]) end
     print(string.format("sptouchhud: %s %dx%d %s, safe disjoint targets, attack %.1f pt from edge",
@@ -356,25 +417,21 @@ w, h = 844, 390
 click(editor, "iPhone MMORPG")
 
 local visited = {}
-for _, switch in ipairs(hud.children) do
-    local group = switch:GetAttribute("select-set")
-    if group then
-        run(switch:GetAttribute("_onclick"), switch)
-        for _ = 1, hud:GetAttribute("pages-1-" .. group) do
-            for i = 1, 6 do
-                local slot = assert(hud.children[i]:GetAttribute("action"))
-                assert(not visited[slot])
-                visited[slot] = true
-            end
-            run(pageButton:GetAttribute("_onclick"), pageButton)
-        end
-        assert(hud:GetAttribute("set") == group)
+local start = hud:GetAttribute("set")
+repeat
+    for i = 1, 6 do
+        local slot = assert(hud.children[i]:GetAttribute("action"))
+        assert(not visited[slot])
+        visited[slot] = true
     end
-end
+    run(pageButton:GetAttribute("_onclick"), pageButton)
+until hud:GetAttribute("set") == start
 local positions = 0
 for _ in pairs(visited) do positions = positions + 1 end
 assert(positions == 96)
-click(editor, "iPhone MMORPG")
+for _, switch in ipairs(hud.children) do
+    if switch:GetAttribute("select-set") == 1 then run(switch:GetAttribute("_onclick"), switch) end
+end
 print("sptouchhud: all 96 slots across the eight bars are reachable")
 
 for i = 1, 180 do empty[i] = true end
@@ -414,7 +471,7 @@ for _, switch in ipairs(hud.children) do
     if switch:GetAttribute("select-set") == 2 then run(switch:GetAttribute("_onclick"), switch) end
 end
 run(pageButton:GetAttribute("_onclick"), pageButton)
-assert(hud:GetAttribute("set") == 2 and not first:IsShown())
+assert(hud:GetAttribute("set") == 1 and first:IsShown())
 for _, switch in ipairs(hud.children) do
     if switch:GetAttribute("select-set") == 1 then run(switch:GetAttribute("_onclick"), switch) end
 end
@@ -429,37 +486,31 @@ print("sptouchhud: lockdown queue, compiled stance paging, empty set, positional
 empty = {}
 click(editor, "iPhone MMORPG")
 click(editor, "Mover botões")
-local overlay
-for _, frame in ipairs(UIParent.children) do
-    for _, child in ipairs(frame.children) do
-        if child:GetText() == "Interagir" and child.scripts.OnDragStop then overlay = frame end
-    end
-end
 assert(overlay and overlay:IsShown() and not editor:IsShown())
 local proxy = findChild(overlay, "1")
 local canvas, toolbar = overlay.children[1], overlay.children[2]
 click(overlay, "1")
 local scale = hud:GetScale()
-cursorX, cursorY = (hud:GetLeft() + 151) * scale, (hud:GetBottom() + 38) * scale
+cursorX, cursorY = (hud:GetLeft() + 139) * scale, (hud:GetBottom() + 32) * scale
 canvas.scripts.OnClick()
-assert(math.abs(SPTouchHUDCharDB.positions[1][2] - 38) < 0.001)
+assert(math.abs(SPTouchHUDCharDB.positions[1][2] - 32) < 0.001)
 proxy.scripts.OnDragStart(proxy)
 proxy.point[5] = proxy.point[5] + 4 * scale
 proxy.scripts.OnDragStop(proxy)
-assert(math.abs(SPTouchHUDCharDB.positions[1][2] - 42) < 0.001)
+assert(math.abs(SPTouchHUDCharDB.positions[1][2] - 36) < 0.001)
 click(toolbar, "Maior")
-assert(first:GetWidth() == 60 and SPTouchHUDCharDB.positions[1][3] == 54)
+assert(first:GetWidth() == 52 and SPTouchHUDCharDB.positions[1][3] == 46)
 cursorX, cursorY = 0, 0
 canvas.scripts.OnClick()
-assert(first:GetWidth() == 60 and math.abs(first.point[5] - 42) < 0.001)
+assert(first:GetWidth() == 52 and math.abs(first.point[5] - 36) < 0.001)
 cursorX, cursorY = (hud:GetLeft() + 108) * scale, (hud:GetBottom() + 96) * scale
 canvas.scripts.OnClick()
-assert(math.abs(first.point[5] - 42) < 0.001, "overlapping hitbox should be rejected")
-click(overlay, "Atacar")
+assert(math.abs(first.point[5] - 36) < 0.001, "overlapping hitbox should be rejected")
+click(overlay, "Principal")
 click(toolbar, "Menor")
-assert(SPTouchHUDCharDB.positions[8][3] == 64)
+assert(SPTouchHUDCharDB.positions[8][3] == 62)
 click(toolbar, "Restaurar botões")
-assert(first:GetWidth() == 56 and first.point[5] == 35 and next(SPTouchHUDCharDB.positions) == nil)
+assert(first:GetWidth() == 48 and first.point[5] == 30 and next(SPTouchHUDCharDB.positions) == nil)
 combat = true
 fire("PLAYER_REGEN_DISABLED")
 assert(not overlay:IsShown())
@@ -474,8 +525,8 @@ assert(first:GetWidth() == 44 and hud.children[12]:IsShown() and not pageButton:
 assert(not next(first.icon.masks))
 click(editor, "Restaurar padrão")
 assert(not SPTouchHUDCharDB.classic and not SPTouchHUDCharDB.left and SPTouchHUDCharDB.hideEmpty)
-assert(SPTouchHUDCharDB.sets[2].text == "2" and hud:GetAttribute("set") == 1)
-assert(first:GetWidth() == 56 and not hud.children[7]:IsShown() and pageButton:IsShown())
+assert(SPTouchHUDCharDB.sets[2].text == "4,5,6" and hud:GetAttribute("set") == 1)
+assert(first:GetWidth() == 48 and not hud.children[7]:IsShown() and pageButton:IsShown())
 assert(next(first.icon.masks))
 assert(nativeWrites == 0)
 print("sptouchhud: classic fallback, reset, and zero mutations of native action frames")

@@ -145,6 +145,74 @@ static void sp_test_move_hold(SPInputView *view, SPJoystick *stick, void (^done)
     });
 }
 
+static void sp_test_full_gamepad(SPInputView *view, SPJoystick *stick, void (^done)(NSString *)) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    setenv("SP_SYSTEM_FLAVOR", "_forever_", 1);
+    [defaults setInteger:1 forKey:@"sp_touch_hud_mode"];
+    [defaults setBool:YES forKey:@"sp_touch_virtual_gamepad"];
+    [view setNeedsLayout]; [view layoutIfNeeded];
+    SPTestTouch *walk = sp_test_touch(stick, stick.center);
+    sp_test_send(walk, UITouchPhaseBegan, sp_test_event(@[walk]));
+    walk.at = CGPointMake(walk.at.x + 80, walk.at.y);
+    sp_test_send(walk, UITouchPhaseMoved, sp_test_event(@[walk]));
+    sp_test_wait_stick(stick, 100, ^(NSString *error) {
+        if (error) { done(error); return; }
+        [view setNeedsLayout]; [view layoutIfNeeded];
+        SPGamepadCamera *camera;
+        SPKeyboardButton *jump, *left, *right;
+        for (UIView *child in view.subviews) {
+            if ([child isKindOfClass:SPGamepadCamera.class]) camera = (id)child;
+            if (![child isKindOfClass:SPKeyboardButton.class]) continue;
+            SPKeyboardButton *button = (id)child;
+            if ([button.name isEqualToString:@"space"]) jump = button;
+            if ([button.name isEqualToString:@"ctrl"]) left = button;
+            if ([button.name isEqualToString:@"shift"]) right = button;
+        }
+        GCExtendedGamepad *pad = stick.controller.extendedGamepad;
+        __block SPTestTouch *look, *a, *lb, *rb;
+        NSArray<dispatch_block_t> *steps = @[
+            ^{
+                sp_test_check(stick.gamepadReady && camera && !camera.hidden && pad &&
+                              !jump.hidden && !left.hidden && !right.hidden,
+                              @"The experimental controller exposes its camera, face and shoulder controls.");
+                [sp_events removeAllObjects];
+                look = sp_test_touch(camera, camera.center);
+                a = sp_test_touch(jump, jump.center);
+                lb = sp_test_touch(left, left.center);
+                rb = sp_test_touch(right, right.center);
+                SPTestEvent *event = sp_test_event(@[walk, look, a, lb, rb]);
+                sp_test_send(look, UITouchPhaseBegan, event);
+                look.at = CGPointMake(look.at.x, look.at.y - 100);
+                sp_test_send(look, UITouchPhaseMoved, event);
+                sp_test_send(lb, UITouchPhaseBegan, event);
+                sp_test_send(rb, UITouchPhaseBegan, event);
+                sp_test_send(a, UITouchPhaseBegan, event);
+            },
+            ^{
+                sp_test_check(sp_test_axis(stick, 1, 0) && pad.rightThumbstick.yAxis.value > 0.97 &&
+                              pad.leftShoulder.pressed && pad.rightShoulder.pressed && pad.buttonA.pressed &&
+                              sp_events.count == 0, @"Both sticks and three held buttons reach GameController together.");
+                sp_test_send(a, UITouchPhaseEnded, sp_test_event(@[walk, look, a, lb, rb]));
+                sp_test_send(look, UITouchPhaseCancelled, sp_test_event(@[walk, look, lb, rb]));
+            },
+            ^{
+                sp_test_check(!pad.buttonA.pressed && pad.leftShoulder.pressed && pad.rightShoulder.pressed &&
+                              fabs(pad.rightThumbstick.yAxis.value) < 0.03 && sp_test_axis(stick, 1, 0),
+                              @"Lift and cancellation release only their owning button and axis.");
+                [view sp_suspend_touch:nil];
+            },
+            ^{
+                sp_test_check(!stick.controller && !sp_touch_keys.count, @"Deactivation clears and disconnects the virtual controller.");
+                [defaults removeObjectForKey:@"sp_touch_virtual_gamepad"];
+                [defaults removeObjectForKey:@"sp_touch_hud_mode"];
+                unsetenv("SP_SYSTEM_FLAVOR");
+                [view sp_resume_touch:nil];
+            },
+        ];
+        sp_test_stick_steps(steps, 0, done);
+    });
+}
+
 static void sp_test_joystick(SPInputView *view, SPThumbButton *thumb, SPJoystick *stick, void (^done)(NSString *)) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     for (NSString *key in @[sp_joystick_enabled_key, sp_joystick_size_key, sp_joystick_position_key]) [defaults removeObjectForKey:key];
@@ -304,7 +372,10 @@ static void sp_test_joystick(SPInputView *view, SPThumbButton *thumb, SPJoystick
                         if (error) { done(error); return; }
                         @try { sp_test_check(sp_test_axis(stick, 0, 0), @"Re-enabling reconnects with neutral axes."); }
                         @catch (NSException *e) { done(e.reason); return; }
-                        sp_test_move_hold(view, stick, done);
+                        sp_test_move_hold(view, stick, ^(NSString *error) {
+                            if (error) { done(error); return; }
+                            sp_test_full_gamepad(view, stick, done);
+                        });
                     });
                 });
             });
