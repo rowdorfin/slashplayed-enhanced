@@ -91,3 +91,53 @@ static inline SPMemorySample SPMemoryRead(const SPMemoryBin *bin) {
                             atomic_load_explicit(&bin->logical, memory_order_relaxed),
                             atomic_load_explicit(&bin->allocated, memory_order_relaxed)};
 }
+
+static inline uint64_t SPMemoryWorkingSet(uint64_t real, uint64_t cap) {
+    return cap && cap < real ? cap : real;
+}
+
+enum {
+    SPVMTagCount = 256,
+    SPVMTagMappedFile = SPVMTagCount,
+    SPVMTagLedger,
+    SPVMTagSlots,
+    SPVMTagTopCount = 8
+};
+
+typedef struct {
+    uint64_t dirty, swapped;
+} SPVMTagPages;
+
+static inline void SPVMTagAdd(SPVMTagPages *tags, unsigned tag, int external,
+                             uint32_t dirty, uint32_t swapped) {
+    // XNU reports its synthesized footprint-ledger region with user_tag = -1.
+    if (tag == UINT32_MAX) tag = SPVMTagLedger;
+    else if (tag >= SPVMTagCount) tag = 0;
+    if (tag == 0 && external) tag = SPVMTagMappedFile;
+    tags[tag].dirty += dirty;
+    tags[tag].swapped += swapped;
+}
+
+static inline uint64_t SPVMTagTotal(SPVMTagPages pages) {
+    return pages.dirty + pages.swapped;
+}
+
+// Repeated selection is bounded by eight passes over the fixed tag table.
+typedef struct {
+    unsigned tag;
+    SPVMTagPages pages;
+} SPVMTagSample;
+
+static inline unsigned SPVMTagTop(SPVMTagPages *tags, SPVMTagSample *top) {
+    unsigned count = 0;
+    for (; count < SPVMTagTopCount; count++) {
+        unsigned best = 0;
+        for (unsigned tag = 1; tag < SPVMTagSlots; tag++) {
+            if (SPVMTagTotal(tags[tag]) > SPVMTagTotal(tags[best])) best = tag;
+        }
+        if (!SPVMTagTotal(tags[best])) break;
+        top[count] = (SPVMTagSample){best, tags[best]};
+        tags[best] = (SPVMTagPages){0};
+    }
+    return count;
+}

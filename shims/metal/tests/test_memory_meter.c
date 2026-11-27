@@ -6,6 +6,29 @@
 static SPMemoryHistogram histogram;
 
 int main(void) {
+    const uint64_t gib = UINT64_C(1) << 30;
+    assert(SPMemoryWorkingSet(4 * gib, 0) == 4 * gib);
+    assert(SPMemoryWorkingSet(4 * gib, 2 * gib) == 2 * gib);
+    assert(SPMemoryWorkingSet(4 * gib, 3 * gib / 2) == 3 * gib / 2);
+    assert(SPMemoryWorkingSet(4 * gib, gib) == gib);
+    assert(SPMemoryWorkingSet(gib, 2 * gib) == gib);
+    assert(SPMemoryWorkingSet(0, gib) == 0);
+
+    SPVMTagPages tags[SPVMTagSlots] = {0};
+    SPVMTagSample top[SPVMTagTopCount];
+    assert(SPVMTagTop(tags, top) == 0);
+    for (unsigned tag = 1; tag <= 9; tag++) SPVMTagAdd(tags, tag, 0, 1, 0);
+    SPVMTagAdd(tags, 2, 1, 2, 3);
+    SPVMTagAdd(tags, 0, 1, 3, 0);
+    SPVMTagAdd(tags, SPVMTagSlots, 0, 0, 2);
+    SPVMTagAdd(tags, UINT32_MAX, 0, 0, 1);
+    assert(tags[SPVMTagLedger].swapped == 1);
+    assert(SPVMTagTop(tags, top) == SPVMTagTopCount);
+    assert(top[0].tag == 2 && top[0].pages.dirty == 3 && top[0].pages.swapped == 3);
+    assert(top[1].tag == SPVMTagMappedFile && SPVMTagTotal(top[1].pages) == 3);
+    assert(top[2].tag == 0 && SPVMTagTotal(top[2].pages) == 2);
+    assert(top[3].tag == 1 && top[4].tag == 3 && top[7].tag == 6);
+
     const unsigned edges[] = {128, 256, 512, 1024, 2048};
     for (unsigned i = 0; i < sizeof edges / sizeof *edges; i++) {
         assert(SPMemoryEdgeClass(edges[i]) == edges[i]);

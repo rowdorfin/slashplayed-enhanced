@@ -384,13 +384,19 @@ BOOL sp_graphics_restore(void) {
 }
 
 // The shim opens/rotates the diagnostic log on its first device query. Use its
-// normal entry point before writing preflight records, after SP_A16_PROFILE is set.
+// normal entry point before writing preflight records, after the experiment flags are set.
 static id<MTLDevice> preflight_device(NSString *bundle) {
     NSString *path = [bundle stringByAppendingPathComponent:@"Frameworks/libspMetal.dylib"];
     void *metal = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL | RTLD_FIRST);
     typedef id<MTLDevice> (*Factory)(void) NS_RETURNS_RETAINED;
     Factory factory = metal ? (Factory)dlsym(metal, "MTLCreateSystemDefaultDevice") : NULL;
-    return factory ? factory() : nil;
+    id<MTLDevice> device = factory ? factory() : nil;
+    if (device && getenv("SP_GPU_WORKING_SET_MIB")) {
+        // Native BC devices skip the fallback install, but can still report a capped working set.
+        void (*install)(id<MTLDevice>) = (void (*)(id<MTLDevice>))dlsym(metal, "sp_install_metal_memory_queries");
+        if (install) install(device);
+    }
+    return device;
 }
 
 static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger resolution, BOOL found,
@@ -409,10 +415,13 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     const char *configRender = getenv("SP_CONFIG_RENDER_SCALE");
     NSString *render = requested[@"RenderScale"] ?: (configRender ? @(configRender) : @"game");
     NSString *textures = requested[@"graphicsTextureResolution"] ?: @"game";
+    BOOL compact = getenv("SP_BC_COMPACT") != NULL;
+    const char *budgetEnv = getenv("SP_GPU_WORKING_SET_MIB");
+    NSString *budget = budgetEnv ? [NSString stringWithFormat:@"%s MiB", budgetEnv] : @"real";
     graphics_log([NSString stringWithFormat:
-        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@",
+        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s",
         machine, device.name ?: @"unknown", nativeBC, backend, profile ? @"a16" : @"native",
-        graphics_name(preset), width, render, textures, found ? @"found" : @"missing"]);
+        graphics_name(preset), width, render, textures, found ? @"found" : @"missing", compact, budgetEnv ?: "0"]);
 
     if (!pump) return;
     UIWindow *window = nil;
@@ -430,8 +439,8 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     notice.textAlignment = NSTextAlignmentCenter;
     notice.numberOfLines = 0;
     notice.userInteractionEnabled = NO;
-    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@",
-                   backend, graphics_name(preset), width, render, textures];
+    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · Orçamento %@",
+                   backend, graphics_name(preset), width, render, textures, compact ? @"on" : @"off", budget];
     [window addSubview:notice];
     UILayoutGuide *safe = window.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -1119,8 +1128,18 @@ int main(int argc, char **argv) {
     BOOL token = [NSFileManager.defaultManager fileExistsAtPath:
                   [NSHomeDirectory() stringByAppendingPathComponent:@"Library/spnetbattle.plist"]];
 
-    if ([NSUserDefaults.standardUserDefaults boolForKey:@"sp_a16_profile"])
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if ([defaults boolForKey:@"sp_a16_profile"])
         setenv("SP_A16_PROFILE", "1", 1);
+    if ([defaults boolForKey:@"sp_bc_compact"])
+        setenv("SP_BC_COMPACT", "1", 1);
+    else
+        unsetenv("SP_BC_COMPACT");
+    NSInteger gpuBudget = [defaults integerForKey:@"sp_gpu_working_set_mib"];
+    if (gpuBudget == 2048 || gpuBudget == 1536 || gpuBudget == 1024)
+        setenv("SP_GPU_WORKING_SET_MIB", [@(gpuBudget) stringValue].UTF8String, 1);
+    else
+        unsetenv("SP_GPU_WORKING_SET_MIB");
     setenv("SP_SYSTEM_FLAVOR", [NSString stringWithFormat:@"_%@_", flavor].UTF8String, 1);
     NSString *appkit = [dir stringByAppendingPathComponent:@"Frameworks/libspAppKit.dylib"];
     // Game data a copy left incomplete first, so nobody signs in to then be told. Then the sign-in, so the

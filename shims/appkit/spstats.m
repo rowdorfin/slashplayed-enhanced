@@ -9,9 +9,13 @@
 // occupied time from the union of completed command-buffer intervals).
 #import <Metal/Metal.h>
 #include <mach/mach.h>
+#include <mach/vm_region.h>
+#include <mach/vm_statistics.h>
+#include <malloc/malloc.h>
 #include <os/lock.h>
 #include <objc/runtime.h>
 #include "../metal/spmetalmeter.h"
+#include "../metal/spmemorymeter.h"
 #include <time.h>
 #include <stddef.h>
 #include <stdatomic.h>
@@ -170,11 +174,115 @@ static NSString *sp_stats_scenes(void) {
     return out.length ? out : @"\n    no connected scenes";
 }
 
+static const char *sp_stats_vm_tag(unsigned tag) {
+    switch (tag) {
+    case 0: return "untagged";
+    case SPVMTagMappedFile: return "mapped-file";
+    case SPVMTagLedger: return "VM-ledger";
+    case VM_MEMORY_MALLOC: return "MALLOC";
+    case VM_MEMORY_MALLOC_SMALL: return "MALLOC_SMALL";
+    case VM_MEMORY_MALLOC_TINY: return "MALLOC_TINY";
+    case VM_MEMORY_MALLOC_LARGE: return "MALLOC_LARGE";
+    case VM_MEMORY_MALLOC_HUGE: return "MALLOC_HUGE";
+    case VM_MEMORY_MALLOC_LARGE_REUSABLE: return "MALLOC_LARGE_REUSABLE";
+    case VM_MEMORY_MALLOC_LARGE_REUSED: return "MALLOC_LARGE_REUSED";
+    case VM_MEMORY_MALLOC_NANO: return "MALLOC_NANO";
+    case VM_MEMORY_MALLOC_MEDIUM: return "MALLOC_MEDIUM";
+    case VM_MEMORY_IOKIT: return "IOKit";
+    case VM_MEMORY_IOACCELERATOR: return "IOAccelerator";
+    case VM_MEMORY_FOUNDATION: return "Foundation";
+    case VM_MEMORY_COREGRAPHICS: return "CoreGraphics";
+    case VM_MEMORY_COREGRAPHICS_DATA: return "CoreGraphics-data";
+    case VM_MEMORY_COREGRAPHICS_SHARED: return "CoreGraphics-shared";
+    case VM_MEMORY_COREGRAPHICS_FRAMEBUFFERS: return "CoreGraphics-framebuffers";
+    case VM_MEMORY_COREGRAPHICS_BACKINGSTORES: return "CoreGraphics-backingstores";
+    case VM_MEMORY_COREGRAPHICS_XALLOC: return "CoreGraphics-xalloc";
+    case VM_MEMORY_JAVASCRIPT_JIT_EXECUTABLE_ALLOCATOR: return "JavaScript-JIT-executable";
+    case VM_MEMORY_JAVASCRIPT_JIT_REGISTER_FILE: return "JavaScript-JIT-register";
+    case VM_MEMORY_DYLIB: return "dylib";
+    case VM_MEMORY_STACK: return "stack";
+    default: return "unknown";
+    }
+}
+
+static void sp_stats_vm_tags(const char *phase, unsigned long long warning) {
+    SPVMTagPages tags[SPVMTagSlots] = {0};
+    vm_address_t address = 0;
+    natural_t depth = 0;
+    unsigned regions = 0;
+    kern_return_t status;
+    uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (;;) {
+        vm_size_t size = 0;
+        vm_region_submap_info_data_64_t info = {0};
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        // The iOS SDK publishes the Mach VM recurse operation as vm_region_recurse_64.
+        status = vm_region_recurse_64(mach_task_self(), &address, &size, &depth,
+                                     (vm_region_recurse_info_t)&info, &count);
+        if (status != KERN_SUCCESS) break;
+        if (count < VM_REGION_SUBMAP_INFO_V0_COUNT_64 || !size || size > UINTPTR_MAX - address) {
+            status = KERN_FAILURE;
+            break;
+        }
+        if (info.is_submap) {
+            depth++;
+            continue;
+        }
+        SPVMTagAdd(tags, info.user_tag, info.external_pager, info.pages_dirtied, info.pages_swapped_out);
+        regions++;
+        address += size;
+    }
+
+    SPVMTagSample top[SPVMTagTopCount];
+    unsigned topCount = SPVMTagTop(tags, top);
+    double ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1e6;
+    NSMutableString *line = [NSMutableString stringWithFormat:
+        @"SP_VM_TAGS phase=%s warning=%llu ms=%.2f regions=%u complete=%d kr=%d MiB(total/dirty/swapped)",
+        phase, warning, ms, regions, status == KERN_INVALID_ADDRESS || status == KERN_NO_SPACE, status];
+    double pageMiB = vm_page_size / 1048576.0;
+    for (unsigned i = 0; i < topCount; i++) {
+        unsigned tag = top[i].tag;
+        SPVMTagPages pages = top[i].pages;
+        [line appendFormat:@" %s(%u)=%.2f/%.2f/%.2f", sp_stats_vm_tag(tag), tag,
+                           SPVMTagTotal(pages) * pageMiB, pages.dirty * pageMiB, pages.swapped * pageMiB];
+    }
+    sp_stats_say(line.UTF8String);
+}
+
+static void sp_stats_malloc_zones(const char *phase, unsigned long long warning) {
+    vm_address_t *addresses = NULL;
+    unsigned count = 0;
+    kern_return_t status = malloc_get_all_zones(mach_task_self(), NULL, &addresses, &count);
+    NSMutableString *line = [NSMutableString stringWithFormat:
+        @"SP_MALLOC_ZONES phase=%s warning=%llu kr=%d", phase, warning, status];
+    if (status == KERN_SUCCESS) {
+        [line appendFormat:@" zones=%u (inUse/allocated/blocks)", count];
+        for (unsigned i = 0; i < count; i++) {
+            malloc_zone_t *zone = (malloc_zone_t *)addresses[i];
+            if (!zone || !zone->introspect || !zone->introspect->statistics) continue;
+            malloc_statistics_t stats = {0};
+            malloc_zone_statistics(zone, &stats);
+            const char *name = malloc_get_zone_name(zone);
+            [line appendFormat:@" #%u(%s)=%zu/%zu/%u", i, name ?: "unnamed",
+                               stats.size_in_use, stats.size_allocated, stats.blocks_in_use];
+        }
+    }
+    sp_stats_say(line.UTF8String);
+}
+
+static void sp_stats_memory_sample(const char *phase, unsigned long long warning) {
+    sp_stats_vm_tags(phase, warning);
+    sp_stats_malloc_zones(phase, warning);
+}
+
 static void *sp_stats_watch(void *unused) {
     (void)unused;
     for (;;) {
         sleep(30);
-        @autoreleasepool { sp_stats_line(); }
+        @autoreleasepool {
+            sp_stats_line();
+            sp_stats_memory_sample("periodic", 0);
+        }
     }
     return NULL;
 }
@@ -189,6 +297,13 @@ static void sp_stats_memory_warning(void) {
         count * sizeof(natural_t) >= offsetof(task_vm_info_data_t, phys_footprint) + sizeof(vm.phys_footprint);
     sp_stats_say([NSString stringWithFormat:@"SP_MEM_PRESSURE source=UIKit level=warn warnings=%llu phys_footprint=%@",
                   warnings, measured ? @(vm.phys_footprint) : @"n/a"].UTF8String);
+    // UIKit delivery and the Metal shim's dispatch-pressure trim are independent.
+    // Match these samples to the timestamped SP_MEM_TRIM line when reading the log.
+    dispatch_time_t followup = dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC);
+    sp_stats_memory_sample("warning", warnings);
+    dispatch_after(followup, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool { sp_stats_memory_sample("warning+2s", warnings); }
+    });
 }
 
 static void sp_stats_start(void) {

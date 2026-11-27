@@ -97,6 +97,9 @@ int main(void) {
     assert(low && strstr(low, "SET RenderScale \"0.5\"") && strstr(low, "SET useHighResTextures \"0\""));
     assert(strstr(low, "SET graphicsParticleDensity \"1\"") && strstr(low, "SET graphicsProjectedTextures \"0\""));
     assert(strstr(low, "SET ffxAntiAliasingMode \"0\"") && strstr(low, "SET MSAAQuality \"0\""));
+    assert(strstr(low, "SET graphicsShadowQuality \"0\"") && strstr(low, "SET graphicsViewDistance \"0\""));
+    assert(strstr(low, "SET graphicsEnvironmentDetail \"0\"") && strstr(low, "SET graphicsGroundClutter \"0\""));
+    assert(strstr(low, "SET graphicsLiquidDetail \"0\"") && strstr(low, "SET graphicsSSAO \"0\""));
     restored = sp_graphics_edit(low, newA16Backup, SP_GRAPHICS_KEEP, false, false, &applied, &unchanged);
     assert(restored && !strcmp(restored, lowOriginal));
     free(restored);

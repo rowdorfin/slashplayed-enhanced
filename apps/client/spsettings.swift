@@ -700,6 +700,25 @@ struct SettingsView: View {
                     settings.reload()
                 }
             ))
+            Toggle("Texturas BC1 compactas (experimental)", isOn: Binding(
+                get: { UserDefaults.standard.bool(forKey: "sp_bc_compact") },
+                set: {
+                    UserDefaults.standard.set($0, forKey: "sp_bc_compact")
+                    settings.reload()
+                }
+            ))
+            Picker("Orçamento gráfico (experimental)", selection: Binding(
+                get: { UserDefaults.standard.integer(forKey: "sp_gpu_working_set_mib") },
+                set: {
+                    UserDefaults.standard.set($0, forKey: "sp_gpu_working_set_mib")
+                    settings.reload()
+                }
+            )) {
+                Text("Real").tag(0)
+                ForEach([2048, 1536, 1024], id: \.self) { budget in
+                    Text("\(budget) MiB").tag(budget)
+                }
+            }
             Picker("Game resolution", selection: $optimizedResolution) {
                 Text("Choose in WoW").tag(0)
                 Text("1280 px").tag(1280)

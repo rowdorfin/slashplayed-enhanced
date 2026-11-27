@@ -1693,15 +1693,26 @@ static bool spA16GuestCaller(void *returnAddress) {
 
 static os_unfair_lock spBCMemoryQueryLock = OS_UNFAIR_LOCK_INIT;
 
-static void spBCMemoryQuery(SPA16MemoryQuery *query, SEL selector, uint64_t value, void *caller) {
-    if (!spA16GuestCaller(caller)) return;
+static uint64_t spBCWorkingSetCap(void) {
+    const char *mib = getenv("SP_GPU_WORKING_SET_MIB");
+    if (!mib || *mib < '0' || *mib > '9') return 0;
+    char *end;
+    unsigned long long count = strtoull(mib, &end, 10);
+    return !*end && count <= (UINT64_MAX >> 20) ? (uint64_t)count << 20 : 0;
+}
+
+static uint64_t spBCMemoryQuery(SPA16MemoryQuery *query, SEL selector, uint64_t value, void *caller) {
+    if (!spA16GuestCaller(caller)) return value;
+    uint64_t returned = selector == @selector(recommendedMaxWorkingSetSize)
+        ? SPMemoryWorkingSet(value, spBCWorkingSetCap()) : value;
     os_unfair_lock_lock(&spBCMemoryQueryLock);
     bool changed = spA16RecordMemoryQuery(query, value);
     uint64_t count = query->count;
     os_unfair_lock_unlock(&spBCMemoryQueryLock);
     if (changed)
-        spBCLog(@"SP_MEM_QUERY sel=%s value=%llu count=%llu", sel_getName(selector),
-                (unsigned long long)value, (unsigned long long)count);
+        spBCLog(@"SP_MEM_QUERY sel=%s real=%llu returned=%llu count=%llu", sel_getName(selector),
+                (unsigned long long)value, (unsigned long long)returned, (unsigned long long)count);
+    return returned;
 }
 
 #define SP_BC_MEMORY_QUERY(name, type) \
@@ -1709,7 +1720,7 @@ static void spBCMemoryQuery(SPA16MemoryQuery *query, SEL selector, uint64_t valu
         static SPA16MemoryQuery query; \
         type value = ((type (*)(id, SEL))original(self, selector))(self, selector); \
         int savedErrno = errno; \
-        spBCMemoryQuery(&query, selector, value, __builtin_return_address(0)); \
+        value = (type)spBCMemoryQuery(&query, selector, value, __builtin_return_address(0)); \
         errno = savedErrno; \
         return value; \
     }
@@ -1730,6 +1741,12 @@ static void spBCInstallMemoryQueries(Class cls) {
     hook(cls, @selector(hasUnifiedMemory), (IMP)spBCQuery_hasUnifiedMemory);
     hook(cls, @selector(maxBufferLength), (IMP)spBCQuery_maxBufferLength);
     spBCInstallPhysicalMemoryQuery();
+}
+
+// The launcher calls this at preflight when the cap is enabled, including on
+// native BC devices that skip the fallback install.
+__attribute__((visibility("default"))) void sp_install_metal_memory_queries(id<MTLDevice> device) {
+    spBCInstallMemoryQueries(object_getClass(device));
 }
 
 // Foundation may be queried before the guest requests its Metal device.
