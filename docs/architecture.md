@@ -1164,6 +1164,43 @@ The client loads every library through `-[MTLDevice newLibraryWithData:error:]`,
 hooks that one method: for a `MTLB` container with the flag set and a version below 2.6, it clears
 the bit in a **copy** and calls the original. Nothing on disk changes.
 
+### Hardware profile
+
+Settings offers Automatic, Native, and A16 compatibility. Automatic chooses Native only when Apple
+Metal reports native BC support. A manual Native request falls back to compatibility if the
+capability is false or unavailable. Apple GPU family flags are diagnostic. Compatibility uses the
+existing software BC fallback on hardware that reports no BC. On a GPU with native BC, manually
+choosing compatibility turns on the A16 simulation. If the selector is unavailable, the compatibility
+profile retains the legacy shim's backend detection.
+
+The launcher detects capabilities through its linked Apple Metal factory. Early UIKit starts the
+AppKit stats watcher and lifecycle observers without setting up a shim Metal device. AppKit's hover
+code queries Metal when the guest attaches its layer. After Settings closes, the launcher projects
+the selected profile's preferences into the legacy keys, publishes the profile and experiment flags,
+and calls AppKit's resolution lock before preflight opens libspMetal. The Metal constructor
+(`spBCEarlyMemoryQuery`) and the device setup both run after those flags are available.
+
+The first migration copies existing graphics, resolution, and experiment preferences to the
+compatibility namespace. Native starts with Keep, resolution chosen in WoW, and experiments off.
+Touch and HUD preferences, applied-preset and session records, and Config.wtf backups are shared.
+Native Keep restores the graphics backup when its last applied preset was an A16 preset. Native
+launches also restore backed-up memory CVars through the existing client-default path.
+
+In Native, the Metal factory emits the `SP_METAL_DIAG`, `SP_HARDWARE_PROFILE`, and
+`SP_A16_PROFILE session` records. Heap-sizing traces, BC texture hooks, capability masking, and
+memory-query hooks stay off. The observer retains the original drawable logging and metallib
+support. AppKit retains the original frame and GPU counters and skips the expanded timing and
+VM-region/malloc-zone diagnostics. The launcher also logs the selection and backend and displays the
+active profile during preflight.
+
+libspSystem keeps its allocation and memory-observation exports for BindCheck. With tracing off, the
+allocation wrappers forward using their resolved pointers and an acquire atomic flag load.
+The memory observation wrappers also short-circuit on that flag, and the Foundation and notification
+swizzles are installed only when tracing is enabled. The existing Linux benchmark in
+`shims/system/tests/run.sh` measured median malloc+free times of 6.45 ns plain and 6.80 ns wrapped
+with tracing off at 64 B, and 18.11 ns plain and 22.41 ns wrapped at 1 MiB during T010-A. These
+measurements characterize the portable wrapper model. Darwin performance still needs device results.
+
 ## iPad
 
 iPadOS behaves like visionOS for everything above (TXM and the prepare, the metallib retag, the

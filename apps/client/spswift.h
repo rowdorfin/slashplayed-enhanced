@@ -21,6 +21,8 @@ BOOL sp_game_has_image(NSString *flavor);
 NSString *sp_game_reset(NSString *flavor);
 BOOL sp_graphics_has_backup(void);
 BOOL sp_graphics_restore(void);
+NSString *sp_hw_setting_key(NSString *key);
+NSDictionary<NSString *, NSString *> *sp_hw_settings(void);
 // The game's region and languages (spcdn.h's sp_game_region: Region, Text, Speech, Source), and Device "1"
 // when the device decides them (Settings can change it), "0" when the Mac does (Battle.net there).
 NSDictionary<NSString *, NSString *> *sp_game_region_now(NSString *flavor);

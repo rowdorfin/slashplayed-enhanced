@@ -34,6 +34,6 @@ xcrun --sdk "$SP_SDK" clang -target "$SP_TARGET" -c spguest_tlv.S -o "$TMP/spgue
 # swiftc links, so the Swift runtime (the OS's, in /usr/lib/swift) and its rpath come with it.
 xcrun --sdk "$SP_SDK" swiftc -target "$SP_TARGET" \
   -framework Foundation -framework UIKit -framework SwiftUI -framework CoreGraphics -framework QuartzCore \
-  -framework CoreText -framework Network -framework Security -lz -lc++ \
+  -framework CoreText -framework Metal -framework Network -framework Security -lz -lc++ \
   "$TMP"/*.o "$ZSIGN/$SP_PLATFORM/libzsign.a" "$ZSIGN/$SP_PLATFORM/openssl/lib/libcrypto.a" -o "$OUT" \
   -Xlinker -rpath -Xlinker @executable_path/Frameworks

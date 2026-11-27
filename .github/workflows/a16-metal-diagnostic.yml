@@ -113,6 +113,7 @@ jobs:
               "$platform/Slashplayed.app/Frameworks/libspMetal.dylib" |
               strings -a > "$RUNNER_TEMP/metal-$platform.strings"
             grep -F 'SP_BC_FALLBACK' "$RUNNER_TEMP/metal-$platform.strings" >/dev/null
+            grep -F 'SP_HARDWARE_PROFILE' "$RUNNER_TEMP/metal-$platform.strings" >/dev/null
             grep -F 'SP_A16_PROFILE session' "$RUNNER_TEMP/metal-$platform.strings" >/dev/null
             grep -Fx "$GITHUB_SHA" "$RUNNER_TEMP/metal-$platform.strings" >/dev/null
           done

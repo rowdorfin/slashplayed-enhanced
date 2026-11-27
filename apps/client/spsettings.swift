@@ -18,6 +18,7 @@
 // Acknowledgements, the licenses of what the app ships.
 import SwiftUI
 import UIKit
+import Metal  // Autolink Apple Metal for the launcher’s direct factory call.
 
 private func say(_ s: String) { sp_launch_say("start: " + s) }
 
@@ -154,6 +155,10 @@ struct Snapshot {
     }
     var saved = false
     var identity: SPIdentityReading?
+    var hardwareChoice = 0
+    var nativeHardwareProfile = false
+    var hardwareName = ""
+    var hardwareBC = "unknown"
     var scale = 0
     var chordRightFinger = false
     var thumbEnabled = true
@@ -203,6 +208,11 @@ final class Settings: ObservableObject {
 
     func reload() {
         var s = Snapshot()
+        let hardware = sp_hw_settings()
+        s.hardwareChoice = Int(hardware["requested"] ?? "") ?? 0
+        s.nativeHardwareProfile = hardware["effective"] == "native"
+        s.hardwareName = hardware["hardware"] ?? ""
+        s.hardwareBC = hardware["bc"] ?? "unknown"
         s.saved = sp_login_saved()
         if !s.saved { email = nil }
         s.identity = sp_identity_reading()
@@ -386,14 +396,32 @@ private struct DoneButton: ToolbarContent {
 
 struct SettingsView: View {
     @ObservedObject var settings: Settings
-    @AppStorage("sp_optimized_resolution") private var optimizedResolution = 0
-    @AppStorage("sp_forever_graphics_preset") private var graphicsPreset = 0
-    @AppStorage("sp_forever_thread_allocator") private var threadAllocator = 0
-    @AppStorage("sp_forever_low_priority_threads") private var lowPriorityThreads = 0
-    @AppStorage("sp_forever_cacheless_shaders") private var cachelessShaders = 0
-    @AppStorage("sp_forever_economic_preload") private var economicPreload = 0
     @State private var graphicsRestoreFailed = false
     @State private var columns: NavigationSplitViewVisibility = .all
+
+    private func hardwareInteger(_ key: String) -> Binding<Int> {
+        let scoped = sp_hw_setting_key(key)
+        return Binding(get: { UserDefaults.standard.integer(forKey: scoped) }, set: {
+            UserDefaults.standard.set($0, forKey: scoped)
+            settings.reload()
+        })
+    }
+
+    private func hardwareToggle(_ key: String) -> Binding<Bool> {
+        let scoped = sp_hw_setting_key(key)
+        return Binding(get: { UserDefaults.standard.bool(forKey: scoped) }, set: {
+            UserDefaults.standard.set($0, forKey: scoped)
+            settings.reload()
+        })
+    }
+
+    private var graphicsPreset: Binding<Int> {
+        let choice = hardwareInteger("sp_forever_graphics_preset")
+        return Binding(get: {
+            let value = choice.wrappedValue
+            return settings.now.nativeHardwareProfile && (value == 4 || value == 5) ? 0 : value
+        }, set: { choice.wrappedValue = $0 })
+    }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
@@ -695,63 +723,60 @@ struct SettingsView: View {
         return choices.sorted { $0.pixels.width < $1.pixels.width }
     }
 
-    private var display: some View {
+    @ViewBuilder private var display: some View {
         Section {
-            Toggle("Perfil A16 (experimental)", isOn: Binding(
-                get: { UserDefaults.standard.bool(forKey: "sp_a16_profile") },
-                set: {
-                    UserDefaults.standard.set($0, forKey: "sp_a16_profile")
-                    settings.reload()
-                }
-            ))
-            Toggle("Texturas BC1 compactas (experimental)", isOn: Binding(
-                get: { UserDefaults.standard.bool(forKey: "sp_bc_compact") },
-                set: {
-                    UserDefaults.standard.set($0, forKey: "sp_bc_compact")
-                    settings.reload()
-                }
-            ))
-            Picker("Rastreio de alocações (diagnóstico)", selection: Binding(
-                get: { UserDefaults.standard.integer(forKey: "sp_alloc_trace") },
-                set: {
-                    UserDefaults.standard.set($0, forKey: "sp_alloc_trace")
-                    settings.reload()
-                }
-            )) {
-                Text("Desligado").tag(0)
-                Text("Guest").tag(1)
-                Text("Guest + processo (indisponível nesta versão)").tag(2)
+            Picker("Perfil de hardware", selection: Binding(get: { settings.now.hardwareChoice }, set: {
+                UserDefaults.standard.set($0, forKey: "sp_hw_profile")
+                settings.reload()
+            })) {
+                Text("Automático (padrão)").tag(0)
+                Text("Nativo").tag(1)
+                Text("Compatibilidade A16").tag(2)
             }
-            Picker("Limiar do rastreio de alocações", selection: Binding(
-                get: { UserDefaults.standard.integer(forKey: "sp_alloc_trace_min_kib") == 1024 ? 1024 : 256 },
-                set: {
-                    UserDefaults.standard.set($0, forKey: "sp_alloc_trace_min_kib")
-                    settings.reload()
-                }
-            )) {
-                Text("256 KiB").tag(256)
-                Text("1024 KiB").tag(1024)
+            LabeledContent("Dispositivo", value: settings.now.hardwareName)
+            LabeledContent("Perfil efetivo", value: settings.now.nativeHardwareProfile ? "Nativo" : "Compatibilidade A16")
+            if settings.now.hardwareBC != "yes" {
+                Text(settings.now.hardwareBC == "no"
+                     ? "Nativo indisponível porque a GPU não oferece suporte nativo a texturas BC."
+                     : "Nativo indisponível porque o Metal não informou o suporte a texturas BC.")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
-            Picker("Orçamento gráfico (experimental)", selection: Binding(
-                get: { UserDefaults.standard.integer(forKey: "sp_gpu_working_set_mib") },
-                set: {
-                    UserDefaults.standard.set($0, forKey: "sp_gpu_working_set_mib")
-                    settings.reload()
+        }
+        if !settings.now.nativeHardwareProfile {
+            Section {
+                Toggle("Perfil A16 (experimental)", isOn: hardwareToggle("sp_a16_profile"))
+                Toggle("Texturas BC1 compactas (experimental)", isOn: hardwareToggle("sp_bc_compact"))
+                Picker("Rastreio de alocações (diagnóstico)", selection: hardwareInteger("sp_alloc_trace")) {
+                    Text("Desligado").tag(0)
+                    Text("Guest").tag(1)
+                    Text("Guest + processo (indisponível nesta versão)").tag(2)
                 }
-            )) {
-                Text("Real").tag(0)
-                ForEach([2048, 1536, 1024], id: \.self) { budget in
-                    Text("\(budget) MiB").tag(budget)
+                let minimum = hardwareInteger("sp_alloc_trace_min_kib")
+                Picker("Limiar do rastreio de alocações", selection: Binding(
+                    get: { minimum.wrappedValue == 1024 ? 1024 : 256 },
+                    set: { minimum.wrappedValue = $0 }
+                )) {
+                    Text("256 KiB").tag(256)
+                    Text("1024 KiB").tag(1024)
+                }
+                Picker("Orçamento gráfico (experimental)", selection: hardwareInteger("sp_gpu_working_set_mib")) {
+                    Text("Real").tag(0)
+                    ForEach([2048, 1536, 1024], id: \.self) { budget in
+                        Text("\(budget) MiB").tag(budget)
+                    }
                 }
             }
-            Picker("Game resolution", selection: $optimizedResolution) {
+        }
+        Section {
+            let resolution = hardwareInteger("sp_optimized_resolution")
+            Picker("Game resolution", selection: resolution) {
                 Text("Choose in WoW").tag(0)
                 Text("1280 px").tag(1280)
                 Text("1600 px").tag(1600)
                 Text("1688 px").tag(1688)
                 Text("Native").tag(3)
             }
-            ForEach(optimizedResolution == 0 ? displayChoices : []) { choice in
+            ForEach(resolution.wrappedValue == 0 ? displayChoices : []) { choice in
                 VStack(alignment: .leading, spacing: 4) {
                     #if os(visionOS)
                     Text(choice.dimensions + " pixels")
@@ -911,37 +936,40 @@ struct SettingsView: View {
                 LabeledContent("Region", value: sp_region_name(g.region))
             }
             if g.flavor == "forever" {
-                Picker("Preset gráfico", selection: $graphicsPreset) {
+                Picker("Preset gráfico", selection: graphicsPreset) {
                     Text("Não alterar").tag(0)
                     Text("Performance").tag(1)
                     Text("Balanceado").tag(2)
                     Text("Qualidade").tag(3)
-                    Text("A16 Performance").tag(4)
-                    Text("A16 Low Memory").tag(5)
+                    if !settings.now.nativeHardwareProfile {
+                        Text("A16 Performance").tag(4)
+                        Text("A16 Low Memory").tag(5)
+                    }
                 }
-                Picker("Alocador por thread (experimental)", selection: $threadAllocator) {
-                    Text("Padrão do cliente").tag(0)
-                    Text("Desativado").tag(1)
+                if !settings.now.nativeHardwareProfile {
+                    Picker("Alocador por thread (experimental)", selection: hardwareInteger("sp_forever_thread_allocator")) {
+                        Text("Padrão do cliente").tag(0)
+                        Text("Desativado").tag(1)
+                    }
+                    Picker("Threads de baixa prioridade (experimental)", selection: hardwareInteger("sp_forever_low_priority_threads")) {
+                        Text("Padrão do cliente").tag(0)
+                        Text("1").tag(1)
+                        Text("2").tag(2)
+                    }
+                    Picker("Shaders sem cache (experimental)", selection: hardwareInteger("sp_forever_cacheless_shaders")) {
+                        Text("Padrão do cliente").tag(0)
+                        Text("Ativo").tag(1)
+                    }
+                    Picker("Pré-carregamento econômico (experimental)", selection: hardwareInteger("sp_forever_economic_preload")) {
+                        Text("Padrão do cliente").tag(0)
+                        Text("Ativo").tag(1)
+                    }
+                    Text("Essas opções podem reduzir o FPS. Shaders sem cache e pré-carregamento econômico podem fazer objetos e texturas aparecerem de repente ou demorarem mais para aparecer pela primeira vez. Os efeitos ainda não foram medidos. Aplicadas na próxima abertura do jogo.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
-                Picker("Threads de baixa prioridade (experimental)", selection: $lowPriorityThreads) {
-                    Text("Padrão do cliente").tag(0)
-                    Text("1").tag(1)
-                    Text("2").tag(2)
-                }
-                Picker("Shaders sem cache (experimental)", selection: $cachelessShaders) {
-                    Text("Padrão do cliente").tag(0)
-                    Text("Ativo").tag(1)
-                }
-                Picker("Pré-carregamento econômico (experimental)", selection: $economicPreload) {
-                    Text("Padrão do cliente").tag(0)
-                    Text("Ativo").tag(1)
-                }
-                Text("Essas opções podem reduzir o FPS. Shaders sem cache e pré-carregamento econômico podem fazer objetos e texturas aparecerem de repente ou demorarem mais para aparecer pela primeira vez. Os efeitos ainda não foram medidos. Aplicadas na próxima abertura do jogo.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
                 Button("Restaurar configuração anterior") {
                     if sp_graphics_restore() {
-                        graphicsPreset = 0
                         settings.reload()
                     } else {
                         graphicsRestoreFailed = true

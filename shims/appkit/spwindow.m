@@ -179,8 +179,11 @@ static NSInteger sp_optimized_resolution(void) {
     }
 }
 
-// Snapshot the start screen's choice after Settings closes, before entering the guest.
+static void sp_stats_lock_profile(void);
+
+// Snapshot the start screen's choices after Settings closes, before entering the guest.
 __attribute__((visibility("default"))) NSInteger sp_lock_optimized_resolution(void) {
+    sp_stats_lock_profile();
     sp_session_resolution = sp_optimized_resolution();
     return sp_session_resolution;
 }

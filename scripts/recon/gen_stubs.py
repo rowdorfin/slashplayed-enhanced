@@ -146,6 +146,7 @@ uint32_t sp_KBGetLayoutType(int16_t kbdType) { return 'ANSI'; }
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include "../metal/spa16profile.h"
+#include "../../apps/client/sphwprofile.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -153,12 +154,17 @@ uint32_t sp_KBGetLayoutType(int16_t kbdType) { return 'ANSI'; }
 #define SP_A16_BUILD_SHA "unknown"
 #endif
 
+static bool spNativeHardwareProfile(void) {
+    const char *profile = getenv("SP_HW_PROFILE");
+    return profile && strcmp(profile, "native") == 0;
+}
+
 static bool spA16Profile(void) {
     static dispatch_once_t once;
     static bool active;
     dispatch_once(&once, ^{
         const char *value = getenv("SP_A16_PROFILE");
-        active = value && strcmp(value, "1") == 0;
+        active = !spNativeHardwareProfile() && value && strcmp(value, "1") == 0;
     });
     return active;
 }
@@ -233,24 +239,8 @@ static id sp_newLibraryWithData(id self, SEL _cmd, dispatch_data_t data, NSError
 // size changed, so a run shows whether the client is presenting at all and how it handles resizes.
 static id (*sp_nextDrawable_orig)(id, SEL);
 static _Atomic bool sp_drawable_trace;
-static id sp_nextDrawable(id self, SEL _cmd) {
+static id sp_traceDrawable(id self, id d) {
     static _Atomic uint64_t frames;
-    static _Atomic unsigned long long lastPixels;
-    static _Atomic bool reportedSize;
-    id d = sp_nextDrawable_orig(self, _cmd);
-    if (d && spA16GuestCaller(__builtin_return_address(0)) &&
-        objc_getAssociatedObject(((CAMetalLayer *)self).device, &spA16SessionDeviceKey)) {
-        id<MTLTexture> texture = [(id<CAMetalDrawable>)d texture];
-        unsigned long long pixels = ((unsigned long long)texture.width << 32) | texture.height;
-        if (pixels && atomic_exchange(&lastPixels, pixels) != pixels) {
-            const char *phase = atomic_exchange(&reportedSize, true) ? "resize" : "session";
-            NSString *line = [NSString stringWithFormat:
-                @"SP_A16_PROFILE %s build=%s real=drawable:%lux%lu",
-                phase, SP_A16_BUILD_SHA, (unsigned long)texture.width, (unsigned long)texture.height];
-            spBCLog(@"%@", line);
-        }
-    }
-    if (!atomic_load(&sp_drawable_trace)) return d;
     uint64_t n = ++frames;
     CGSize size = ((CAMetalLayer *)self).drawableSize;
     static _Atomic unsigned long long lastLayerSize;
@@ -268,8 +258,31 @@ static id sp_nextDrawable(id self, SEL _cmd) {
     return d;
 }
 
+static id sp_nextDrawableNative(id self, SEL _cmd) {
+    return sp_traceDrawable(self, sp_nextDrawable_orig(self, _cmd));
+}
+
+static id sp_nextDrawable(id self, SEL _cmd) {
+    static _Atomic unsigned long long lastPixels;
+    static _Atomic bool reportedSize;
+    id d = sp_nextDrawable_orig(self, _cmd);
+    if (d && spA16GuestCaller(__builtin_return_address(0)) &&
+        objc_getAssociatedObject(((CAMetalLayer *)self).device, &spA16SessionDeviceKey)) {
+        id<MTLTexture> texture = [(id<CAMetalDrawable>)d texture];
+        unsigned long long pixels = ((unsigned long long)texture.width << 32) | texture.height;
+        if (pixels && atomic_exchange(&lastPixels, pixels) != pixels) {
+            const char *phase = atomic_exchange(&reportedSize, true) ? "resize" : "session";
+            NSString *line = [NSString stringWithFormat:
+                @"SP_A16_PROFILE %s build=%s real=drawable:%lux%lu",
+                phase, SP_A16_BUILD_SHA, (unsigned long)texture.width, (unsigned long)texture.height];
+            spBCLog(@"%@", line);
+        }
+    }
+    return atomic_load(&sp_drawable_trace) ? sp_traceDrawable(self, d) : d;
+}
+
 static void spBCInstall(id<MTLDevice> device, Class cls);
-static void spA16Session(id<MTLDevice> device);
+static void spA16Session(id<MTLDevice> device, bool native);
 static bool spBCActive(id device);
 static bool spBCVerbose;
 static MTLSizeAndAlign spBCHeapSize(id device, SEL selector, MTLTextureDescriptor *descriptor,
@@ -298,7 +311,7 @@ static BOOL sp_metal_diag_append(int fd, const char *line, size_t len) {
     return NO;
 }
 
-static void sp_metal_diag_write(const char *line) {
+static void sp_metal_diag_record(const char *line, bool mirrorToStderr) {
     size_t len = strlen(line);
     if (!len || line[len - 1] != '\\n') return;
     os_unfair_lock_lock(&sp_metal_diag_lock);
@@ -319,7 +332,11 @@ static void sp_metal_diag_write(const char *line) {
     os_unfair_lock_unlock(&sp_metal_diag_lock);
     if (!saved) SP_LOG_ONCE("Metal diagnostic file write failed; see stderr/os_log");
     os_log(OS_LOG_DEFAULT, "[sp:Metal diag] %{public}s", line);
-    (void)write(STDERR_FILENO, line, len);
+    if (mirrorToStderr) (void)write(STDERR_FILENO, line, len);
+}
+
+static void sp_metal_diag_write(const char *line) {
+    sp_metal_diag_record(line, true);
 }
 
 static const char *sp_metal_diag_format(MTLPixelFormat format) {
@@ -487,6 +504,17 @@ static void spBCLog(NSString *format, ...) {
 static void sp_prepare_metal_device(id<MTLDevice> device, bool observer) {
     if (!device) return;
     Class cls = object_getClass(device);
+    if (spNativeHardwareProfile()) {
+        static dispatch_once_t native_once;
+        dispatch_once(&native_once, ^{
+#if SP_METAL_DIAG
+            sp_open_metal_diag();
+            sp_install_metal_diag(device, cls, false);
+#endif
+            spA16Session(device, true);
+        });
+        return;
+    }
     bool sizing = observer || spA16Profile() ||
         ([device respondsToSelector:@selector(supportsBCTextureCompression)] && !device.supportsBCTextureCompression);
 #if SP_METAL_DIAG
@@ -502,7 +530,7 @@ static void sp_prepare_metal_device(id<MTLDevice> device, bool observer) {
 #endif
     static dispatch_once_t bc_once;
     dispatch_once(&bc_once, ^{
-        spA16Session(device);
+        spA16Session(device, false);
         spBCInstall(device, cls);
         Method drawable = class_getInstanceMethod(NSClassFromString(@"CAMetalLayer"), @selector(nextDrawable));
         if (drawable) {
@@ -538,7 +566,15 @@ id<MTLDevice> sp_MTLCreateSystemDefaultDevice(void) {
 static void sp_add_device_props(id dev) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        atomic_store(&sp_drawable_trace, true);
+        if (spNativeHardwareProfile()) {
+            Method drawable = class_getInstanceMethod(NSClassFromString(@"CAMetalLayer"), @selector(nextDrawable));
+            if (drawable) {
+                sp_nextDrawable_orig = (void *)method_getImplementation(drawable);
+                method_setImplementation(drawable, (IMP)sp_nextDrawableNative);
+            }
+        } else {
+            atomic_store(&sp_drawable_trace, true);
+        }
         Class c = object_getClass(dev);
         Method m = class_getInstanceMethod(c, @selector(newLibraryWithData:error:));
         sp_newLibraryWithData_orig = (void *)method_setImplementation(m, (IMP)sp_newLibraryWithData);
@@ -566,7 +602,7 @@ static void sp_add_device_props(id dev) {
 CFArrayRef sp_MTLCopyAllDevicesWithObserver(void **observer, id handler) {
     id<MTLDevice> dev = sp_MTLCreateSystemDefaultDevice();
     if (dev) {
-        sp_prepare_metal_device(dev, true);
+        if (!spNativeHardwareProfile()) sp_prepare_metal_device(dev, true);
         sp_add_device_props(dev);
     }
     sp_stub_log([NSString stringWithFormat:@"MTLCopyAllDevicesWithObserver: %@", dev.name].UTF8String);

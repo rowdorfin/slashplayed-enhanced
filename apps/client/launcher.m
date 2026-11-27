@@ -58,6 +58,7 @@
 #import "spaddons.h"
 #import "spsign.h"
 #include "spmemory.h"
+#include "sphwprofile.h"
 
 static void say(NSString *s) {
     fprintf(stderr, "[sp:launch] %s\n", s.UTF8String);
@@ -259,6 +260,101 @@ static NSString *const graphicsChoiceKey = @"sp_forever_graphics_preset";
 static NSString *const graphicsAppliedKey = @"sp_forever_graphics_applied";
 static NSString *const graphicsSessionKey = @"sp_forever_graphics_session";
 
+static char hardwareMachine[128];
+static NSString *hardwareGPU;
+static SPHardwareCapabilities hardwareCaps;
+
+static void hardware_detect(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // The executable links Apple Metal. The guest shim is opened only at preflight.
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        hardwareGPU = device.name ?: @"unknown";
+        size_t length = sizeof hardwareMachine;
+        if (sysctlbyname("hw.machine", hardwareMachine, &length, NULL, 0) != 0)
+            strcpy(hardwareMachine, "unknown");
+        hardwareCaps.hasBC = [device respondsToSelector:@selector(supportsBCTextureCompression)];
+        hardwareCaps.bc = hardwareCaps.hasBC && device.supportsBCTextureCompression;
+        hardwareCaps.apple2 = [device supportsFamily:MTLGPUFamilyApple2];
+        hardwareCaps.apple7 = [device supportsFamily:MTLGPUFamilyApple7];
+        hardwareCaps.apple8 = [device supportsFamily:MTLGPUFamilyApple8];
+        hardwareCaps.apple9 = [device supportsFamily:MTLGPUFamilyApple9];
+        hardwareCaps.mac2 = [device supportsFamily:MTLGPUFamilyMac2];
+    });
+}
+
+static SPHardwareSelection hardware_selection(void) {
+    hardware_detect();
+    return sp_hw_select([NSUserDefaults.standardUserDefaults integerForKey:@"sp_hw_profile"], hardwareCaps);
+}
+
+static NSString *hardware_key(enum SPHardwareProfile profile, NSString *key) {
+    return [NSString stringWithFormat:@"sp_hw_%s_%@", sp_hw_name(profile), key];
+}
+
+static NSArray<NSString *> *hardware_experiment_keys(void) {
+    return @[@"sp_a16_profile", @"sp_bc_compact", @"sp_gpu_working_set_mib", @"sp_alloc_trace",
+             @"sp_alloc_trace_min_kib", @"sp_forever_thread_allocator", @"sp_forever_low_priority_threads",
+             @"sp_forever_cacheless_shaders", @"sp_forever_economic_preload"];
+}
+
+static NSArray<NSString *> *hardware_scoped_keys(void) {
+    return [hardware_experiment_keys() arrayByAddingObjectsFromArray:@[graphicsChoiceKey, @"sp_optimized_resolution"]];
+}
+
+static void hardware_migrate(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if ([defaults integerForKey:@"sp_hw_profile_schema"] >= 1) return;
+    for (NSString *key in hardware_scoped_keys()) {
+        NSString *scoped = hardware_key(SP_HW_A16, key);
+        id value = [defaults objectForKey:key];
+        if (value && ![defaults objectForKey:scoped]) [defaults setObject:value forKey:scoped];
+    }
+    [defaults setInteger:1 forKey:@"sp_hw_profile_schema"];
+}
+
+static void hardware_project(SPHardwareSelection selection) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    BOOL native = selection.effective == SP_HW_NATIVE;
+    NSArray<NSString *> *experiments = hardware_experiment_keys();
+    for (NSString *key in hardware_scoped_keys()) {
+        id value = [defaults objectForKey:hardware_key(selection.effective, key)];
+        if (native && ([experiments containsObject:key] ||
+                       ([key isEqualToString:graphicsChoiceKey] &&
+                        sp_graphics_is_a16((enum SPGraphicsPreset)[value integerValue]))))
+            value = nil;
+        if (value) [defaults setObject:value forKey:key];
+        else [defaults removeObjectForKey:key];
+    }
+}
+
+NSString *sp_hw_setting_key(NSString *key) {
+    return hardware_key(hardware_selection().effective, key);
+}
+
+NSDictionary<NSString *, NSString *> *sp_hw_settings(void) {
+    SPHardwareSelection selection = hardware_selection();
+    return @{@"requested": [@(selection.requested) stringValue],
+             @"effective": @(sp_hw_name(selection.effective)),
+             @"hardware": [NSString stringWithFormat:@"%s · %@", hardwareMachine, hardwareGPU],
+             @"bc": hardwareCaps.hasBC ? (hardwareCaps.bc ? @"yes" : @"no") : @"unknown"};
+}
+
+static const char *hardware_backend(void) {
+    const char *simulate = getenv("SP_A16_PROFILE");
+    const char *compact = getenv("SP_BC_COMPACT");
+    return sp_hw_backend(simulate && !strcmp(simulate, "1"), hardwareCaps, compact && !strcmp(compact, "1"));
+}
+
+static void hardware_log(SPHardwareSelection selection) {
+    say([NSString stringWithFormat:
+        @"SP_HARDWARE_PROFILE requested=%d effective=%s reason=%s hw.machine=%s GPU=\"%@\" BC=%s "
+         @"Apple7=%d Apple8=%d Apple9=%d Mac2=%d textureBackend=%s",
+        selection.requested, sp_hw_name(selection.effective), selection.reason, hardwareMachine, hardwareGPU,
+        hardwareCaps.hasBC ? (hardwareCaps.bc ? "1" : "0") : "n/a", hardwareCaps.apple7, hardwareCaps.apple8,
+        hardwareCaps.apple9, hardwareCaps.mac2, hardware_backend()]);
+}
+
 static NSString *graphics_name(NSInteger preset) {
     NSArray<NSString *> *names = @[@"keep", @"performance", @"balanced", @"quality",
                                    @"a16-performance", @"a16-low-memory"];
@@ -388,7 +484,9 @@ done:
 }
 
 BOOL sp_graphics_restore(void) {
-    return graphics_config(SP_GRAPHICS_KEEP, @"restore");
+    if (!graphics_config(SP_GRAPHICS_KEEP, @"restore")) return NO;
+    [NSUserDefaults.standardUserDefaults setInteger:SP_GRAPHICS_KEEP forKey:sp_hw_setting_key(graphicsChoiceKey)];
+    return YES;
 }
 
 static NSString *memory_backup_path(NSString *flavor, size_t key) {
@@ -482,17 +580,10 @@ static id<MTLDevice> preflight_device(NSString *bundle) {
     return device;
 }
 
-static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger resolution, BOOL found, NSDictionary *memory,
-                           void (^pump)(double)) {
-    char machine[128] = {0};
-    size_t length = sizeof machine;
-    if (sysctlbyname("hw.machine", machine, &length, NULL, 0) != 0) strcpy(machine, "unknown");
-    BOOL haveBC = [device respondsToSelector:@selector(supportsBCTextureCompression)];
-    BOOL nativeBC = haveBC && device.supportsBCTextureCompression;
-    const char *profileEnv = getenv("SP_A16_PROFILE");
-    BOOL profile = profileEnv && strcmp(profileEnv, "1") == 0;
-    // Same condition as spBCShouldEnable in spbcfallback.m.
-    NSString *backend = profile || (haveBC && !nativeBC) ? @"bc-fallback" : @"bc-native";
+static void show_preflight(SPHardwareSelection selection, NSInteger preset, NSInteger resolution, BOOL found,
+                           NSDictionary *memory, void (^pump)(double)) {
+    const char *backend = hardware_backend();
+    BOOL native = selection.effective == SP_HW_NATIVE;
     NSString *width = resolution == 3 ? @"native" : resolution ? [@(resolution) stringValue] : @"game";
     NSDictionary *requested = graphics_requested(preset);
     const char *configRender = getenv("SP_CONFIG_RENDER_SCALE");
@@ -504,9 +595,9 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     const char *budgetEnv = getenv("SP_GPU_WORKING_SET_MIB");
     NSString *budget = budgetEnv ? [NSString stringWithFormat:@"%s MiB", budgetEnv] : @"real";
     graphics_log([NSString stringWithFormat:
-        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s SP_ALLOC_TRACE=%s SP_ALLOC_TRACE_MIN_KIB=%s ThreadPoolPerThreadAllocator=%@ ThreadPoolLimitLP=%@ "
+        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%s profile=%s preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s SP_ALLOC_TRACE=%s SP_ALLOC_TRACE_MIN_KIB=%s ThreadPoolPerThreadAllocator=%@ ThreadPoolLimitLP=%@ "
          @"GxAllowCachelessShaderMode=%@ worldPreloadNonCritical=%@ worldPreloadHighResTextures=%@",
-        machine, device.name ?: @"unknown", nativeBC, backend, profile ? @"a16" : @"native",
+        hardwareMachine, hardwareGPU, hardwareCaps.bc, backend, sp_hw_name(selection.effective),
         graphics_name(preset), width, render, textures, found ? @"found" : @"missing", compact, budgetEnv ?: "0", allocTrace, allocMin,
         memory[@"ThreadPoolPerThreadAllocator"] ?: @"client-default", memory[@"ThreadPoolLimitLP"] ?: @"client-default",
         memory[@"GxAllowCachelessShaderMode"] ?: @"client-default",
@@ -530,9 +621,9 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     notice.numberOfLines = 0;
     notice.lineBreakMode = NSLineBreakByWordWrapping;
     notice.userInteractionEnabled = NO;
-    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · Orçamento %@\nRastreio %s · Limiar %s KiB\nAlocador por thread %@ · Threads LP %@\n"
+    notice.text = [NSString stringWithFormat:@"%@ · %s · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · Orçamento %@\nRastreio %s · Limiar %s KiB\nAlocador por thread %@ · Threads LP %@\n"
                     @"Shaders sem cache %@\nPré-carregamento econômico %@",
-                   backend, graphics_name(preset), width, render, textures, compact ? @"on" : @"off",
+                   native ? @"Nativo" : @"Compatibilidade A16", backend, graphics_name(preset), width, render, textures, compact ? @"on" : @"off",
                    budget, allocTrace, allocMin,
                    memory[@"ThreadPoolPerThreadAllocator"] ?: @"client-default", memory[@"ThreadPoolLimitLP"] ?: @"client-default",
                    [memory[@"GxAllowCachelessShaderMode"] isEqual:@"1"] ? @"ativo" : @"padrão",
@@ -552,7 +643,7 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     pump(0.1);  // Give UIKit a frame before guest loading takes the main thread.
 }
 
-static NSInteger graphics_preset(NSString *flavor) {
+static NSInteger graphics_preset(NSString *flavor, bool native) {
     if (![flavor isEqualToString:@"forever"]) return SP_GRAPHICS_KEEP;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *path = config_wtf_path(flavor);
@@ -567,6 +658,11 @@ static NSInteger graphics_preset(NSString *flavor) {
     NSInteger preset = [defaults integerForKey:graphicsChoiceKey];
     NSDictionary *requested = graphics_requested(preset);
     if (!requested.count) {
+        if (sp_graphics_restore_on_native_keep(native, (enum SPGraphicsPreset)preset,
+                (enum SPGraphicsPreset)[defaults integerForKey:graphicsAppliedKey], sp_graphics_has_backup())) {
+            graphics_config(SP_GRAPHICS_KEEP, @"native-restore");
+            return SP_GRAPHICS_KEEP;
+        }
         [defaults setObject:@{} forKey:graphicsSessionKey];
         return SP_GRAPHICS_KEEP;
     }
@@ -1097,6 +1193,7 @@ int main(int argc, char **argv) {
     NSString *sys = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/libspSystem.dylib"];
     void *systemShim = dlopen(sys.fileSystemRepresentation, RTLD_NOW);
     if (!systemShim) say([NSString stringWithFormat:@"no console log: %s", dlerror()]);
+    hardware_migrate();
     delete_listed();
     write_free_space();
     NSString *forgot = sp_identity_forget_if_asked();
@@ -1227,23 +1324,34 @@ int main(int argc, char **argv) {
                   [NSHomeDirectory() stringByAppendingPathComponent:@"Library/spnetbattle.plist"]];
 
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    if ([defaults boolForKey:@"sp_a16_profile"])
+    // Settings can change the request while UIKit runs. Publish the final choice and legacy keys
+    // before AppKit locks the resolution and before Metal's constructor or factory can read them.
+    SPHardwareSelection hardware = hardware_selection();
+    hardware_project(hardware);
+    BOOL native = hardware.effective == SP_HW_NATIVE;
+    setenv("SP_HW_PROFILE", sp_hw_name(hardware.effective), 1);
+    setenv("SP_HW_PROFILE_REQUESTED", [@(hardware.requested) stringValue].UTF8String, 1);
+    setenv("SP_HW_PROFILE_REASON", hardware.reason, 1);
+    if (!native && (sp_hw_force_a16(hardware, hardwareCaps) || [defaults boolForKey:@"sp_a16_profile"]))
         setenv("SP_A16_PROFILE", "1", 1);
-    if ([defaults boolForKey:@"sp_bc_compact"])
+    else
+        unsetenv("SP_A16_PROFILE");
+    if (!native && [defaults boolForKey:@"sp_bc_compact"])
         setenv("SP_BC_COMPACT", "1", 1);
     else
         unsetenv("SP_BC_COMPACT");
     NSInteger allocTrace = [defaults integerForKey:@"sp_alloc_trace"];
-    if (allocTrace == 1 || allocTrace == 2)
+    if (!native && (allocTrace == 1 || allocTrace == 2))
         setenv("SP_ALLOC_TRACE", allocTrace == 1 ? "1" : "2", 1);
     else
         unsetenv("SP_ALLOC_TRACE");
     setenv("SP_ALLOC_TRACE_MIN_KIB", [defaults integerForKey:@"sp_alloc_trace_min_kib"] == 1024 ? "1024" : "256", 1);
     NSInteger gpuBudget = [defaults integerForKey:@"sp_gpu_working_set_mib"];
-    if (gpuBudget == 2048 || gpuBudget == 1536 || gpuBudget == 1024)
+    if (!native && (gpuBudget == 2048 || gpuBudget == 1536 || gpuBudget == 1024))
         setenv("SP_GPU_WORKING_SET_MIB", [@(gpuBudget) stringValue].UTF8String, 1);
     else
         unsetenv("SP_GPU_WORKING_SET_MIB");
+    hardware_log(hardware);
     setenv("SP_SYSTEM_FLAVOR", [NSString stringWithFormat:@"_%@_", flavor].UTF8String, 1);
     NSString *appkit = [dir stringByAppendingPathComponent:@"Frameworks/libspAppKit.dylib"];
     // Game data a copy left incomplete first, so nobody signs in to then be told. Then the sign-in, so the
@@ -1264,12 +1372,13 @@ int main(int argc, char **argv) {
     void *ak = dlopen(appkit.fileSystemRepresentation, RTLD_NOW);
     NSInteger (*lockResolution)(void) = ak ? (NSInteger (*)(void))dlsym(ak, "sp_lock_optimized_resolution") : NULL;
     NSInteger resolution = lockResolution ? lockResolution() : 0;
-    __attribute__((objc_precise_lifetime)) id<MTLDevice> device = preflight_device(dir);
+    __attribute__((objc_precise_lifetime)) id<MTLDevice> preflightDevice = preflight_device(dir);
+    (void)preflightDevice;
     if (systemShim && getenv("SP_ALLOC_TRACE")) {
         void (*configureAllocationTrace)(void) = dlsym(systemShim, "sp_alloc_configure");
         if (configureAllocationTrace) configureAllocationTrace();
     }
-    NSInteger preset = graphics_preset(flavor);
+    NSInteger preset = graphics_preset(flavor, native);
     NSDictionary *memory = memory_config(flavor);
     default_render_scale(flavor);
     BOOL missingResolutionConfig;
@@ -1291,7 +1400,7 @@ int main(int argc, char **argv) {
     void (^preflightPump)(double) = sp_launch_uikit();
     if (loading) loading(sp_flavor_name(flavor).UTF8String);
     else say([NSString stringWithFormat:@"no loading screen: %s", dlerror()]);
-    show_preflight(device, preset, resolution, resolutionConfig && !missingResolutionConfig, memory, preflightPump);
+    show_preflight(hardware, preset, resolution, resolutionConfig && !missingResolutionConfig, memory, preflightPump);
     if (token) {
         void (*import)(void) = ak ? (void (*)(void))dlsym(ak, "sp_net_battle_import") : NULL;
         if (import) import();

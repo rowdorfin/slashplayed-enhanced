@@ -17,6 +17,11 @@ static bool sp_graphics_is_a16(enum SPGraphicsPreset preset) {
     return preset == SP_GRAPHICS_A16 || preset == SP_GRAPHICS_A16_LOW_MEMORY;
 }
 
+static inline bool sp_graphics_restore_on_native_keep(bool native, enum SPGraphicsPreset choice,
+                                                       enum SPGraphicsPreset applied, bool hasBackup) {
+    return native && choice == SP_GRAPHICS_KEEP && hasBackup && sp_graphics_is_a16(applied);
+}
+
 typedef struct {
     const char *name;
     const char *value;

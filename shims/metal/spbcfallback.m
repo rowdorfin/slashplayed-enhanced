@@ -1901,12 +1901,13 @@ static void spBCInstallMemoryQueries(Class cls) {
 // The launcher calls this at preflight when the cap is enabled, including on
 // native BC devices that skip the fallback install.
 __attribute__((visibility("default"))) void sp_install_metal_memory_queries(id<MTLDevice> device) {
-    spBCInstallMemoryQueries(object_getClass(device));
+    if (!spNativeHardwareProfile()) spBCInstallMemoryQueries(object_getClass(device));
 }
 
 // Foundation may be queried before the guest requests its Metal device.
 __attribute__((constructor)) static void spBCEarlyMemoryQuery(void) {
-    // The launcher can enable the profile after loading a shim.
+    // The launcher publishes the session profile before loading this shim.
+    if (spNativeHardwareProfile()) return;
     const char *profile = getenv("SP_A16_PROFILE");
     if (profile && strcmp(profile, "1") == 0) {
         @autoreleasepool { spBCInstallPhysicalMemoryQuery(); }
@@ -1953,8 +1954,8 @@ static bool spBCCompactRequested(id<MTLDevice> device) {
     const char *flag = getenv("SP_BC_COMPACT");
     return flag && strcmp(flag, "1") == 0 && [device supportsFamily:MTLGPUFamilyApple2];
 }
-static void spA16Session(id<MTLDevice> device) {
-    bool profile = spA16Profile();
+static void spA16Session(id<MTLDevice> device, bool native) {
+    bool profile = !native && spA16Profile();
     char machine[128] = "unknown";
     size_t machineSize = sizeof machine;
     if (sysctlbyname("hw.machine", machine, &machineSize, NULL, 0) != 0)
@@ -1968,9 +1969,20 @@ static void spA16Session(id<MTLDevice> device) {
     uint64_t footprint = 0;
     bool measured = spA16Footprint(&footprint);
     size_t available = os_proc_available_memory();
-    const char *backend = "bc-native";
-    if (spBCShouldEnable(device))
-        backend = spBCCompactRequested(device) ? "bc-fallback-rgba8+astc-bc1" : "bc-fallback-rgba8";
+    SPHardwareCapabilities caps = {.hasBC = haveBC, .bc = nativeBC,
+        .apple2 = [device supportsFamily:MTLGPUFamilyApple2]};
+    const char *backend = sp_hw_backend(profile, caps, !native && spBCCompactRequested(device));
+#if SP_METAL_DIAG
+    // The launcher already wrote the console copy. Keep one record in each log.
+    NSString *hardware = [NSString stringWithFormat:
+        @"SP_HARDWARE_PROFILE requested=%s effective=%s reason=%s hw.machine=%s GPU=\"%@\" BC=%s "
+             @"Apple7=%d Apple8=%d Apple9=%d Mac2=%d textureBackend=%s\n",
+            getenv("SP_HW_PROFILE_REQUESTED") ?: "0",
+            getenv("SP_HW_PROFILE") ?: (profile || (haveBC && !nativeBC) ? "a16" : "native"),
+            getenv("SP_HW_PROFILE_REASON") ?: "legacy-default", machine, device.name, haveBC ? (nativeBC ? "1" : "0") : "n/a",
+            apple7, apple8, apple9, mac2, backend];
+    sp_metal_diag_record(hardware.UTF8String, false);
+#endif
     NSString *line = [NSString stringWithFormat:
         @"SP_A16_PROFILE session build=%s profile=%s textureBackend=%s "
         @"real={hw.machine=%s device=\"%@\" Apple7=%d Apple8=%d Apple9=%d Mac2=%d BC=%s "
@@ -1985,7 +1997,7 @@ static void spA16Session(id<MTLDevice> device) {
         !profile && !haveBC ? "n/a" : spA16EffectiveBC(profile, nativeBC) ? "1" : "0",
         profile ? "4096" : "off"];
     spBCLog(@"%@", line);
-    objc_setAssociatedObject(device, &spA16SessionDeviceKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!native) objc_setAssociatedObject(device, &spA16SessionDeviceKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (profile) spBCLog(@"SP_A16_PROFILE mem%@", spA16BudgetFields(footprint, measured));
 }
 

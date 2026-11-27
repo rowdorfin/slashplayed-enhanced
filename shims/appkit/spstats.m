@@ -38,7 +38,31 @@ static uint64_t sp_stats_gpu_sum, sp_stats_cbs, sp_stats_bc_cbs, sp_stats_bc_sum
 static void (*sp_stats_commit_orig)(id, SEL);
 static const void *sp_stats_bc_key;
 
+static atomic_bool sp_stats_native;
+static _Atomic uint64_t sp_stats_native_frames, sp_stats_native_last, sp_stats_native_slow, sp_stats_native_worst;
+static _Atomic uint64_t sp_stats_native_gpu, sp_stats_native_cbs;
+
+static void sp_stats_lock_profile(void) {
+    const char *profile = getenv("SP_HW_PROFILE");
+    atomic_store_explicit(&sp_stats_native, profile && !strcmp(profile, "native"), memory_order_relaxed);
+}
+
+static bool sp_stats_is_native(void) {
+    return atomic_load_explicit(&sp_stats_native, memory_order_relaxed);
+}
+
 static void sp_stats_frame(void) {
+    if (sp_stats_is_native()) {
+        sp_stats_native_frames++;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint64_t last = atomic_exchange(&sp_stats_native_last, now);
+        if (!last) return;
+        uint64_t gap = now - last;
+        if (gap > 50000000) sp_stats_native_slow++;
+        uint64_t worst = sp_stats_native_worst;
+        while (gap > worst && !atomic_compare_exchange_weak(&sp_stats_native_worst, &worst, gap)) {}
+        return;
+    }
     os_unfair_lock_lock(&sp_stats_lock);
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     sp_stats_frames++;
@@ -73,13 +97,23 @@ static void sp_stats_commit(id<MTLCommandBuffer> cb, SEL _cmd) {
 }
 
 // Called from sp_hover_attach with the device's command buffer class, the same one the client's are.
+static void sp_stats_commit_native(id<MTLCommandBuffer> cb, SEL _cmd) {
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        CFTimeInterval seconds = done.GPUEndTime - done.GPUStartTime;
+        if (seconds > 0 && seconds < 10) sp_stats_native_gpu += (uint64_t)(seconds * 1e9);
+        sp_stats_native_cbs++;
+    }];
+    sp_stats_commit_orig(cb, _cmd);
+}
+
 static void sp_stats_hook_gpu(Class c) {
     static BOOL done;
     Method m = done ? NULL : class_getInstanceMethod(c, @selector(commit));
     if (!m) return;
     done = YES;
-    sp_stats_bc_key = sel_registerName(SP_BC_UPLOAD_CB_KEY);
-    sp_stats_commit_orig = (void *)method_setImplementation(m, (IMP)sp_stats_commit);
+    bool native = sp_stats_is_native();
+    if (!native) sp_stats_bc_key = sel_registerName(SP_BC_UPLOAD_CB_KEY);
+    sp_stats_commit_orig = (void *)method_setImplementation(m, native ? (IMP)sp_stats_commit_native : (IMP)sp_stats_commit);
 }
 
 // CPU use of the process (100 = one core), and its busiest three threads, from the scheduler's
@@ -139,6 +173,18 @@ static void sp_stats_line(void) {
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     double secs = (now - sp_stats_window_start) / 1e9;
     sp_stats_window_start = now;
+    if (sp_stats_is_native()) {
+        os_unfair_lock_unlock(&sp_stats_lock);
+        uint64_t frames = atomic_exchange(&sp_stats_native_frames, 0);
+        uint64_t slow = atomic_exchange(&sp_stats_native_slow, 0);
+        uint64_t worst = atomic_exchange(&sp_stats_native_worst, 0);
+        uint64_t gpu = atomic_exchange(&sp_stats_native_gpu, 0);
+        uint64_t cbs = atomic_exchange(&sp_stats_native_cbs, 0);
+        sp_stats_say([NSString stringWithFormat:@"stats: %.1f fps, worst %llu ms, %llu over 50 ms | gpu %.0f%% (%.1f ms/frame, "
+                     "%llu buffers) | %@ | %@", frames / secs, worst / 1000000, slow, gpu / (secs * 1e7),
+                     frames ? gpu / 1e6 / frames : 0.0, cbs, sp_stats_cpu(), sp_stats_state()].UTF8String);
+        return;
+    }
     uint64_t frames = sp_stats_frames, gpu = sp_stats_gpu.busy, cbs = sp_stats_cbs;
     uint64_t sum = sp_stats_gpu_sum, evicted = sp_stats_gpu.evicted, clipped = sp_stats_gpu_clipped;
     uint64_t bcCbs = sp_stats_bc_cbs, bcSum = sp_stats_bc_sum;
@@ -277,6 +323,7 @@ static uint64_t sp_stats_malloc_zones(const char *phase, unsigned long long warn
 }
 
 static void sp_stats_memory_sample(const char *phase, unsigned long long warning) {
+    if (sp_stats_is_native()) return;
     uint64_t mallocLarge = sp_stats_vm_tags(phase, warning);
     uint64_t zoneInUse = sp_stats_malloc_zones(phase, warning);
     void (*sample)(uint64_t, uint64_t, bool) = dlsym(RTLD_DEFAULT, "sp_alloc_sample");
@@ -364,7 +411,8 @@ static void sp_stats_start(void) {
         NSString *what = events[name];
         [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:nil
                                                     usingBlock:^(NSNotification *note) {
-            if ([name isEqualToString:UIApplicationDidReceiveMemoryWarningNotification]) sp_stats_memory_warning();
+            if ([name isEqualToString:UIApplicationDidReceiveMemoryWarningNotification] && !sp_stats_is_native())
+                sp_stats_memory_warning();
             sp_stats_say([NSString stringWithFormat:@"lifecycle: %@ | %@%@", what, sp_stats_state(),
                          [thermal containsObject:name] ? @"" : sp_stats_scenes()].UTF8String);
         }];

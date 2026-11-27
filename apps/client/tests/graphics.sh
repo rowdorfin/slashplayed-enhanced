@@ -10,3 +10,5 @@ else
 fi
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror "$@" graphics.c -o "$output/graphics"
 "$output/graphics"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror "$@" hwprofile.c -o "$output/hwprofile"
+"$output/hwprofile"
