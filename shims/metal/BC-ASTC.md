@@ -1,14 +1,13 @@
 # BC to ASTC 4×4 proof of concept
 
-This experiment stays in the host tests. The current Metal allocator has to pick
+The original experiment ran in the host tests. The Metal allocator has to pick
 a format before it sees the first upload. BC1 RGBA descriptors give no
 opacity guarantee, and choosing ASTC after seeing only the first upload would
 miss punch-through blocks in later mips or partial updates. The direct
 punch-through mode preserves alpha but changes transparent black, which can
-affect unpremultiplied sampling and bilinear filtering. BC1 with an external
-opacity guarantee is a candidate for a future device experiment. Keep other
-textures on RGBA8 until a quality policy and a way to classify the whole
-texture are available.
+affect unpremultiplied sampling and bilinear filtering. The original experiment
+proposed testing BC1 with an external opacity guarantee. The runtime
+pilot and its risk decision are described in [T009-I](#t009-i-bc1-direto-no-runtime).
 
 ## Block budget and measurements
 
@@ -114,6 +113,98 @@ c++ -O3 -std=c++17 -Ishims/metal -I"$arm/Source" shims/metal/tests/bench_bc_astc
   that recognizes the flag, `DEVICECTL_CHILD_SP_BC_ASTC=1 apps/client/run.sh`
   uses the existing debug launch mechanism, which passes the staged child
   environment via `xcrun devicectl`
-  ([run.sh](../../apps/client/run.sh#L58)). The current code has no ASTC flag.
-  An iPad run would still need to validate the Metal calls, texture views,
+  ([run.sh](../../apps/client/run.sh#L58)). That flag was a proposal for the PoC.
+  An iPad run still needs to validate the Metal calls, texture views,
   filtering, GPU timings, and change in actual allocated memory.
+
+## T009-I: BC1 direto no runtime
+
+1. **Mips, caminho existente no fallback.** BC nativo e ASTC LDR têm
+   filtragem, e o blit de mipmaps exige também um formato renderizável.
+   Porém, `newTexture` aloca com o descriptor físico. Para BC1, esse
+   descriptor leva RGBA8 linear ou sRGB e preserva usage e níveis. O shim
+   guarda o formato BC solicitado em metadados. Antes do delta 1,
+   `spBCGenerateMipmaps` encaminhava o objeto ao Metal sem consultar
+   esses metadados. Assim, uma
+   textura solicitada como BC1, fisicamente RGBA8, com mais de um mip,
+   pode receber mipmaps gerados no fallback. O mascaramento de formato
+   para o cliente não altera o backing que executa o blit. A contagem de
+   níveis no histograma indica alocação e não distingue upload de geração.
+   O código demonstra a possibilidade, e a frequência no jogo permanece
+   desconhecida. Recusar esse blit numa textura compacta poderia deixar
+   níveis sem os dados que o jogo espera. [Criação](spbcfallback.m#L1206),
+   [metadados](spbcfallback.m#L1054), [mapeamento](spbcdecode.c#L28),
+   [hook de mipmaps](spbcfallback.m#L1770),
+   [requisitos Metal](https://developer.apple.com/documentation/metal/mtlblitcommandencoder/generatemipmaps%28for%3A%29),
+   [capacidades](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf).
+2. **Uploads, grade confirmada.** Os dois `replaceRegion` e os dois uploads
+   buffer → textura passam por `SPBCMakeLayout`. X/Y começam em múltiplos
+   de quatro. Um tamanho parcial termina na borda do mip, inclusive quando
+   o chamador arredonda o tamanho dentro do mesmo número de blocos. O
+   layout valida pitches e, no blit, o shim confere o fim contra o tamanho
+   do buffer. As divisões internas do tiler são múltiplos de quatro e o
+   último tile herda a borda. Slices e níveis são encaminhados
+   individualmente. Cada bloco BC1 tem todos os dados para um bloco ASTC
+   4×4, sem ler texels vizinhos. No destino ASTC, o tiler calcula
+   os pitches e tamanhos por linhas de blocos.
+   [Replace](spbcfallback.m#L844), [blit](spbcfallback.m#L1527),
+   [slices e níveis](spbcfallback.m#L1629), [layout e tiles](spbclayout.c#L70),
+   [regiões comprimidas no Metal](https://developer.apple.com/documentation/metal/mtltexture/replace%28region%3Amipmaplevel%3Awithbytes%3Abytesperrow%3A%29).
+3. **Readback, rejeição confirmada.** Ambos os `getBytes` do cliente
+   rejeitam readback nas texturas convertidas, e ambos os blits textura →
+   buffer rejeitam pela presença de metadados BC. As mesmas verificações
+   cobrem o backing ASTC com esses metadados.
+   [Readback CPU](spbcfallback.m#L927), [readback por blit](spbcfallback.m#L1755).
+4. **Views, compatibilidade confirmada.** Os quatro seletores aceitam
+   apenas o mesmo `SPBCKind` e escolhem a variante linear ou sRGB do
+   backing da textura.
+   O Metal admite views entre as duas variantes do mesmo formato
+   comprimido. ASTC 4×4 LDR e sRGB podem compartilhar o backing, sujeitos
+   às regras Metal de usage e da view solicitada.
+   [Views do shim](spbcfallback.m#L965),
+   [compatibilidade Metal](https://developer.apple.com/documentation/metal/mtltexture/maketextureview%28pixelformat%3A%29).
+5. **Cópias, guarda física necessária.** Os três seletores textura →
+   textura já compartilhavam uma guarda baseada no RGBA8 derivado do formato
+   solicitado. Duas BC1 com o mesmo formato físico ASTC podem usar o blit
+   de mesmo formato. O filtro de elegibilidade permite combinações
+   mistas, por exemplo, textura standalone e textura de heap. A guarda
+   anterior deixaria passar duas BC1 da mesma variante. A nova guarda
+   checa os formatos físicos reais e recusa o par misto ou LDR ↔ sRGB
+   com contador, antes de encaminhar a cópia. [Guarda e seletores](spbcfallback.m#L1665).
+
+Nos três grupos da amostra (512, 256 e 128), a soma observada em RGBA8 foi
+830,24 MiB alocados. Aplicar idealmente a razão de 4:1 aos três grupos
+daria 207,56 MiB em ASTC e uma economia estimada de 622,68 MiB.
+Para uma textura quadrada 512² com dois níveis (512² + 256²), o layout
+lógico custa 1.310.720 B em RGBA8 e 327.680 B em ASTC. A estimativa sobre
+a amostra supõe elegibilidade integral e ignora diferenças de padding.
+A alocação Metal, o footprint, FPS/p95 e o efeito do RGB transparente na
+filtragem e composição exigem teste no iPad. O alfa punch-through é exato
+no PoC, mas o RGB transparente do BC1 pode passar de preto ao endpoint
+mais escuro. A tabela acima registra o custo do codec no host.
+
+**Decisão do delta 1.** O cliente publicado funciona com BC nativo no
+macOS, onde o blit de mipmaps em BC1 é inválido. O piloto assume que o
+cliente também não depende desse blit no iPad. O contador `mipgenBC` e o
+primeiro log com formato e dimensões cobrem todas as chamadas BC no
+fallback. RGBA8 continua encaminhando o blit. ASTC o recusa e registra
+`SP_BC_COMPACT reject op=mipgen`. Uma ocorrência no iPad comprova que
+o cliente acionou o caminho e exige verificar se os níveis recusados
+eram necessários.
+
+`SP_BC_COMPACT=1` ativa `bc-fallback-rgba8+astc-bc1` em dispositivos
+no fallback com suporte à família Apple2. A decisão é tomada na
+alocação de cada BC1 standalone elegível. O staging mantém a política
+de reserva e a vida útil existentes, com pitch ASTC de 16 B por bloco.
+No resumo, `live` e `total` contam raízes, `opaque` e `punch` contam
+blocos acumulados, e `msPerOutputMiB` usa bytes ASTC transcodificados.
+`astcAllocated` vem de `allocatedSize`, `rgbaLayout` é a conta lógica
+RGBA8 das mesmas texturas vivas, e `savedEstimate` é a diferença.
+`SP_BC_HIST` e `SP_BC_TOP` usam o formato físico real.
+
+No Ryzen 5 4600G com GCC -O1, o microbench de 1024² em
+`shims/metal/tests/run.sh` mediu 652 MPix/s opaco e 86 MPix/s
+punch-through. Os testes de referência verificaram alfa exato e erro
+RGB visível de até 1 por canal em linear e sRGB. Um texel transparente
+sintético passou de RGB (0, 0, 0) para (0, 131, 0) com alfa 0 nos
+dois perfis. O maior canal transparente observado foi 255.

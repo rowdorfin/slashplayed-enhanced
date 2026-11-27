@@ -1,4 +1,5 @@
 #include "spbclayout.h"
+#include "spbcastc.h"
 #include <limits.h>
 
 static size_t spBCMin(size_t a, size_t b) { return a < b ? a : b; }
@@ -21,10 +22,9 @@ SPBCSize SPBCMipSize(SPBCSize base, size_t level) {
                       spBCMipDimension(base.depth, level)};
 }
 
-size_t SPBCTextureBytes(SPBCKind kind, SPBCSize base, unsigned long type,
-                        size_t levels, size_t arrayLength, size_t samples) {
-    size_t texel = SPBCTexelBytes(kind);
-    if (!texel || !base.width || !base.height || !base.depth || !levels ||
+static size_t spBCTextureBytes(size_t unitBytes, bool compressed, SPBCSize base, unsigned long type,
+                               size_t levels, size_t arrayLength, size_t samples) {
+    if (!unitBytes || !base.width || !base.height || !base.depth || !levels ||
         levels > sizeof(size_t) * CHAR_BIT || !arrayLength || !samples) return 0;
     size_t layers = 1;
     switch (type) {
@@ -38,13 +38,24 @@ size_t SPBCTextureBytes(SPBCKind kind, SPBCSize base, unsigned long type,
     size_t total = 0;
     for (size_t level = 0; level < levels; level++) {
         SPBCSize mip = SPBCMipSize(base, level);
-        if (mip.width > SIZE_MAX / mip.height) return 0;
-        size_t area = mip.width * mip.height;
+        size_t width = compressed ? SPBCBlockCount(mip.width) : mip.width;
+        size_t height = compressed ? SPBCBlockCount(mip.height) : mip.height;
+        if (width > SIZE_MAX / height) return 0;
+        size_t area = width * height;
         if (area > (SIZE_MAX - total) / mip.depth) return 0;
         total += area * mip.depth;
     }
-    if (total > SIZE_MAX / texel / layers / samples) return 0;
-    return total * texel * layers * samples;
+    if (total > SIZE_MAX / unitBytes / layers / samples) return 0;
+    return total * unitBytes * layers * samples;
+}
+
+size_t SPBCTextureBytes(SPBCKind kind, SPBCSize base, unsigned long type,
+                        size_t levels, size_t arrayLength, size_t samples) {
+    return spBCTextureBytes(SPBCTexelBytes(kind), false, base, type, levels, arrayLength, samples);
+}
+
+size_t SPBCASTCTextureBytes(SPBCSize base, unsigned long type, size_t levels, size_t arrayLength) {
+    return spBCTextureBytes(SPBCASTCBlockBytes, true, base, type, levels, arrayLength, 1);
 }
 
 bool SPBCValidSlice(unsigned long type, size_t arrayLength, size_t slice) {
@@ -90,6 +101,18 @@ bool SPBCMakeLayout(SPBCKind kind, SPBCSize mip, SPBCOrigin origin, SPBCSize req
     return true;
 }
 
+static void spBCAdvanceTile(SPBCOrigin *cursor, SPBCSize size, size_t width, size_t height) {
+    cursor->x += width;
+    if (cursor->x == size.width) {
+        cursor->x = 0;
+        cursor->y += height;
+        if (cursor->y == size.height) {
+            cursor->y = 0;
+            cursor->z++;
+        }
+    }
+}
+
 bool SPBCNextTile(SPBCKind kind, SPBCSize size, size_t alignment, size_t limit,
                   SPBCOrigin *cursor, SPBCTile *tile) {
     size_t texel = SPBCTexelBytes(kind);
@@ -104,14 +127,21 @@ bool SPBCNextTile(SPBCKind kind, SPBCSize size, size_t alignment, size_t limit,
     size_t height = spBCMin(size.height - cursor->y, rows);
     size_t row = (width * texel + alignment - 1) / alignment * alignment;
     *tile = (SPBCTile){*cursor, {width, height, 1}, row, row * height};
-    cursor->x += width;
-    if (cursor->x == size.width) {
-        cursor->x = 0;
-        cursor->y += height;
-        if (cursor->y == size.height) {
-            cursor->y = 0;
-            cursor->z++;
-        }
-    }
+    spBCAdvanceTile(cursor, size, width, height);
+    return true;
+}
+
+bool SPBCNextASTCTile(SPBCSize size, size_t limit, SPBCOrigin *cursor, SPBCTile *tile) {
+    size_t maxBlocks = limit / SPBCASTCBlockBytes;
+    if (!maxBlocks || cursor->x >= size.width || cursor->y >= size.height || cursor->z >= size.depth)
+        return false;
+    // A strip keeps the same height across all of its tiles, including the
+    // right edge. Buffer offsets and pitches stay multiples of a full block.
+    size_t stripBlocks = spBCMin(SPBCBlockCount(size.width), maxBlocks);
+    size_t width = spBCMin(size.width - cursor->x, stripBlocks * 4);
+    size_t height = spBCMin(size.height - cursor->y, maxBlocks / stripBlocks * 4);
+    size_t row = SPBCBlockCount(width) * SPBCASTCBlockBytes;
+    *tile = (SPBCTile){*cursor, {width, height, 1}, row, row * SPBCBlockCount(height)};
+    spBCAdvanceTile(cursor, size, width, height);
     return true;
 }

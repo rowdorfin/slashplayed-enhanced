@@ -3,6 +3,15 @@
 
 #include <string.h>
 
+bool SPBC1CompactEligible(unsigned long format, unsigned long type, unsigned long usage,
+                          unsigned long storage, bool standalone, bool supportsASTC) {
+    // Metal values: 2D, 2DArray, Cube, CubeArray; ShaderRead | PixelFormatView;
+    // Shared, Managed, Private. The ObjC integration checks these constants.
+    return standalone && supportsASTC && (format == SPPixelFormatBC1_RGBA || format == SPPixelFormatBC1_RGBA_sRGB) &&
+           (type == 2 || type == 3 || type == 5 || type == 6) &&
+           !(usage & ~0x11ul) && storage <= 2;
+}
+
 // Khronos Data Format, ASTC: single partition, 4x4 grid (one weight per
 // texel). The weight stream starts at bit 127 and runs toward bit zero.
 enum {
@@ -137,7 +146,7 @@ static void spASTCPunchThrough(uint8_t out[16], uint8_t rgb[2][3], uint32_t indi
     spASTCDualPlaneRGBA(out, rgb, indices, colors, alpha, 0, 255);
 }
 
-void SPBC1ToASTC(const uint8_t source[8], uint8_t target[16]) {
+static bool spASTCBC1(const uint8_t source[8], uint8_t target[16]) {
     unsigned c0 = source[0] | (unsigned)source[1] << 8;
     unsigned c1 = source[2] | (unsigned)source[3] << 8;
     uint32_t indices = source[4] | (uint32_t)source[5] << 8 | (uint32_t)source[6] << 16 |
@@ -147,10 +156,16 @@ void SPBC1ToASTC(const uint8_t source[8], uint8_t target[16]) {
     spASTCEndpoint(c1, rgb[1]);
     memset(target, 0, 16);
     bool fourColors = c0 > c1;
-    if (!fourColors && (indices & (indices >> 1) & UINT32_C(0x55555555)))
+    bool punch = !fourColors && (indices & (indices >> 1) & UINT32_C(0x55555555));
+    if (punch)
         spASTCPunchThrough(target, rgb, indices);
     else
         spASTCOpaque(target, rgb, indices, fourColors);
+    return punch;
+}
+
+void SPBC1ToASTC(const uint8_t source[8], uint8_t target[16]) {
+    spASTCBC1(source, target);
 }
 
 static void spASTCInterpolatedAlpha(SPBCKind kind, const uint8_t source[16], uint8_t target[16]) {
@@ -183,16 +198,23 @@ void SPBC3ToASTC(const uint8_t source[16], uint8_t target[16]) {
     spASTCInterpolatedAlpha(SPBC3, source, target);
 }
 
-bool SPBC1RectToASTC(const uint8_t *source, size_t sourceRow, size_t width, size_t height,
-                    uint8_t *target, size_t targetRow) {
+bool SPBC1RectToASTCCounted(const uint8_t *source, size_t sourceRow, size_t width, size_t height,
+                           uint8_t *target, size_t targetRow, size_t *punchThrough) {
     size_t cols = SPBCBlockCount(width), rows = SPBCBlockCount(height);
     if (!source || !target || !cols || !rows || cols > SIZE_MAX / SPBCASTCBlockBytes) return false;
     size_t srcBytes = cols * 8, dstBytes = cols * SPBCASTCBlockBytes;
     if (sourceRow < srcBytes || targetRow < dstBytes ||
         rows - 1 > (SIZE_MAX - srcBytes) / sourceRow ||
         rows - 1 > (SIZE_MAX - dstBytes) / targetRow) return false;
+    size_t punch = 0;
     for (size_t y = 0; y < rows; y++)
         for (size_t x = 0; x < cols; x++)
-            SPBC1ToASTC(source + y * sourceRow + x * 8, target + y * targetRow + x * SPBCASTCBlockBytes);
+            punch += spASTCBC1(source + y * sourceRow + x * 8, target + y * targetRow + x * SPBCASTCBlockBytes);
+    if (punchThrough) *punchThrough = punch;
     return true;
+}
+
+bool SPBC1RectToASTC(const uint8_t *source, size_t sourceRow, size_t width, size_t height,
+                    uint8_t *target, size_t targetRow) {
+    return SPBC1RectToASTCCounted(source, sourceRow, width, height, target, targetRow, NULL);
 }
