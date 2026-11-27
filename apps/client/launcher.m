@@ -416,12 +416,15 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     NSString *render = requested[@"RenderScale"] ?: (configRender ? @(configRender) : @"game");
     NSString *textures = requested[@"graphicsTextureResolution"] ?: @"game";
     BOOL compact = getenv("SP_BC_COMPACT") != NULL;
+    BOOL compactAlpha = getenv("SP_BC_COMPACT_ALPHA") != NULL;
+    const char *allocTrace = getenv("SP_ALLOC_TRACE") ?: "0";
+    const char *allocMin = getenv("SP_ALLOC_TRACE_MIN_KIB") ?: "256";
     const char *budgetEnv = getenv("SP_GPU_WORKING_SET_MIB");
     NSString *budget = budgetEnv ? [NSString stringWithFormat:@"%s MiB", budgetEnv] : @"real";
     graphics_log([NSString stringWithFormat:
-        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s",
+        @"SP_PREFLIGHT hardware=%s/\"%@\" nativeBC=%d backend=%@ profile=%@ preset=%@ resolution=%@ renderScale=%@ textures=%@ config=%@ SP_BC_COMPACT=%d SP_GPU_WORKING_SET_MIB=%s SP_ALLOC_TRACE=%s SP_ALLOC_TRACE_MIN_KIB=%s SP_BC_COMPACT_ALPHA=%d",
         machine, device.name ?: @"unknown", nativeBC, backend, profile ? @"a16" : @"native",
-        graphics_name(preset), width, render, textures, found ? @"found" : @"missing", compact, budgetEnv ?: "0"]);
+        graphics_name(preset), width, render, textures, found ? @"found" : @"missing", compact, budgetEnv ?: "0", allocTrace, allocMin, compactAlpha]);
 
     if (!pump) return;
     UIWindow *window = nil;
@@ -439,8 +442,9 @@ static void show_preflight(id<MTLDevice> device, NSInteger preset, NSInteger res
     notice.textAlignment = NSTextAlignmentCenter;
     notice.numberOfLines = 0;
     notice.userInteractionEnabled = NO;
-    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · Orçamento %@",
-                   backend, graphics_name(preset), width, render, textures, compact ? @"on" : @"off", budget];
+    notice.text = [NSString stringWithFormat:@"%@ · %@ · %@\nRenderScale %@ · Textures %@\nBC1 compacto %@ · BC2/BC3 compacto %@ · Orçamento %@\nRastreio %s · Limiar %s KiB",
+                   backend, graphics_name(preset), width, render, textures, compact ? @"on" : @"off",
+                   compactAlpha ? @"on" : @"off", budget, allocTrace, allocMin];
     [window addSubview:notice];
     UILayoutGuide *safe = window.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -998,7 +1002,8 @@ int main(int argc, char **argv) {
     // Safe this early: its path redirect is set up on first use, by the client, after SP_SYSTEM_FLAVOR,
     // and only the client is bound to it.
     NSString *sys = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/libspSystem.dylib"];
-    if (!dlopen(sys.fileSystemRepresentation, RTLD_NOW)) say([NSString stringWithFormat:@"no console log: %s", dlerror()]);
+    void *systemShim = dlopen(sys.fileSystemRepresentation, RTLD_NOW);
+    if (!systemShim) say([NSString stringWithFormat:@"no console log: %s", dlerror()]);
     delete_listed();
     write_free_space();
     NSString *forgot = sp_identity_forget_if_asked();
@@ -1135,6 +1140,16 @@ int main(int argc, char **argv) {
         setenv("SP_BC_COMPACT", "1", 1);
     else
         unsetenv("SP_BC_COMPACT");
+    if ([defaults boolForKey:@"sp_bc_compact_alpha"])
+        setenv("SP_BC_COMPACT_ALPHA", "1", 1);
+    else
+        unsetenv("SP_BC_COMPACT_ALPHA");
+    NSInteger allocTrace = [defaults integerForKey:@"sp_alloc_trace"];
+    if (allocTrace == 1 || allocTrace == 2)
+        setenv("SP_ALLOC_TRACE", allocTrace == 1 ? "1" : "2", 1);
+    else
+        unsetenv("SP_ALLOC_TRACE");
+    setenv("SP_ALLOC_TRACE_MIN_KIB", [defaults integerForKey:@"sp_alloc_trace_min_kib"] == 1024 ? "1024" : "256", 1);
     NSInteger gpuBudget = [defaults integerForKey:@"sp_gpu_working_set_mib"];
     if (gpuBudget == 2048 || gpuBudget == 1536 || gpuBudget == 1024)
         setenv("SP_GPU_WORKING_SET_MIB", [@(gpuBudget) stringValue].UTF8String, 1);
@@ -1161,6 +1176,10 @@ int main(int argc, char **argv) {
     NSInteger (*lockResolution)(void) = ak ? (NSInteger (*)(void))dlsym(ak, "sp_lock_optimized_resolution") : NULL;
     NSInteger resolution = lockResolution ? lockResolution() : 0;
     __attribute__((objc_precise_lifetime)) id<MTLDevice> device = preflight_device(dir);
+    if (systemShim && getenv("SP_ALLOC_TRACE")) {
+        void (*configureAllocationTrace)(void) = dlsym(systemShim, "sp_alloc_configure");
+        if (configureAllocationTrace) configureAllocationTrace();
+    }
     NSInteger preset = graphics_preset(flavor);
     default_render_scale(flavor);
     BOOL missingResolutionConfig;

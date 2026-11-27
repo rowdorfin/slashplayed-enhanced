@@ -14,5 +14,5 @@ case $PLATFORM in
   *) echo "usage: $0 <xros|ios|macos> <out-dir> [install-name prefix]" >&2; exit 1 ;;
 esac
 $CC -dynamiclib -O1 -Wall spdl.c -o "$OUT/libspdl.dylib" -install_name "${PREFIX}libspdl.dylib"
-$CC -dynamiclib -O1 -Wall spsystem.c -o "$OUT/libspSystem.dylib" -install_name "${PREFIX}libspSystem.dylib" \
-  -Wl,-reexport-lSystem.B "$OUT/libspdl.dylib"
+$CC -dynamiclib -O1 -Wall -fno-omit-frame-pointer -fobjc-arc spsystem.c spalloctrack.c spmemobserve.m -o "$OUT/libspSystem.dylib" -install_name "${PREFIX}libspSystem.dylib" \
+  -framework Foundation -Wl,-reexport-lSystem.B "$OUT/libspdl.dylib"

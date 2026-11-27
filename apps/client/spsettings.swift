@@ -707,6 +707,34 @@ struct SettingsView: View {
                     settings.reload()
                 }
             ))
+            Toggle("Texturas BC2/BC3 compactas (experimental)", isOn: Binding(
+                get: { UserDefaults.standard.bool(forKey: "sp_bc_compact_alpha") },
+                set: {
+                    UserDefaults.standard.set($0, forKey: "sp_bc_compact_alpha")
+                    settings.reload()
+                }
+            ))
+            Picker("Rastreio de alocações (diagnóstico)", selection: Binding(
+                get: { UserDefaults.standard.integer(forKey: "sp_alloc_trace") },
+                set: {
+                    UserDefaults.standard.set($0, forKey: "sp_alloc_trace")
+                    settings.reload()
+                }
+            )) {
+                Text("Desligado").tag(0)
+                Text("Guest").tag(1)
+                Text("Guest + processo (indisponível nesta versão)").tag(2)
+            }
+            Picker("Limiar do rastreio de alocações", selection: Binding(
+                get: { UserDefaults.standard.integer(forKey: "sp_alloc_trace_min_kib") == 1024 ? 1024 : 256 },
+                set: {
+                    UserDefaults.standard.set($0, forKey: "sp_alloc_trace_min_kib")
+                    settings.reload()
+                }
+            )) {
+                Text("256 KiB").tag(256)
+                Text("1024 KiB").tag(1024)
+            }
             Picker("Orçamento gráfico (experimental)", selection: Binding(
                 get: { UserDefaults.standard.integer(forKey: "sp_gpu_working_set_mib") },
                 set: {

@@ -75,6 +75,7 @@ static void vlog(const char *fmt, ...) {
 // The client's __TEXT, and its RW alias once prepared. The client is the main executable, or, under
 // the flavor launcher (apps/client/launcher.m), an executable retyped MH_BUNDLE that it dlopens.
 static uintptr_t text, text_len, text_w;
+static _Atomic uintptr_t sp_diag_text, sp_diag_text_len;
 static int tracing;  // SP_SYSTEM_TRACE=1
 
 static int find_text(const struct mach_header *h, intptr_t slide, int bundle_only) {
@@ -94,6 +95,8 @@ static int find_text(const struct mach_header *h, intptr_t slide, int bundle_onl
     if (bundle_only && !has_main) return 0;
     text = t;
     text_len = len;
+    atomic_store_explicit(&sp_diag_text_len, len, memory_order_relaxed);
+    atomic_store_explicit(&sp_diag_text, t, memory_order_release);
     return 1;
 }
 
@@ -116,16 +119,24 @@ void sp_set_client(const struct mach_header *h, intptr_t slide, const char *path
 
 static int in_text(uintptr_t a, size_t len) { return a >= text && len <= text_len && a - text <= text_len - len; }
 
+static uintptr_t sp_diagnostic_guest_base(uintptr_t pc) {
+    uintptr_t base = atomic_load_explicit(&sp_diag_text, memory_order_acquire);
+    uintptr_t len = atomic_load_explicit(&sp_diag_text_len, memory_order_relaxed);
+    return pc - base < len ? base : 0;
+}
+
 // Guest images loaded by spguest have no dyld entry for dladdr.
 __attribute__((visibility("default"))) bool sp_client_contains_pc(uintptr_t pc) {
-    return in_text(pc, 1);
+    return sp_diagnostic_guest_base(pc) != 0;
 }
+
+#include "spallocdarwin.inc"
 
 static int traced(void) {
     struct kinfo_proc kp;
     size_t len = sizeof kp;
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
-    return sysctl(mib, 4, &kp, &len, NULL, 0) == 0 && (kp.kp_proc.p_flag & P_TRACED);
+    return sp_lib_sysctl(mib, 4, &kp, &len, NULL, 0) == 0 && (kp.kp_proc.p_flag & P_TRACED);
 }
 
 __attribute__((noinline)) static uintptr_t jit_cmd(uintptr_t cmd, uintptr_t a, uintptr_t b, uintptr_t c) {
@@ -158,9 +169,13 @@ static int prepare_text(void) {
         return EACCES;
     }
     // Copy the contents aside: the debugger's writes may change them (bulkz zeroes everything).
-    void *orig = mmap(NULL, text_len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    unsigned char *firsts = malloc(text_len / PAGE);
-    if (orig == MAP_FAILED || !firsts) return ENOMEM;
+    void *orig = sp_lib_mmap(NULL, text_len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    unsigned char *firsts = sp_lib_malloc(text_len / PAGE);
+    if (orig == MAP_FAILED || !firsts) {
+        if (orig != MAP_FAILED) sp_lib_munmap(orig, text_len);
+        sp_lib_free(firsts);
+        return ENOMEM;
+    }
     memcpy(orig, (void *)text, text_len);
     for (size_t i = 0; i < text_len / PAGE; i++) firsts[i] = ((unsigned char *)text)[i * PAGE];
 
@@ -168,6 +183,8 @@ static int prepare_text(void) {
         vlog("preparing __TEXT %p+0x%lx (%lu pages)\n", (void *)text, text_len, text_len / PAGE);
         uintptr_t r = jit_cmd(1, text, text_len, (uintptr_t)firsts);
         if (r != text) {
+            sp_lib_free(firsts);
+            sp_lib_munmap(orig, text_len);
             vlog("prepare returned %p, wanted %p\n", (void *)r, (void *)text);
             return EACCES;
         }
@@ -177,7 +194,7 @@ static int prepare_text(void) {
         for (int ms = 0; traced() && ms < 5000; ms += 10) usleep(10000);
         vlog("detached (traced=%d)\n", traced());
     }
-    free(firsts);
+    sp_lib_free(firsts);
 
     vm_address_t w = 0;
     vm_prot_t cur, max;
@@ -185,11 +202,13 @@ static int prepare_text(void) {
                                 &cur, &max, VM_INHERIT_NONE);
     if (!kr) kr = vm_protect(mach_task_self(), w, text_len, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     if (kr) {
+        sp_lib_munmap(orig, text_len);
+        if (w) sp_lib_vm_deallocate(mach_task_self(), w, text_len);
         vlog("RW alias of __TEXT failed: %s\n", mach_error_string(kr));
         return EACCES;
     }
     memcpy((void *)w, orig, text_len);
-    munmap(orig, text_len);
+    sp_lib_munmap(orig, text_len);
     sys_icache_invalidate((void *)text, text_len);
     text_w = w;
     vlog("__TEXT alias at %p, contents restored\n", (void *)w);
@@ -680,12 +699,18 @@ int sp_flock(int fd, int op) {
     return r;
 }
 
-// The client's own mmap calls (its startup code rewrite gets the real one from dlsym). Only file-backed and
-// shared mappings are logged.
+// The startup code rewrite gets the real mmap from dlsym. Guest anonymous
+// mappings go to the allocation tracer. File-backed/shared mappings also have path tracing.
 void *sp_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) __asm__("_mmap");
 void *sp_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
-    REAL(void *(*)(void *, size_t, int, int, int, off_t), "mmap");
-    void *r = fn(addr, len, prot, flags, fd, off);
+    bool trace = sp_alloc_on();
+    uint64_t before = trace && (flags & MAP_FIXED) ? sp_alloc_vm_generation() : 0;
+    void *r = sp_lib_mmap(addr, len, prot, flags, fd, off);
+    if (trace && r != MAP_FAILED) {
+        if (flags & MAP_FIXED) sp_alloc_vm_remove((uintptr_t)r, len, before);
+        if ((flags & MAP_ANON) && len >= sp_alloc_min && len <= SIZE_MAX - sp_alloc_page_mask)
+            SP_ADD(r, (len + sp_alloc_page_mask) & ~sp_alloc_page_mask, SP_VM);
+    }
     if (fd >= 0 || flags & MAP_SHARED)
         TRACE("mmap(%p, 0x%zx, %d, 0x%x, %d, 0x%llx) = %p %s", addr, len, prot, flags, fd, (long long)off, r,
               ERR(r == MAP_FAILED));
@@ -962,27 +987,31 @@ static void sysctl_value(char *out, size_t outlen, const char *name, const void 
 
 // "a.b.c" for a MIB, through the kernel's undocumented {0, 1} name lookup; numbers if that fails.
 static void mib_name(const int *mib, u_int n, char *out, size_t outlen) {
-    REAL(int (*)(int *, u_int, void *, size_t *, void *, size_t), "sysctl");
+    __typeof__(sp_lib_sysctl) fn = sp_lib_sysctl;
     int q[CTL_MAXNAME + 2] = {0, 1};
     size_t len = outlen;
-    if (n <= CTL_MAXNAME) {
+    if (mib && n <= CTL_MAXNAME) {
         memcpy(q + 2, mib, n * sizeof *mib);
         if (fn(q, n + 2, out, &len, NULL, 0) == 0) return;
     }
     size_t o = 0;
-    for (u_int i = 0; i < n && o < outlen; i++) o += snprintf(out + o, outlen - o, "%s%d", i ? "." : "", mib[i]);
+    for (u_int i = 0; mib && i < n && o < outlen; i++) o += snprintf(out + o, outlen - o, "%s%d", i ? "." : "", mib[i]);
 }
 
 int sp_sysctl(int *mib, u_int n, void *old, size_t *oldlen, void *new, size_t newlen) __asm__("_sysctl");
 int sp_sysctl(int *mib, u_int n, void *old, size_t *oldlen, void *new, size_t newlen) {
-    REAL(int (*)(int *, u_int, void *, size_t *, void *, size_t), "sysctl");
+    __typeof__(sp_lib_sysctl) fn = sp_lib_sysctl;
     int r = fn(mib, n, old, oldlen, new, newlen);
-    if (tracing && FROM_CLIENT) {
+    if (sp_alloc_on() || (tracing && FROM_CLIENT)) {
         int e = errno;
-        char name[128], v[160] = "";
-        mib_name(mib, n, name, sizeof name);
-        if (!r && oldlen) sysctl_value(v, sizeof v, name, old, *oldlen);
-        TRACE("ident: sysctl(%s) = %d %s %s", name, r, ERR(r < 0), v);
+        char name[128] = "", v[160] = "";
+        if (!r || e != EFAULT) mib_name(mib, n, name, sizeof name);
+        errno = e;
+        if (sp_alloc_on()) sp_mem_sysctl(name, r, old, !r && oldlen ? *oldlen : 0);
+        if (tracing && FROM_CLIENT) {
+            if (!r && oldlen) sysctl_value(v, sizeof v, name, old, *oldlen);
+            TRACE("ident: sysctl(%s) = %d %s %s", name, r, ERR(r < 0), v);
+        }
         errno = e;
     }
     return r;
@@ -990,8 +1019,13 @@ int sp_sysctl(int *mib, u_int n, void *old, size_t *oldlen, void *new, size_t ne
 
 int sp_sysctlbyname(const char *name, void *old, size_t *oldlen, void *new, size_t newlen) __asm__("_sysctlbyname");
 int sp_sysctlbyname(const char *name, void *old, size_t *oldlen, void *new, size_t newlen) {
-    REAL(int (*)(const char *, void *, size_t *, void *, size_t), "sysctlbyname");
+    __typeof__(sp_lib_sysctlbyname) fn = sp_lib_sysctlbyname;
     int r = fn(name, old, oldlen, new, newlen);
+    if (sp_alloc_on()) {
+        int e = errno;
+        sp_mem_sysctl(name, r, old, !r && oldlen ? *oldlen : 0);
+        errno = e;
+    }
     if (tracing && FROM_CLIENT) {
         int e = errno;
         char v[160] = "";
@@ -1330,19 +1364,17 @@ static void console_tee_start(void) {
 
 // Logs the app's memory footprint (what jetsam counts) and what's left before its limit, every
 // second while it moves by 128 MB or more: visionOS SIGKILLs an app over its limit without a report.
-extern size_t os_proc_available_memory(void);
-
 static void *memory_watch(void *unused) {
     (void)unused;
     uint64_t last = 0;
     for (;;) {
         task_vm_info_data_t vm;
         mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS &&
+        if (sp_host_task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS &&
             (vm.phys_footprint > last + (128 << 20) || vm.phys_footprint + (128 << 20) < last)) {
             last = vm.phys_footprint;
             vlog("memory: footprint %llu MB, %zu MB available\n", vm.phys_footprint >> 20,
-                 os_proc_available_memory() >> 20);
+                 sp_host_available_memory() >> 20);
         }
         sleep(1);
     }
@@ -1363,6 +1395,7 @@ static void memory_watch_start(void) {
 __attribute__((visibility("default"))) unsigned char dispatch_queue_offsets[64];
 
 __attribute__((constructor)) static void sp_init(void) {
+    sp_alloc_resolve();
 #if !TARGET_OS_OSX
     console_tee_start();
     memory_watch_start();
