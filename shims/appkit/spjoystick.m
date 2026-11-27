@@ -346,6 +346,7 @@ static CGPoint sp_stick_value(CGPoint offset, CGFloat travel, CGFloat deadzone) 
                 sp_stub_log("input: virtual controller connection failed; using WASD until retry");
                 [self disconnectController];
                 self->_analogFallback = YES;
+                self->_requested = NO;
                 [self sendValue:self->_value];
                 return;
             }
