@@ -1,15 +1,17 @@
-# SPTouchHUD 4.0 para Forever
+# SPTouchHUD 5.0 para Forever
 
-Em **Settings → Controls**, ative **Controles touchscreen** e escolha **SPTouchHUD** em **Barra de habilidades**. O preset **iPhone MMORPG** traz seis habilidades em arco, **Atacar**, **Alvo**, e **Interagir**, acima da faixa do botão nativo de pulo. **1**, **2**, e **3** escolhem o conjunto. **›** avança para a próxima página ocupada do conjunto. Os conjuntos iniciais cobrem as oito barras, inclusive itens e macros. Ícones, recarga, cargas, contagem, e cores de alcance e disponibilidade vêm dos slots do jogo.
+Em **Settings → Controls**, ative **Controles touchscreen** e selecione **HUD 5.0 (addon SPTouchHUD)**. No jogo, o botão maior usa ataque automático ou a ação escolhida. Os seis botões em arco mostram os ícones, a recarga, as cargas, a contagem de itens e o estado de alcance e disponibilidade. Toque em **1/N** para percorrer as páginas ocupadas dos três conjuntos. Os conjuntos iniciais cobrem as oito barras.
 
-Abra **··· → Editar HUD**, **Settings → AddOns → SPTouchHUD**, ou `/sphud`.
+Abra **⚙ → Editar HUD**, **Settings → AddOns → SPTouchHUD** ou digite **/sphud**.
 
-- **Slots** monta a lista na ordem dos toques. Para mudar a ordem, remova e reinsira a posição. O campo aceita listas como `1:3,2:1-4,5:9`. Cada conjunto aceita até 48 posições.
-- **Mover botões** abre a edição fora de combate. Arraste um botão ou toque nele e depois numa posição livre. Use **Menor** e **Maior** para ajustar o tamanho. **Restaurar botões** repõe os nove botões. Os alvos precisam caber na área do grupo sem sobreposição.
-- Use o puxador para mover o grupo e **Escala**, **Opacidade**, e **Aplicar** para ajustar sua apresentação. **Restaurar padrão** repõe a geometria iPhone MMORPG e conserva os conjuntos. Os presets incluem **Canhoto** e a grade **HUD 2.0 clássico**.
-- No modo **Canhoto**, use também **Trocar lado do joystick** na engrenagem UIKit. O joystick, o pulo, e os ajustes de câmera pertencem ao UIKit.
+- Em **Escolher ações**, toque em **Principal** ou em um dos seis botões da página atual. Escolha uma ação pelo nome e ícone, inclusive macros e itens que estejam na barra. Em **Principal**, use **Ataque automático** para restaurar a ação inicial. Uma posição da barra principal acompanha a página e a postura. Uma posição das demais barras é fixa. Se a posição principal estiver vazia, o botão mostra um traço.
+- Em um botão secundário, escolha uma ação para substituir a atual ou preencher um espaço livre. **Mover antes**, **Mover depois** e **Remover ação** organizam o conjunto. A lista compacta as posições vazias, então remover uma ação puxa as seguintes.
+- **Mover botões** abre a edição de geometria. Arraste um botão ou toque nele e depois numa posição livre. **Menor**, **Maior** e **Opacidade** alteram o botão selecionado. **Restaurar botões** repõe as posições, tamanhos e transparências individuais.
+- **Avançado** edita o nome, a cor e as posições de cada conjunto. O campo aceita listas como `1:3,2:1-4,5:9` com até 48 posições por conjunto.
+- Use o puxador para mover o grupo e **Escala**, **Opacidade** e **Aplicar** para ajustar o HUD. Os presets **iPhone MMORPG**, **iPhone compacto**, **iPad touchscreen**, **Canhoto** e **HUD 2.0 clássico** aplicam a geometria e mantêm as escolhas de ações.
+- Para jogar com a mão esquerda, selecione **Canhoto** também na engrenagem UIKit. No UIKit, use **Mover botões** e segure a alça do joystick para reposicioná-lo. Em **Settings → Controls → Joystick** ficam tamanho, zona morta, centro fixo ou flutuante e modo analógico.
 
-O layout, os conjuntos, e as posições individuais ficam em `SPTouchHUDCharDB`. A migração v4 repõe a geometria antiga e conserva os conjuntos válidos, inclusive em registros incompletos. A habilitação fica em `SPTouchHUDDB`. As barras originais e os atalhos de teclado e mouse ficam disponíveis. Ocultá-las foi omitido porque não há um caminho validado para desativar e restaurar os alvos do mouse das barras protegidas sem risco de taint.
+A migração da 4.0 preserva os conjuntos e a ordem, o lado, a escala, a opacidade e a habilitação. Os deslocamentos e tamanhos individuais são restaurados para acomodar a nova geometria. O chat, o rastreador e as barras originais continuam sob controle do jogo. Use as opções de chat e o Edit Mode disponíveis no cliente para mudanças de layout.
 
 ## Slots e combate
 
@@ -26,9 +28,15 @@ O layout, os conjuntos, e as posições individuais ficam em `SPTouchHUDCharDB`.
 | 7 | MultiBar6 | 14 | 157–168 |
 | 8 | MultiBar7 | 15 | 169–180 |
 
-**Implementação.** Fora de combate, o Lua consulta a ocupação e compila as páginas 1–15 da barra principal junto com os slots fixos selecionados. Os slots comprovadamente vazios saem da lista. Eventos de slot, página, forma, e furtividade atualizam a compilação. Em combate, o controlador seguro escolhe a lista compilada da página atual e volta à primeira página do conjunto se a anterior não existir. A ocupação e a geometria aguardam o fim do combate. Veículo, override, forma temporária, e páginas fora da faixa compilada mantêm as posições selecionadas da barra principal para que ações que surjam em combate continuem acessíveis.
+**Implementação.** Fora de combate, o Lua consulta a ocupação e compila as páginas 1–15 da barra principal junto com os slots fixos selecionados. Os slots comprovadamente vazios saem da lista. Eventos de slot, página, talentos, forma e furtividade agrupam a recompilação em uma atualização. Em combate, o controlador seguro escolhe a lista compilada da página atual e volta à primeira página do conjunto se a anterior não existir. A ocupação e a geometria aguardam o fim do combate. Veículo, override, forma temporária, e páginas fora da faixa compilada mantêm as posições selecionadas da barra principal para que ações que surjam em combate continuem acessíveis.
 
-**HIPÓTESE a validar no aparelho.** O driver e as consultas de bônus precisam refletir cada forma em Forever no momento da troca. **Interagir** depende do botão contextual de gamepad disponível no cliente e do aceite do par de chamadas `/click` com toque. Valide também os comandos **Atacar** e **Alvo**, o gesto de arrastar do editor, e as margens com a escala real da interface. [MainActionBarFrame.lua][gamepad] · [SecureTemplates.lua][actions]
+**HIPÓTESE a validar no aparelho.** O driver e as consultas de bônus precisam refletir cada forma em Forever no momento da troca. **Interagir** depende do botão contextual de gamepad disponível no cliente e do aceite do par de chamadas `/click` com toque. Valide também o **Ataque automático**, **Alvo**, o gesto de arrastar do editor, e as margens com a escala real da interface. [MainActionBarFrame.lua][gamepad] · [SecureTemplates.lua][actions]
+
+## Gamepad virtual experimental
+
+O joystick padrão envia WASD com diagonais. O modo analógico usa um controle iOS dentro do Slashplayed. Com **Joystick analógico** e **Gamepad virtual experimental** ativados, o primeiro toque no joystick conecta um perfil com dois eixos direcionais e os botões **A**, **LB**, **RB** e **X**. O botão de câmera dedicado fica ao lado de A. Arraste dentro dele para inclinar o eixo e solte para voltar ao centro. Os atalhos e as camadas permanecem sob controle das configurações nativas do Forever.
+
+Confirme no jogo com **/sphudpad** antes e depois de tocar no joystick. Se necessário, habilite o gamepad pelo menu do Forever ou manualmente com **/console GamePadEnable 1**. Anote o valor original de **GamePadEnable** antes de alterá-lo. Em caso de falha de conexão no iOS, o joystick envia WASD. Se o iOS conectar e o guest ignorar o controle, desligue o modo experimental ou o modo analógico no Settings. As habilidades do HUD seguem vinculadas a ações seguras da barra do jogo. O protótipo precisa ser validado com o cliente real e com controle físico Bluetooth.
 
 ## Instalação
 

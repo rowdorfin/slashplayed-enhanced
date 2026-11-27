@@ -1071,8 +1071,9 @@ and scroll events and `NSTextInputClient`), with no event taps. `spevent.m`:
   Cancellation and scene deactivation clear held input.
 - **Virtual left stick (iPhone and iPad).** `spjoystick.m`, also included by `spevent.m`, owns a separate
   UIKit touch and a hidden `GCVirtualController` configured with only `GCInputLeftThumbstick`. The
-  client's existing native GameController imports see its connection and analog axes; no mouse or
-  keyboard events are synthesized. Touch displacement has a radial 12% dead zone, rescales the remaining
+  guest's macOS GameController install name maps to the iOS system framework in
+  the same process. The simulator checks controller enumeration and the real extended profile.
+  WoW's own enumeration, backend selection, and in-game behavior still require device verification. Touch displacement has a radial 12% dead zone, rescales the remaining
   travel to 0–1, clamps diagonals to the unit circle, and flips UIKit Y to controller Y. A separate
   44-point handle repositions the control after a two-second stationary hold, while leaving the axes
   neutral. A filling border shows progress, and the handle turns gold when unlocked. Before unlocking,
@@ -1100,6 +1101,17 @@ and scroll events and `NSTextInputClient`), with no event taps. `spevent.m`:
   also retained in `sp_game_presented`, so a late input view cannot miss the one-shot event. A new
   direct touch in a foreground-active scene clears stale suspension if its activation notification
   was missed; old moved touches and touches in inactive scenes cannot use that recovery path.
+- **Forever HUD 5.0.** The compact UIKit stick and Jump have separate safe-area lanes from the
+  Lua action arc. The stick leaves the lower chat strip and has no surrounding touch shield in
+  this mode. Lua compiles bank and page occupancy outside combat and configures its own secure
+  action buttons. The visual picker stores ordinary action positions. The primary position follows
+  secure page changes if it belongs to the main bar. See [the HUD guide](../addon/SPTouchHUD/README.md).
+- **Experimental full virtual controller.** In Forever HUD mode, the opt-in setting extends the
+  analog profile with a touch-owned right stick, A, X, and both shoulders. Each UIKit button owns
+  one press until release or cancellation, independent of the other touches. The dedicated
+  camera control leaves ordinary mouse and touch camera paths available. Deactivation resets the
+  axes and buttons and disconnects the controller. The default WASD mode and the original one-stick
+  mode remain available.
 - **Mouselook.** The client hides the cursor, dissociates it from the mouse and reads drag deltas. The
   CoreGraphics shim's cursor calls go to the AppKit shim; while dissociated, deltas come from
   `GCMouse`'s raw movement and the position stays put. iPadOS honours pointer lock, so it's on by
