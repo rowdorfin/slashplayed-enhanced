@@ -61,8 +61,9 @@ void sp_alloc_unmap(struct sp_alloc_tracker *, uintptr_t, uint64_t, uint64_t now
 bool sp_alloc_rate(uint64_t previous, uint64_t live, uint64_t elapsed_ns, uint64_t bytes_per_second);
 void sp_alloc_rank(struct sp_alloc_site *, size_t count, unsigned live[16], unsigned growth[8]);
 
-enum { SP_ALLOC_SITE5_TOP = 8, SP_ALLOC_SITE5_BUCKETS = 2 * SP_ALLOC_SITES };
+enum { SP_ALLOC_SITE5_FRAMES = 5, SP_ALLOC_SITE5_TOP = 8, SP_ALLOC_SITE5_BUCKETS = 2 * SP_ALLOC_SITES };
 struct sp_alloc_site5 {
+    uintptr_t pc[SP_ALLOC_SITE5_FRAMES];
     uint64_t hash, live, blocks, total, allocs, frees;
     unsigned sub_sites;
 };

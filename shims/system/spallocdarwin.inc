@@ -142,7 +142,7 @@ static void sp_alloc_stack(uintptr_t pc[SP_ALLOC_FRAMES], uintptr_t caller, uint
 static char *sp_alloc_site_ids(char *out, const uintptr_t *pc) {
     out = sp_alloc_number(sp_alloc_literal(out, " site="), sp_alloc_stack_hash(pc, SP_ALLOC_FRAMES), 16);
     out = sp_alloc_number(sp_alloc_literal(out, " site4="), sp_alloc_stack_hash(pc, 4), 16);
-    return sp_alloc_number(sp_alloc_literal(out, " site5="), sp_alloc_stack_hash(pc, 5), 16);
+    return sp_alloc_number(sp_alloc_literal(out, " site5="), sp_alloc_stack_hash(pc, SP_ALLOC_SITE5_FRAMES), 16);
 }
 
 static void sp_alloc_big(size_t size, enum sp_alloc_kind kind, const uintptr_t *pc, uint64_t tid, uint64_t now) {
@@ -370,19 +370,10 @@ static void sp_alloc_add_thread(struct sp_alloc_thread_sample *names, unsigned *
     names[(*count)++].id = id;
 }
 
-static void sp_alloc_print_site(const char *reason, const char *rank, unsigned index,
-                                const struct sp_alloc_thread_sample *names, unsigned count) {
-    const struct sp_alloc_site *s = &sp_alloc_snapshot[index];
-    char line[2048];
-    // At most 90 image bytes, "+0x", 16 hex digits, and a comma per frame.
-    _Static_assert(sizeof line >= 640 + SP_ALLOC_FRAMES * 110, "SP_ALLOC_TOP line capacity");
-    char *out = sp_alloc_literal(line, "SP_ALLOC_TOP reason=");
-    out = sp_alloc_literal(out, reason);
-    out = sp_alloc_literal(sp_alloc_literal(out, " rank="), rank);
-    out = sp_alloc_site_ids(out, s->pc);
+static char *sp_alloc_format_stack(char *out, const uintptr_t *pcs, unsigned frames) {
     out = sp_alloc_literal(out, " stack=");
-    for (unsigned i = 0; i < SP_ALLOC_FRAMES && s->pc[i]; i++) {
-        uintptr_t pc = s->pc[i], base = sp_diagnostic_guest_base(pc);
+    for (unsigned i = 0; i < frames && pcs[i]; i++) {
+        uintptr_t pc = pcs[i], base = sp_diagnostic_guest_base(pc);
         const char *image = "unknown";
         Dl_info info;
         if (base) image = "guest";
@@ -395,6 +386,20 @@ static void sp_alloc_print_site(const char *reason, const char *rank, unsigned i
         out = sp_alloc_bounded(out, image, 90);
         out = sp_alloc_number(sp_alloc_literal(out, "+0x"), pc - base, 16);
     }
+    return out;
+}
+
+static void sp_alloc_print_site(const char *reason, const char *rank, unsigned index,
+                                const struct sp_alloc_thread_sample *names, unsigned count) {
+    const struct sp_alloc_site *s = &sp_alloc_snapshot[index];
+    char line[2048];
+    // At most 90 image bytes, "+0x", 16 hex digits, and a comma per frame.
+    _Static_assert(sizeof line >= 640 + SP_ALLOC_FRAMES * 110, "SP_ALLOC_TOP line capacity");
+    char *out = sp_alloc_literal(line, "SP_ALLOC_TOP reason=");
+    out = sp_alloc_literal(out, reason);
+    out = sp_alloc_literal(sp_alloc_literal(out, " rank="), rank);
+    out = sp_alloc_site_ids(out, s->pc);
+    out = sp_alloc_format_stack(out, s->pc, SP_ALLOC_FRAMES);
     out = sp_alloc_field(out, " live=", s->live);
     out = sp_alloc_field(out, " blocks=", s->blocks);
     out = sp_alloc_field(out, " peak=", s->peak);
@@ -421,9 +426,12 @@ static void sp_alloc_print_site(const char *reason, const char *rank, unsigned i
 }
 
 static void sp_alloc_print_site5(const char *reason, const struct sp_alloc_site5 *group) {
-    char line[320], *out = sp_alloc_literal(line, "SP_ALLOC_TOP reason=");
+    char line[896];
+    _Static_assert(sizeof line >= 320 + SP_ALLOC_SITE5_FRAMES * 110, "SP_ALLOC_TOP site5 line capacity");
+    char *out = sp_alloc_literal(line, "SP_ALLOC_TOP reason=");
     out = sp_alloc_literal(out, reason);
     out = sp_alloc_number(sp_alloc_literal(out, " rank=site5 site5="), group->hash, 16);
+    out = sp_alloc_format_stack(out, group->pc, SP_ALLOC_SITE5_FRAMES);
     out = sp_alloc_field(out, " live=", group->live);
     out = sp_alloc_field(out, " blocks=", group->blocks);
     out = sp_alloc_field(out, " total=", group->total);

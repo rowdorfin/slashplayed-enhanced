@@ -1260,7 +1260,9 @@ natively. The shim does not synthesize events.
 
 `SP_ALLOC_BIG` and `SP_ALLOC_TOP` capture up to 12 frames with the same frame-pointer bounds checks.
 `site` hashes the full stack, `site4` hashes its first four entries, and `site5` preserves the previous
-five-entry hash for the same PCs. These IDs hash raw PCs and may change across launches with ASLR.
+five-entry hash for the same PCs. These hashes are per-launch IDs because ASLR changes raw PCs.
+For A/B comparisons across launches of the same build, match the image-relative offsets in `stack=`.
+The `rank=site5` rows show the first five frames, or fewer if the captured stack ended sooner.
 The tracker and its dump snapshot each retain 8,192 sites. Seven extra pointers per site cost
 448 KiB per table on arm64 (896 KiB total), and the transient stack array grows by 56 bytes.
 More distinct stacks can fill the site table sooner. The portable benchmark measures tracker

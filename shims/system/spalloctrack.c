@@ -180,7 +180,7 @@ void sp_alloc_rank_site5(const struct sp_alloc_site snapshot[SP_ALLOC_SITES],
     for (unsigned i = 0; i < SP_ALLOC_SITES; i++) {
         const struct sp_alloc_site *site = &snapshot[i];
         if (!site->allocs) continue;
-        uint64_t hash = sp_alloc_stack_hash(site->pc, 5);
+        uint64_t hash = sp_alloc_stack_hash(site->pc, SP_ALLOC_SITE5_FRAMES);
         const unsigned mask = SP_ALLOC_SITE5_BUCKETS - 1;
         unsigned bucket = hash & mask;
         // Store one-based group indices so even a zero hash can be grouped.
@@ -188,6 +188,7 @@ void sp_alloc_rank_site5(const struct sp_alloc_site snapshot[SP_ALLOC_SITES],
             bucket = (bucket + 1) & mask;
         if (!scratch->buckets[bucket]) {
             scratch->groups[count] = (struct sp_alloc_site5){.hash = hash};
+            memcpy(scratch->groups[count].pc, site->pc, sizeof scratch->groups[count].pc);
             scratch->buckets[bucket] = ++count;
         }
         struct sp_alloc_site5 *group = &scratch->groups[scratch->buckets[bucket] - 1];
