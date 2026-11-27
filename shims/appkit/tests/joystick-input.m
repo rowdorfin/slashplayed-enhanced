@@ -219,6 +219,16 @@ static void sp_test_joystick(SPInputView *view, SPThumbButton *thumb, SPJoystick
     [view setNeedsLayout]; [view layoutIfNeeded];
     [view sp_resume_touch:nil];
     BOOL launcherDisconnected = stick.controller == nil;
+    SPTestTouch *early = sp_test_touch(stick, CGPointMake(stick.center.x + 40, stick.center.y));
+    SPTestEvent *earlyEvent = sp_test_event(@[early]);
+    @try {
+        sp_test_send(early, UITouchPhaseBegan, earlyEvent);
+        [view setNeedsLayout]; [view layoutIfNeeded];
+        sp_test_check(!stick.controller && [sp_touch_keys containsIndex:0x07],
+                      @"Before GameController is ready, analog mode keeps WASD held through layout.");
+        sp_test_send(early, UITouchPhaseCancelled, earlyEvent);
+        sp_test_check(!sp_touch_keys.count, @"Cancellation releases early WASD fallback.");
+    } @catch (NSException *e) { done(e.reason); return; }
     __block NSUInteger frames = 0;
     id frameObserver = [NSNotificationCenter.defaultCenter addObserverForName:@"SPGameFirstFrame" object:nil queue:nil
                                                                  usingBlock:^(NSNotification *n) { frames++; }];
