@@ -9,6 +9,7 @@
 // occupied time from the union of completed command-buffer intervals).
 #import <Metal/Metal.h>
 #include <mach/mach.h>
+#include <dlfcn.h>
 #include <mach/vm_region.h>
 #include <mach/vm_statistics.h>
 #include <malloc/malloc.h>
@@ -205,7 +206,7 @@ static const char *sp_stats_vm_tag(unsigned tag) {
     }
 }
 
-static void sp_stats_vm_tags(const char *phase, unsigned long long warning) {
+static uint64_t sp_stats_vm_tags(const char *phase, unsigned long long warning) {
     SPVMTagPages tags[SPVMTagSlots] = {0};
     vm_address_t address = 0;
     natural_t depth = 0;
@@ -233,6 +234,7 @@ static void sp_stats_vm_tags(const char *phase, unsigned long long warning) {
         address += size;
     }
 
+    uint64_t mallocLarge = SPVMTagTotal(tags[VM_MEMORY_MALLOC_LARGE]) * vm_page_size;
     SPVMTagSample top[SPVMTagTopCount];
     unsigned topCount = SPVMTagTop(tags, top);
     double ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 1e6;
@@ -247,9 +249,11 @@ static void sp_stats_vm_tags(const char *phase, unsigned long long warning) {
                            SPVMTagTotal(pages) * pageMiB, pages.dirty * pageMiB, pages.swapped * pageMiB];
     }
     sp_stats_say(line.UTF8String);
+    return mallocLarge;
 }
 
-static void sp_stats_malloc_zones(const char *phase, unsigned long long warning) {
+static uint64_t sp_stats_malloc_zones(const char *phase, unsigned long long warning) {
+    uint64_t defaultInUse = 0;
     vm_address_t *addresses = NULL;
     unsigned count = 0;
     kern_return_t status = malloc_get_all_zones(mach_task_self(), NULL, &addresses, &count);
@@ -263,16 +267,20 @@ static void sp_stats_malloc_zones(const char *phase, unsigned long long warning)
             malloc_statistics_t stats = {0};
             malloc_zone_statistics(zone, &stats);
             const char *name = malloc_get_zone_name(zone);
+            if (name && !strcmp(name, "DefaultMallocZone")) defaultInUse = stats.size_in_use;
             [line appendFormat:@" #%u(%s)=%zu/%zu/%u", i, name ?: "unnamed",
                                stats.size_in_use, stats.size_allocated, stats.blocks_in_use];
         }
     }
     sp_stats_say(line.UTF8String);
+    return defaultInUse;
 }
 
 static void sp_stats_memory_sample(const char *phase, unsigned long long warning) {
-    sp_stats_vm_tags(phase, warning);
-    sp_stats_malloc_zones(phase, warning);
+    uint64_t mallocLarge = sp_stats_vm_tags(phase, warning);
+    uint64_t zoneInUse = sp_stats_malloc_zones(phase, warning);
+    void (*sample)(uint64_t, uint64_t, bool) = dlsym(RTLD_DEFAULT, "sp_alloc_sample");
+    if (sample) sample(mallocLarge, zoneInUse, !strcmp(phase, "warning"));
 }
 
 static void *sp_stats_watch(void *unused) {

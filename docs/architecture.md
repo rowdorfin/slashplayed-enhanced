@@ -1234,3 +1234,26 @@ Export Diagnostics zips them with launch credential values, device identifiers (
 ECIDs, and the crash reports' device keys), and personal details (your name and signing certificates'
 names, Xcode's teams and Apple IDs, the devices' and the Mac's names, and the user folder in paths)
 blanked.
+
+### Guest allocation and memory-pressure diagnostics
+
+The launcher applies `SP_ALLOC_TRACE` and `SP_ALLOC_TRACE_MIN_KIB` before entering the guest.
+Mode 1 accounts for large heap blocks and anonymous mappings imported through libspSystem. Mode 2
+currently falls back to mode 1 because libmalloc's deprecated process-wide logger has no supported
+iOS installation contract. Real allocator entry points are resolved through the real libSystem
+handle at shim initialization. Trace storage is fixed, and the child of a fork disables tracing.
+Guest stack addresses are printed relative to its loaded `__TEXT`. Other images are resolved at dump
+time. The detached loader leaves `__LINKEDIT` unmapped, so `SP_ALLOC_IMPORTS` reports unavailable.
+
+Use `SP_ALLOC_BIG` and the growth-ranked `SP_ALLOC_TOP` rows to match individual allocations with
+live bytes and realloc growth. `SP_ALLOC_COVER` compares requested heap bytes with the latest
+process-wide `MALLOC_LARGE` dirty-plus-compressed and DefaultMallocZone samples. `trackedVM` includes
+anonymous virtual reservations. `phantom` counts stale heap records detected by allocator size
+checks. Equal-sized address reuse can go undetected. `dropped` includes table saturation and partial
+VM unmaps whose surviving ranges are no longer tracked. Direct libc++ and framework allocations
+bypass these hooks.
+
+`SP_MEM_QUERIES` reports observed values and counts. `SP_MEM_SOURCE` records registrations and
+warning-time snapshots. A nonzero `guestDataOr` records event bits actually read through the guest
+hook. A zero snapshot alone cannot establish lack of delivery. iOS delivers memory-pressure sources
+natively. The shim does not synthesize events.
