@@ -1257,3 +1257,24 @@ bypass these hooks.
 warning-time snapshots. A nonzero `guestDataOr` records event bits actually read through the guest
 hook. A zero snapshot alone cannot establish lack of delivery. iOS delivers memory-pressure sources
 natively. The shim does not synthesize events.
+
+`SP_ALLOC_BIG` and `SP_ALLOC_TOP` capture up to 12 frames with the same frame-pointer bounds checks.
+`site` hashes the full stack, `site4` hashes its first four entries, and `site5` preserves the previous
+five-entry hash for the same PCs. These IDs hash raw PCs and may change across launches with ASLR.
+The tracker and its dump snapshot each retain 8,192 sites. Seven extra pointers per site cost
+448 KiB per table on arm64 (896 KiB total), and the transient stack array grows by 56 bytes.
+More distinct stacks can fill the site table sooner. The portable benchmark measures tracker
+hashing and accounting on Linux. It does not measure the cost of walking additional Darwin frames.
+
+`SP_MEM_VMSTAT` samples successful `HOST_VM_INFO64` results at most once per second. It checks the
+returned Mach word count through each required field and includes the file-backed and anonymous
+page counts when their fields are present. Page counts use the reported page size. `available` is
+the process's available memory in bytes, sampled alongside the host counters. `calls` counts every
+call of that flavor, including failed and suppressed samples, and the periodic query dump reports
+its latest total. `SP_MEM_QUERIES` also records the observed CPU and performance-level sysctl values.
+
+`SP_THREADPOOL` reads only `Logs/threadpool.log` under the launcher's
+`$HOME/Documents/$SP_SYSTEM_FLAVOR` game folder or its `SP_SYSTEM_ROOT` override.
+Without a configured root on macOS the diagnostic uses the current directory. The AppKit stats
+utility queue reads at most 4 KiB around 30 seconds after tracing is configured and on the first
+UIKit memory warning while tracing. A missing file produces a status row with the attempted path.

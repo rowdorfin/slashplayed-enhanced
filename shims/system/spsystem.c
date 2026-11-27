@@ -119,7 +119,7 @@ void sp_set_client(const struct mach_header *h, intptr_t slide, const char *path
 
 static int in_text(uintptr_t a, size_t len) { return a >= text && len <= text_len && a - text <= text_len - len; }
 
-static uintptr_t sp_diagnostic_guest_base(uintptr_t pc) {
+__attribute__((visibility("hidden"))) uintptr_t sp_diagnostic_guest_base(uintptr_t pc) {
     uintptr_t base = atomic_load_explicit(&sp_diag_text, memory_order_acquire);
     uintptr_t len = atomic_load_explicit(&sp_diag_text_len, memory_order_relaxed);
     return pc - base < len ? base : 0;
@@ -318,10 +318,72 @@ static size_t from_len, bundle_len;
 
 static void login_setup(void);
 
-static void init_redirect(void) {
-    const char *env = getenv("SP_SYSTEM_ROOT");
+// Shared with the diagnostic reader so it follows the launcher's install root.
+static int sp_game_root(char *out, size_t capacity) {
+    const char *root = getenv("SP_SYSTEM_ROOT");
+    if (root) return snprintf(out, capacity, "%s", root);
 #if TARGET_OS_OSX
-    if (!env) return;
+    return -1;
+#else
+    const char *flavor = getenv("SP_SYSTEM_FLAVOR");
+    return snprintf(out, capacity, "%s/Documents/%s", getenv("HOME"), flavor ? flavor : "_classic_era_");
+#endif
+}
+
+static void sp_threadpool_dump(void) {
+    if (!sp_alloc_on()) return;
+    char path[PATH_MAX];
+    int root = sp_game_root(path, sizeof path);
+#if TARGET_OS_OSX
+    if (root < 0 && getcwd(path, sizeof path)) root = (int)strlen(path);
+#endif
+    static const char suffix[] = "/Logs/threadpool.log";
+    if (root < 0 || (size_t)root > sizeof path - sizeof suffix) {
+        dprintf(STDERR_FILENO, "SP_THREADPOOL status=absent path=Logs/threadpool.log\n");
+        return;
+    }
+    memcpy(path + root, suffix, sizeof suffix);
+    // Use the real calls so a diagnostic open cannot initialize redirection or login cleanup.
+    int (*open_file)(const char *, int, ...) = real("open");
+    int (*close_file)(int) = real("close");
+    int fd = open_file(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode)) {
+        if (fd >= 0) close_file(fd);
+        dprintf(STDERR_FILENO, "SP_THREADPOOL status=absent path=%s\n", path);
+        return;
+    }
+    // Read at most 4 KiB and omit a partial final line if the file was larger.
+    char contents[4096];
+    size_t used = 0;
+    while (used < sizeof contents) {
+        ssize_t n = read(fd, contents + used, sizeof contents - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    close_file(fd);
+    char *start = contents, *end = contents + used;
+    while (start < end) {
+        char *newline = memchr(start, '\n', end - start);
+        if (!newline && used == sizeof contents) break;
+        char *stop = newline ? newline : end;
+        if (stop > start && stop[-1] == '\r') stop--;
+        char line[512];
+        char *out = sp_alloc_literal(line, "SP_THREADPOOL ");
+        while (start < stop && out < line + sizeof line - 1) {
+            unsigned char c = *start++;
+            *out++ = c < ' ' || c == 127 ? '?' : c;
+        }
+        *out++ = '\n';
+        sp_lib_write(STDERR_FILENO, line, out - line);
+        start = newline ? newline + 1 : end;
+    }
+}
+
+static void init_redirect(void) {
+#if TARGET_OS_OSX
+    if (!getenv("SP_SYSTEM_ROOT")) return;
 #endif
     uint32_t len = sizeof bundle;
     if (((int (*)(char *, uint32_t *))real("_NSGetExecutablePath"))(bundle, &len)) return;
@@ -329,11 +391,7 @@ static void init_redirect(void) {
     if (!slash) return;
     *slash = 0;
     bundle_len = strlen(bundle);
-    if (env) strlcpy(to, env, sizeof to);
-    else {
-        const char *flavor = getenv("SP_SYSTEM_FLAVOR");
-        snprintf(to, sizeof to, "%s/Documents/%s", getenv("HOME"), flavor ? flavor : "_classic_era_");
-    }
+    sp_game_root(to, sizeof to);
     ((int (*)(const char *, mode_t))real("mkdir"))(to, 0777);
     strlcpy(from, bundle, sizeof from);
     if (!(slash = strrchr(from, '/'))) return;

@@ -6,6 +6,9 @@
 #include <mach/mach.h>
 #include <notify.h>
 #include <os/lock.h>
+#include <ptrauth.h>
+#include <time.h>
+#include "spalloctrack.h"
 #include <TargetConditionals.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -16,6 +19,7 @@
 
 extern void *sp_real_dlsym(void *, const char *);
 extern bool sp_client_contains_pc(uintptr_t);
+extern uintptr_t sp_diagnostic_guest_base(uintptr_t);
 extern bool sp_alloc_observing(void);
 
 #define EXPORT(ret, name, params) \
@@ -43,6 +47,8 @@ enum { QUERY_CAP = 128, SOURCE_CAP = 32 };
 static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
 static struct query { char name[96], value[160]; unsigned long long count; } queries[QUERY_CAP];
 static unsigned long long queries_dropped, sources_seen;
+static os_unfair_lock vm_lock = OS_UNFAIR_LOCK_INIT;
+static struct sp_mem_vm_rate vm_rate;
 static unsigned sources_tracked;
 static __weak dispatch_source_t sources[SOURCE_CAP];
 static struct source_info {
@@ -71,21 +77,36 @@ void sp_mem_query(const char *name, const char *value) {
 }
 
 void sp_mem_sysctl(const char *name, int status, const void *value, size_t size) {
-    if (!name || (strcmp(name, "hw.memsize") && strcmp(name, "hw.physmem") && strcmp(name, "hw.usermem") &&
-                  strncmp(name, "vm.", 3) && strncmp(name, "kern.memorystatus", 17))) return;
-    char decoded[160];
-    if (status) snprintf(decoded, sizeof decoded, "error:%d", errno);
-    else if (!value) snprintf(decoded, sizeof decoded, "size:%zu", size);
-    else if (size == 4 || size == 8) {
+    if (!name) return;
+    bool perflevel = !strncmp(name, "hw.perflevel", sizeof "hw.perflevel" - 1);
+    if (!perflevel && strcmp(name, "hw.logicalcpu") && strcmp(name, "hw.physicalcpu") &&
+        strcmp(name, "hw.ncpu") && strcmp(name, "hw.activecpu") && strcmp(name, "hw.memsize") &&
+        strcmp(name, "hw.physmem") && strcmp(name, "hw.usermem") && strncmp(name, "vm.", 3) &&
+        strncmp(name, "kern.memorystatus", 17)) return;
+
+    char decoded[160], *out = decoded;
+    if (status) out = sp_alloc_number(sp_alloc_literal(out, "error:"), (unsigned)errno, 10);
+    else if (!value) out = sp_alloc_number(sp_alloc_literal(out, "size:"), size, 10);
+    else if (perflevel && strlen(name) >= sizeof ".name" - 1 &&
+             !strcmp(name + strlen(name) - (sizeof ".name" - 1), ".name")) {
+        const unsigned char *text = value;
+        for (size_t i = 0; i < size && text[i] && out < decoded + sizeof decoded - 1; i++)
+            *out++ = text[i] < ' ' || text[i] == 127 ? '?' : text[i];
+    } else if (size == 4 || size == 8) {
         uint64_t n = 0;
         memcpy(&n, value, size);
-        snprintf(decoded, sizeof decoded, "%llu", (unsigned long long)n);
+        out = sp_alloc_number(out, n, 10);
     } else {
         uint32_t hash = 2166136261u;
         const unsigned char *bytes = value;
         for (size_t i = 0; i < size && i < 4096; i++) hash = (hash ^ bytes[i]) * 16777619u;
-        snprintf(decoded, sizeof decoded, "bytes:%zu hash%s:%08x", size, size > 4096 ? "First4KiB" : "", hash);
+        out = sp_alloc_number(sp_alloc_literal(out, "bytes:"), size, 10);
+        out = sp_alloc_literal(out, size > 4096 ? " hashFirst4KiB:" : " hash:");
+        for (unsigned shift = 28; shift > 0; shift -= 4)
+            *out++ = "0123456789abcdef"[(hash >> shift) & 15];
+        *out++ = "0123456789abcdef"[hash & 15];
     }
+    *out = 0;
     sp_mem_query(name, decoded);
 }
 
@@ -112,20 +133,58 @@ EXPORT(kern_return_t, task_info, (task_name_t task, task_flavor_t flavor, task_i
     return status;
 }
 
+// The kernel can return an older revision than the SDK's full struct. Check
+// field ends in Mach words and copy without assuming alignment of the MIG buffer.
+#define VM_HAS(field) ((uint64_t)words * sizeof(integer_t) >= offsetof(vm_statistics64_data_t, field) + \
+    sizeof(((vm_statistics64_data_t *)0)->field))
+#define VM_COPY(dst, field) memcpy(&sample.dst, (const char *)out + offsetof(vm_statistics64_data_t, field), \
+                                    sizeof sample.dst)
+static void observe_vmstat(kern_return_t status, host_info64_t out,
+                           const mach_msg_type_number_t *count, uintptr_t caller) {
+    mach_msg_type_number_t words = status == KERN_SUCCESS && count ? *count : 0;
+    os_unfair_lock_lock(&vm_lock);
+    bool complete = out && VM_HAS(compressor_page_count);
+    if (sp_mem_vm_due(&vm_rate, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), complete)) {
+        uintptr_t base = sp_diagnostic_guest_base(caller);
+        struct sp_mem_vm_sample sample = {
+            .calls = vm_rate.calls, .words = words, .page_size = vm_page_size,
+            .guest = base != 0, .guest_offset = caller - base,
+            .has_external = VM_HAS(external_page_count), .has_internal = VM_HAS(internal_page_count)
+        };
+#if !TARGET_OS_OSX
+        sample.available = real_os_proc_available_memory();
+        sample.has_available = true;
+#endif
+        VM_COPY(free, free_count);
+        VM_COPY(active, active_count);
+        VM_COPY(inactive, inactive_count);
+        VM_COPY(speculative, speculative_count);
+        VM_COPY(wired, wire_count);
+        VM_COPY(purgeable, purgeable_count);
+        VM_COPY(compressor, compressor_page_count);
+        if (sample.has_external) VM_COPY(external, external_page_count);
+        if (sample.has_internal) VM_COPY(internal, internal_page_count);
+        char line[SP_MEM_VM_LINE];
+        size_t length = sp_mem_vm_format(line, &sample);
+        write(STDERR_FILENO, line, length);
+    }
+    os_unfair_lock_unlock(&vm_lock);
+}
+#undef VM_COPY
+#undef VM_HAS
+
 EXPORT(kern_return_t, host_statistics64, (host_t host, host_flavor_t flavor, host_info64_t out,
                                           mach_msg_type_number_t *count)) {
     kern_return_t status = real_host_statistics64(host, flavor, out, count);
     if (sp_alloc_observing()) {
         int saved = errno;
-        char key[64], value[160];
-        snprintf(key, sizeof key, "host_statistics64(%d)", flavor);
-        if (status == KERN_SUCCESS && flavor == HOST_VM_INFO64 && *count >= HOST_VM_INFO64_COUNT) {
-            vm_statistics64_data_t *vm = (void *)out;
-            snprintf(value, sizeof value, "free:%u active:%u inactive:%u wired:%u compressor:%u",
-                     vm->free_count, vm->active_count, vm->inactive_count, vm->wire_count, vm->compressor_page_count);
-            sp_mem_query(key, value);
+        if (flavor == HOST_VM_INFO64) {
+            uintptr_t caller = (uintptr_t)ptrauth_strip(__builtin_return_address(0), ptrauth_key_return_address);
+            observe_vmstat(status, out, count, caller);
         } else {
-            snprintf(value, sizeof value, "status:%d words:%u", status, status == KERN_SUCCESS ? *count : 0);
+            char key[64], value[160];
+            snprintf(key, sizeof key, "host_statistics64(%d)", flavor);
+            snprintf(value, sizeof value, "status:%d words:%u", status, status == KERN_SUCCESS && count ? *count : 0);
             sp_mem_query(key, value);
         }
         errno = saved;
@@ -348,6 +407,15 @@ void sp_mem_dump(bool warning) {
         if (dropped != reported_dropped) {
             reported_dropped = dropped;
             dprintf(2, "SP_MEM_QUERIES dropped=%llu\n", dropped);
+        }
+        static uint64_t reported_vm_calls;
+        os_unfair_lock_lock(&vm_lock);
+        uint64_t vm_calls = vm_rate.calls;
+        os_unfair_lock_unlock(&vm_lock);
+        if (reported_vm_calls != vm_calls) {
+            reported_vm_calls = vm_calls;
+            dprintf(2, "SP_MEM_QUERIES name=host_statistics64(HOST_VM_INFO64) count=%llu\n",
+                    (unsigned long long)vm_calls);
         }
         if (!warning) return;
         dprintf(2, "SP_MEM_SOURCE event=warning count=%llu dropped=%llu legacyAvailable=%d\n",

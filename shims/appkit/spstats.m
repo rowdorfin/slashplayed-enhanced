@@ -283,6 +283,17 @@ static void sp_stats_memory_sample(const char *phase, unsigned long long warning
     if (sample) sample(mallocLarge, zoneInUse, !strcmp(phase, "warning"));
 }
 
+typedef void (*SPThreadpoolDump)(void);
+static _Atomic(SPThreadpoolDump) sp_stats_threadpool_dump;
+static atomic_bool sp_stats_threadpool_warned;
+
+__attribute__((visibility("default")))
+void sp_stats_schedule_threadpool(SPThreadpoolDump dump) {
+    atomic_store_explicit(&sp_stats_threadpool_dump, dump, memory_order_release);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ dump(); });
+}
+
 static void *sp_stats_watch(void *unused) {
     (void)unused;
     for (;;) {
@@ -308,6 +319,9 @@ static void sp_stats_memory_warning(void) {
     // UIKit delivery and the Metal shim's dispatch-pressure trim are independent.
     // Match these samples to the timestamped SP_MEM_TRIM line when reading the log.
     dispatch_time_t followup = dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC);
+    SPThreadpoolDump dump = atomic_load_explicit(&sp_stats_threadpool_dump, memory_order_acquire);
+    if (dump && !atomic_exchange_explicit(&sp_stats_threadpool_warned, true, memory_order_relaxed))
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ dump(); });
     sp_stats_memory_sample("warning", warnings);
     dispatch_after(followup, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool { sp_stats_memory_sample("warning+2s", warnings); }

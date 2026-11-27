@@ -46,9 +46,11 @@ static uint64_t sp_alloc_large, sp_alloc_zone;
 static bool sp_alloc_coverage;
 static atomic_uint_fast64_t sp_alloc_warning;
 static struct sp_alloc_site sp_alloc_snapshot[SP_ALLOC_SITES];
+static struct sp_alloc_site5_scratch sp_alloc_site5_scratch;
 
 extern kern_return_t sp_host_task_info(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
 extern size_t sp_host_available_memory(void);
+static void sp_threadpool_dump(void);
 extern void sp_mem_init(void *system);
 extern void sp_mem_enable(void);
 extern void sp_mem_dump(bool warning);
@@ -137,30 +139,22 @@ static void sp_alloc_stack(uintptr_t pc[SP_ALLOC_FRAMES], uintptr_t caller, uint
     }
 }
 
-static char *sp_alloc_literal(char *out, const char *s) {
-    while (*s) *out++ = *s++;
-    return out;
-}
-
-static char *sp_alloc_number(char *out, uint64_t n, unsigned base) {
-    char digits[24];
-    unsigned count = 0;
-    do {
-        digits[count++] = "0123456789abcdef"[n % base];
-    } while ((n /= base));
-    while (count) *out++ = digits[--count];
-    return out;
+static char *sp_alloc_site_ids(char *out, const uintptr_t *pc) {
+    out = sp_alloc_number(sp_alloc_literal(out, " site="), sp_alloc_stack_hash(pc, SP_ALLOC_FRAMES), 16);
+    out = sp_alloc_number(sp_alloc_literal(out, " site4="), sp_alloc_stack_hash(pc, 4), 16);
+    return sp_alloc_number(sp_alloc_literal(out, " site5="), sp_alloc_stack_hash(pc, 5), 16);
 }
 
 static void sp_alloc_big(size_t size, enum sp_alloc_kind kind, const uintptr_t *pc, uint64_t tid, uint64_t now) {
     char line[512], *out = sp_alloc_literal(line, "SP_ALLOC_BIG bytes=");
+    _Static_assert(sizeof line >= 200 + SP_ALLOC_FRAMES * 25, "SP_ALLOC_BIG line capacity");
     out = sp_alloc_number(out, size, 10);
     out = sp_alloc_literal(out, " tid=");
     out = sp_alloc_number(out, tid, 10);
     out = sp_alloc_literal(out, " elapsedMs=");
     out = sp_alloc_number(out, sp_alloc_ns(now - sp_alloc_start) / 1000000, 10);
-    out = sp_alloc_literal(out, kind == SP_HEAP ? " kind=heap site=" : " kind=vm site=");
-    out = sp_alloc_number(out, sp_alloc_stack_hash(pc), 16);
+    out = sp_alloc_literal(out, kind == SP_HEAP ? " kind=heap" : " kind=vm");
+    out = sp_alloc_site_ids(out, pc);
     out = sp_alloc_literal(out, " stack=");
     for (unsigned i = 0; i < SP_ALLOC_FRAMES && pc[i]; i++) {
         if (i) *out++ = ',';
@@ -379,12 +373,13 @@ static void sp_alloc_add_thread(struct sp_alloc_thread_sample *names, unsigned *
 static void sp_alloc_print_site(const char *reason, const char *rank, unsigned index,
                                 const struct sp_alloc_thread_sample *names, unsigned count) {
     const struct sp_alloc_site *s = &sp_alloc_snapshot[index];
-    char line[1536];
+    char line[2048];
+    // At most 90 image bytes, "+0x", 16 hex digits, and a comma per frame.
+    _Static_assert(sizeof line >= 640 + SP_ALLOC_FRAMES * 110, "SP_ALLOC_TOP line capacity");
     char *out = sp_alloc_literal(line, "SP_ALLOC_TOP reason=");
     out = sp_alloc_literal(out, reason);
     out = sp_alloc_literal(sp_alloc_literal(out, " rank="), rank);
-    out = sp_alloc_literal(out, " site=");
-    out = sp_alloc_number(out, sp_alloc_stack_hash(s->pc), 16);
+    out = sp_alloc_site_ids(out, s->pc);
     out = sp_alloc_literal(out, " stack=");
     for (unsigned i = 0; i < SP_ALLOC_FRAMES && s->pc[i]; i++) {
         uintptr_t pc = s->pc[i], base = sp_diagnostic_guest_base(pc);
@@ -421,6 +416,20 @@ static void sp_alloc_print_site(const char *reason, const char *rank, unsigned i
         *out++ = '-';
         out = sp_alloc_number(out, s->previous - s->live, 10);
     } else out = sp_alloc_number(out, s->live - s->previous, 10);
+    *out++ = '\n';
+    sp_lib_write(STDERR_FILENO, line, out - line);
+}
+
+static void sp_alloc_print_site5(const char *reason, const struct sp_alloc_site5 *group) {
+    char line[320], *out = sp_alloc_literal(line, "SP_ALLOC_TOP reason=");
+    out = sp_alloc_literal(out, reason);
+    out = sp_alloc_number(sp_alloc_literal(out, " rank=site5 site5="), group->hash, 16);
+    out = sp_alloc_field(out, " live=", group->live);
+    out = sp_alloc_field(out, " blocks=", group->blocks);
+    out = sp_alloc_field(out, " total=", group->total);
+    out = sp_alloc_field(out, " allocs=", group->allocs);
+    out = sp_alloc_field(out, " frees=", group->frees);
+    out = sp_alloc_field(out, " subSites=", group->sub_sites);
     *out++ = '\n';
     sp_lib_write(STDERR_FILENO, line, out - line);
 }
@@ -475,6 +484,10 @@ static void sp_alloc_dump(const char *reason, bool warning) {
         sp_alloc_print_site(reason, "live", top[i], names, count);
     for (unsigned i = 0; i < 8 && growth[i] != SP_ALLOC_SITES; i++)
         sp_alloc_print_site(reason, "growth", growth[i], names, count);
+    struct sp_alloc_site5 site5[SP_ALLOC_SITE5_TOP];
+    sp_alloc_rank_site5(sp_alloc_snapshot, &sp_alloc_site5_scratch, site5);
+    for (unsigned i = 0; i < SP_ALLOC_SITE5_TOP && site5[i].live; i++)
+        sp_alloc_print_site5(reason, &site5[i]);
     sp_mem_dump(warning);
 }
 
@@ -566,4 +579,8 @@ void sp_alloc_configure(void) {
     sp_lib_write(STDERR_FILENO, imports, sizeof imports - 1);
     sp_mem_enable();
     atomic_store_explicit(&sp_alloc_enabled, true, memory_order_release);
+    // UIKit can start before flavor selection. Schedule from trace setup so the
+    // timer follows game launch even if the launcher spent time on its menus.
+    void (*schedule)(void (*)(void)) = sp_real_dlsym(RTLD_DEFAULT, "sp_stats_schedule_threadpool");
+    if (schedule) schedule(sp_threadpool_dump);
 }

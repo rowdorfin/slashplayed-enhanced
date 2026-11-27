@@ -7,9 +7,9 @@ static uint64_t mix(uint64_t x) {
     return x ^ (x >> 33);
 }
 
-uint64_t sp_alloc_stack_hash(const uintptr_t pc[SP_ALLOC_FRAMES]) {
+uint64_t sp_alloc_stack_hash(const uintptr_t *pc, unsigned frames) {
     uint64_t hash = 0;
-    for (unsigned i = 0; i < SP_ALLOC_FRAMES; i++) hash = mix(hash ^ pc[i]);
+    for (unsigned i = 0; i < frames; i++) hash = mix(hash ^ pc[i]);
     return hash;
 }
 
@@ -89,7 +89,7 @@ void sp_alloc_add(struct sp_alloc_tracker *t, uintptr_t address, uint64_t size, 
     struct sp_alloc_block old = sp_alloc_find(t, address);
     if (old.generation) sp_alloc_remove(t, old, now, !old.resizing);
     unsigned i = slot(t, address);
-    unsigned s = sp_alloc_stack_hash(pc) & (SP_ALLOC_SITES - 1);
+    unsigned s = sp_alloc_stack_hash(pc, SP_ALLOC_FRAMES) & (SP_ALLOC_SITES - 1);
     for (unsigned n = 0; n < SP_ALLOC_SITES; n++, s = (s + 1) & (SP_ALLOC_SITES - 1)) {
         struct sp_alloc_site *site = &t->sites[s];
         if (site->allocs && memcmp(site->pc, pc, sizeof site->pc)) continue;
@@ -118,6 +118,7 @@ void sp_alloc_add(struct sp_alloc_tracker *t, uintptr_t address, uint64_t size, 
         if (site->blocks > site->peak_blocks) site->peak_blocks = site->blocks;
         return;
     }
+    // Covers both a new stack with no free site slot and an untracked block.
     t->dropped++;
 }
 
@@ -169,4 +170,91 @@ void sp_alloc_rank(struct sp_alloc_site *sites, size_t count, unsigned live[16],
         scores[i] = sites[i].live > sites[i].previous ? sites[i].live - sites[i].previous : 0;
         if (scores[i]) rank(growth, 8, scores, i);
     }
+}
+
+void sp_alloc_rank_site5(const struct sp_alloc_site snapshot[SP_ALLOC_SITES],
+                         struct sp_alloc_site5_scratch *scratch, struct sp_alloc_site5 top[SP_ALLOC_SITE5_TOP]) {
+    memset(scratch->buckets, 0, sizeof scratch->buckets);
+    memset(top, 0, sizeof *top * SP_ALLOC_SITE5_TOP);
+    unsigned count = 0;
+    for (unsigned i = 0; i < SP_ALLOC_SITES; i++) {
+        const struct sp_alloc_site *site = &snapshot[i];
+        if (!site->allocs) continue;
+        uint64_t hash = sp_alloc_stack_hash(site->pc, 5);
+        const unsigned mask = SP_ALLOC_SITE5_BUCKETS - 1;
+        unsigned bucket = hash & mask;
+        // Store one-based group indices so even a zero hash can be grouped.
+        while (scratch->buckets[bucket] && scratch->groups[scratch->buckets[bucket] - 1].hash != hash)
+            bucket = (bucket + 1) & mask;
+        if (!scratch->buckets[bucket]) {
+            scratch->groups[count] = (struct sp_alloc_site5){.hash = hash};
+            scratch->buckets[bucket] = ++count;
+        }
+        struct sp_alloc_site5 *group = &scratch->groups[scratch->buckets[bucket] - 1];
+        group->live += site->live;
+        group->blocks += site->blocks;
+        group->total += site->total;
+        group->allocs += site->allocs;
+        group->frees += site->frees;
+        group->sub_sites++;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        const struct sp_alloc_site5 *group = &scratch->groups[i];
+        for (unsigned j = 0; j < SP_ALLOC_SITE5_TOP; j++) {
+            if (group->live <= top[j].live) continue;
+            memmove(top + j + 1, top + j, (SP_ALLOC_SITE5_TOP - j - 1) * sizeof *top);
+            top[j] = *group;
+            break;
+        }
+    }
+}
+
+char *sp_alloc_literal(char *out, const char *s) {
+    while (*s) *out++ = *s++;
+    return out;
+}
+
+char *sp_alloc_number(char *out, uint64_t n, unsigned base) {
+    char digits[24];
+    unsigned count = 0;
+    do {
+        digits[count++] = "0123456789abcdef"[n % base];
+    } while ((n /= base));
+    while (count) *out++ = digits[--count];
+    return out;
+}
+
+bool sp_mem_vm_due(struct sp_mem_vm_rate *rate, uint64_t now_ns, bool complete) {
+    rate->calls++;
+    if (!complete || (rate->emitted && now_ns - rate->last_ns < UINT64_C(1000000000))) return false;
+    rate->last_ns = now_ns;
+    rate->emitted = true;
+    return true;
+}
+
+size_t sp_mem_vm_format(char line[SP_MEM_VM_LINE], const struct sp_mem_vm_sample *vm) {
+    // Worst case is under 330 bytes: four wider fields and ten uint32 values,
+    // including labels, newline, and terminator.
+    char *out = sp_alloc_literal(line, "SP_MEM_VMSTAT");
+#define FIELD(name, value) out = sp_alloc_number(sp_alloc_literal(out, " " name "="), value, 10)
+    FIELD("calls", vm->calls);
+    FIELD("words", vm->words);
+    FIELD("pageSize", vm->page_size);
+    FIELD("free", vm->free);
+    FIELD("active", vm->active);
+    FIELD("inactive", vm->inactive);
+    FIELD("speculative", vm->speculative);
+    FIELD("wired", vm->wired);
+    FIELD("purgeable", vm->purgeable);
+    FIELD("compressor", vm->compressor);
+    if (vm->has_external) { FIELD("external", vm->external); }
+    if (vm->has_internal) { FIELD("internal", vm->internal); }
+    if (vm->has_available) { FIELD("available", vm->available); }
+    else out = sp_alloc_literal(out, " available=n/a");
+#undef FIELD
+    out = sp_alloc_literal(out, vm->guest ? " caller=guest+0x" : " caller=outside_guest");
+    if (vm->guest) out = sp_alloc_number(out, vm->guest_offset, 16);
+    *out++ = '\n';
+    *out = 0;
+    return out - line;
 }
