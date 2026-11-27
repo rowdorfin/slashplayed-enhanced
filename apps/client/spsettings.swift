@@ -53,6 +53,7 @@ private let joystickSizeRange = 100.0...260.0
 private let touchHUDModeKey = "sp_touch_hud_mode"
 private let touchLeftHandedKey = "sp_touch_left_handed"
 private let touchCameraSensitivityKey = "sp_touch_camera_sensitivity"
+private let virtualGamepadKey = "sp_touch_virtual_gamepad"
 private let joystickFloatingKey = "sp_joystick_floating"
 private let joystickDeadzoneKey = "sp_joystick_deadzone"
 private let autorunKey = "sp_autorun_enabled"
@@ -166,6 +167,7 @@ struct Snapshot {
     var touchHUDMode = 0
     var touchLeftHanded = false
     var touchCameraSensitivity = 1.0
+    var virtualGamepad = false
     var joystickFloating = false
     var joystickDeadzone = 0.12
     var autorun = false
@@ -226,6 +228,7 @@ final class Settings: ObservableObject {
         s.touchHUDMode = defaults.integer(forKey: touchHUDModeKey) == 1 ? 1 : 0
         s.touchLeftHanded = defaults.bool(forKey: touchLeftHandedKey)
         s.touchCameraSensitivity = touchControlValue(touchCameraSensitivityKey, in: 0.25...3)
+        s.virtualGamepad = defaults.bool(forKey: virtualGamepadKey)
         s.joystickFloating = defaults.bool(forKey: joystickFloatingKey)
         let deadzone = (defaults.object(forKey: joystickDeadzoneKey) as? NSNumber)?.doubleValue ?? 0.12
         s.joystickDeadzone = deadzone.isFinite ? min(0.5, max(0, deadzone)) : 0.12
@@ -807,6 +810,11 @@ struct SettingsView: View {
                 UserDefaults.standard.set($0, forKey: joystickAnalogKey)
                 settings.reload()
             }))
+            Toggle("Gamepad virtual experimental", isOn: Binding(get: { settings.now.virtualGamepad }, set: {
+                UserDefaults.standard.set($0, forKey: virtualGamepadKey)
+                settings.reload()
+            }))
+            .disabled(!settings.now.joystickAnalog || settings.now.touchHUDMode != 1)
             Toggle("Show Joystick", isOn: Binding(get: { settings.now.joystickEnabled }, set: {
                 UserDefaults.standard.set($0, forKey: joystickEnabledKey)
                 settings.reload()
@@ -845,7 +853,7 @@ struct SettingsView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Drag the stick to move your character. Hold the ↔ handle for two seconds until its border fills, then drag to reposition. Lift to lock it again.")
-                Text("Por padrão, o joystick envia WASD, inclusive nas diagonais. O modo analógico requer suporte a controle no jogo.")
+                Text("Por padrão, o joystick envia WASD, inclusive nas diagonais. O modo analógico requer suporte a controle no jogo. No HUD 5.0, o modo experimental acrescenta câmera e A, LB, RB e X. Atribua os botões nas configurações do Forever.")
             }
         }
     }

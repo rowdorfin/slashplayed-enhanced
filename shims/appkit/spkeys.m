@@ -10,6 +10,8 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 @property(nonatomic) NSInteger compactColumn; // One-based, mirrored from the outside of each digit row.
 @property(nonatomic) BOOL editingPosition;
 @property(nonatomic) BOOL compactHUD;
+@property(nonatomic, weak) SPJoystick *gamepad;
+@property(nonatomic, copy) NSString *gamepadElement;
 - (instancetype)initWithName:(NSString *)name label:(NSString *)label usage:(unsigned)usage position:(CGPoint)position;
 - (void)layoutInRect:(CGRect)rect;
 - (void)cancelInputWithReason:(NSString *)reason;
@@ -34,7 +36,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
 @end
 
 @implementation SPKeyboardButton {
-    NSString *_name, *_enabledKey, *_positionKey;
+    NSString *_name, *_enabledKey, *_positionKey, *_pressedGamepadElement;
     unsigned _usage;
     BOOL _actionActive, _layoutDeferred;
     UIView *_face;
@@ -103,8 +105,17 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     [self cancelInputWithReason:@"edit mode changed"];
     _editingPosition = editingPosition;
 }
+- (void)setGamepadElement:(NSString *)element {
+    if (_gamepadElement == element || [_gamepadElement isEqualToString:element]) return;
+    [self cancelInputWithReason:@"gamepad mode changed"];
+    _gamepadElement = [element copy];
+}
 - (void)releaseKeyWithReason:(NSString *)reason {
     _latched = NO;
+    if (_pressedGamepadElement) {
+        [self.gamepad setGamepadButton:_pressedGamepadElement pressed:NO];
+        _pressedGamepadElement = nil;
+    }
     if (_keyDown) {
         if (_usage == 0x2C) sp_space_last_release = reason;
         sp_touch_key(_usage, NO);
@@ -160,7 +171,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     }
     CGRect centers = room ? CGRectInset(lane, outer / 2 + 8, outer / 2 + 8) : CGRectZero;
     BOOL enabled = [defaults objectForKey:_enabledKey] ? [defaults boolForKey:_enabledKey]
-                                                       : !(_usage >= 0xE0 && _usage <= 0xE2);
+                                                       : self.gamepadElement || !(_usage >= 0xE0 && _usage <= 0xE2);
     BOOL geometryChanged = !CGRectEqualToRect(centers, _centers) ||
                            (room && outer != CGRectGetWidth(self.bounds));
     if (enabled && room && geometryChanged && _handle && _touch && !_moving) {
@@ -196,7 +207,12 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     _face.layer.cornerRadius = self.compactHUD ? face / 2 : 8;
     _face.layer.borderWidth = self.compactHUD ? 1 : 1.5;
     _label.text = self.compactHUD && [_name isEqualToString:@"autorun"] ? @"⇈" : self.accessibilityLabel;
-    if (_handle) _label.text = @"Pular";
+    if (_handle) _label.text = self.compactHUD ? @"↑" : @"Pular";
+    if (self.gamepadElement) {
+        if ([self.gamepadElement isEqualToString:GCInputLeftShoulder]) _label.text = @"LB";
+        else if ([self.gamepadElement isEqualToString:GCInputRightShoulder]) _label.text = @"RB";
+        else _label.text = [self.gamepadElement isEqualToString:GCInputButtonA] ? @"A" : @"X";
+    }
     [self setHighlighted:self.highlighted];
     _face.center = CGPointMake(outer / 2, outer / 2);
     _label.frame = CGRectInset(_face.bounds, 4, 0);
@@ -243,7 +259,9 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
             [self beginMove:touch];
             break;
         }
-        if (_usage && !_keyDown) {
+        if (self.gamepadElement && [self.gamepad setGamepadButton:self.gamepadElement pressed:YES])
+            _pressedGamepadElement = self.gamepadElement;
+        else if (_usage && !_keyDown) {
             sp_touch_key(_usage, YES);
             _keyDown = YES;
         }
@@ -256,7 +274,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
     if (!_touch || ![touches containsObject:_touch]) return;
     if (_editingPosition) { [self moveWithTouch:_touch]; return; }
     if (_handle) { [_handle touchesMoved:touches withEvent:event]; return; }
-    if (_compactColumn || _action || _usage == 0x2B) return;
+    if (_compactColumn || _action || _usage == 0x2B || _pressedGamepadElement) return;
     CGPoint at = [_touch locationInView:self.superview];
     if (!_moving && hypot(at.x - _fingerStart.x, at.y - _fingerStart.y) < 10) return;
     _moving = YES;
@@ -268,7 +286,7 @@ static const CGFloat sp_keyboard_default_size = 76, sp_keyboard_min_size = 44, s
         [self touchesMoved:touches withEvent:event];
         BOOL activate = !_editingPosition && !_moving && [self containsKeyPoint:[_touch locationInView:self]];
         BOOL modifier = _usage >= 0xE0 && _usage <= 0xE2;
-        if (activate && modifier && !_latched && _touch.tapCount == 2) _latched = YES;
+        if (activate && modifier && !_pressedGamepadElement && !_latched && _touch.tapCount == 2) _latched = YES;
         else [self releaseKeyWithReason:@"touch ended"];
         _touch = nil;
         [self endMove];

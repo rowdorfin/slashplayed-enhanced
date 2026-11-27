@@ -826,6 +826,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
 #if !TARGET_OS_VISION
     SPThumbButton *_thumbButton;
     SPJoystick *_joystick;
+    SPGamepadCamera *_gamepadCamera;
     NSMapTable<UITouch *, NSValue *> *_hudTaps;
     SPKeyboardButton *_autorun;
     NSArray<SPKeyboardButton *> *_keyboardButtons;
@@ -901,6 +902,9 @@ static BOOL sp_physical_touch(UITouch *touch) {
         _touchEnabled = NO;
         [_touchChat close];
         [_thumbButton cancelHold];
+        [_gamepadCamera cancelInput];
+        [_gamepadCamera removeFromSuperview];
+        _gamepadCamera = nil;
         [_joystick setSuspended:YES];
         for (SPKeyboardButton *button in _keyboardButtons) {
             [button cancelInputWithReason:@"touch controls disabled"];
@@ -917,6 +921,18 @@ static BOOL sp_physical_touch(UITouch *touch) {
     _touchEnabled = YES;
     _joystick = [[SPJoystick alloc] initWithFrame:CGRectZero];
     [self addSubview:_joystick];
+    _gamepadCamera = [[SPGamepadCamera alloc] initWithFrame:CGRectZero];
+    _gamepadCamera.joystick = _joystick;
+    _gamepadCamera.hidden = YES;
+    _gamepadCamera.exclusiveTouch = NO;
+    _gamepadCamera.layer.borderWidth = 1;
+    _gamepadCamera.layer.borderColor = sp_hud_ink().CGColor;
+    _gamepadCamera.backgroundColor = sp_hud_surface();
+    _gamepadCamera.tintColor = sp_hud_ink();
+    _gamepadCamera.accessibilityLabel = @"Câmera do controle";
+    [_gamepadCamera addSubview:[[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"camera"]]];
+    _gamepadCamera.subviews.firstObject.userInteractionEnabled = NO;
+    [self addSubview:_gamepadCamera];
     _thumbButton = [[SPThumbButton alloc] initWithFrame:CGRectZero];
     NSMutableArray<SPKeyboardButton *> *buttons = [NSMutableArray arrayWithArray:@[
         [[SPKeyboardButton alloc] initWithName:@"space" label:@"Pular" usage:0x2C position:CGPointMake(1, 0.79)],
@@ -947,7 +963,10 @@ static BOOL sp_physical_touch(UITouch *touch) {
     _joystick.autorunChanged = ^(BOOL active) { [run setActionActive:active]; };
     [buttons addObjectsFromArray:@[tab, chat, zoomIn, zoomOut, _autorun]];
     _keyboardButtons = [buttons copy];
-    for (SPKeyboardButton *button in buttons) [self addSubview:button];
+    for (SPKeyboardButton *button in buttons) {
+        button.gamepad = _joystick;
+        [self addSubview:button];
+    }
     [self addSubview:_thumbButton];
 
     _overlayMenu = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1036,7 +1055,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
     CGRect jump = hud ? sp_hud_jump_area(game, safe, !leftHanded) : safe;
     CGRect menuArea = hud ? movement : safe;
     CGFloat opacity = sp_touch_setting(@"sp_touch_controls_opacity", 0.2, 1);
-    CGFloat menuHeight = hud ? 38 : 32;
+    CGFloat menuHeight = 32;
     _overlayMenu.hidden = CGRectIsNull(menuArea) || menuArea.size.width < 44 || menuArea.size.height < menuHeight + 4;
     if (!_overlayMenu.hidden)
         _overlayMenu.frame = CGRectMake(CGRectGetMidX(menuArea) - 22, CGRectGetMinY(menuArea) + 4, 44, menuHeight);
@@ -1050,8 +1069,24 @@ static BOOL sp_physical_touch(UITouch *touch) {
     _thumbButton.alpha = _joystick.alpha = opacity;
     _thumbButton.compactHUD = _joystick.compactHUD = hud;
     _joystick.showsMoveHandle = !hud || _editingControls;
-    CGRect stickArea = hud && !_overlayHidden ? sp_hud_band(movement, game, 0.56, 1) : area;
+    // Leave the lower chat strip free in the default HUD. The stick stays movable inside its own lane.
+    CGRect stickArea = hud && !_overlayHidden ? sp_hud_band(movement, game, 0.43, 0.83) : area;
     [_joystick layoutInRect:stickArea];
+    BOOL experimental = hud && !_overlayHidden && !_editingControls && _joystick.gamepadReady;
+    CGRect camera = CGRectNull;
+    if (experimental && !CGRectIsNull(jump) && jump.size.height >= 44) {
+        CGFloat left = leftHanded ? CGRectGetMaxX(jump) + 6 : CGRectGetMinX(jump) - 50;
+        camera = CGRectMake(left, CGRectGetMaxY(jump) - 46, 44, 44);
+    }
+    if (CGRectIsNull(camera) || !CGRectEqualToRect(_gamepadCamera.frame, camera))
+        [_gamepadCamera cancelInput];
+    _gamepadCamera.hidden = CGRectIsNull(camera);
+    if (!_gamepadCamera.hidden) {
+        _gamepadCamera.frame = camera;
+        _gamepadCamera.layer.cornerRadius = 22;
+        _gamepadCamera.alpha = opacity;
+        _gamepadCamera.subviews.firstObject.frame = CGRectMake(12, 12, 20, 20);
+    }
     CGRect thumbArea = area;
     if (hud && !_overlayHidden)
         thumbArea = _showTouchAuxiliaries ? sp_hud_band(movement, game, 0.12, 0.29) : CGRectNull;
@@ -1061,21 +1096,25 @@ static BOOL sp_physical_touch(UITouch *touch) {
                   !_joystick.hidden && ![NSUserDefaults.standardUserDefaults boolForKey:@"sp_joystick_analog"];
     if (!canRun) [_joystick stopAutorun];
     NSArray<NSString *> *modifiers = @[@"ctrl", @"shift", @"alt"];
+    NSArray<NSString *> *gamepadButtons = sp_gamepad_buttons();
     for (SPKeyboardButton *button in _keyboardButtons) {
         button.alpha = opacity;
         button.editingPosition = _editingControls;
         button.compactHUD = hud;
         CGRect buttonArea = area;
+        NSUInteger index = [modifiers indexOfObject:button.name];
+        BOOL jumpButton = [button.name isEqualToString:@"space"];
+        button.gamepadElement = experimental && (jumpButton || index != NSNotFound)
+            ? gamepadButtons[jumpButton ? 0 : index + 1] : nil;
         if (hud && !_overlayHidden) {
-            if ([button.name isEqualToString:@"space"]) {
+            if (jumpButton) {
                 buttonArea = jump;
             } else if (button == _autorun) {
-                buttonArea = sp_hud_band(movement, game, 0.44, 0.56);
+                buttonArea = sp_hud_band(movement, game, 0.83, 1);
             } else {
-                NSUInteger index = [modifiers indexOfObject:button.name];
                 buttonArea = CGRectNull;
-                if (_showTouchAuxiliaries && index != NSNotFound && !CGRectIsNull(movement)) {
-                    CGRect row = sp_hud_band(movement, game, 0.29, 0.44);
+                if ((_showTouchAuxiliaries || experimental) && index != NSNotFound && !CGRectIsNull(movement)) {
+                    CGRect row = sp_hud_band(movement, game, 0.29, 0.43);
                     if (!CGRectIsNull(row)) {
                         CGFloat cell = row.size.width / modifiers.count;
                         buttonArea = CGRectMake(row.origin.x + index * cell, row.origin.y, cell, row.size.height);
@@ -1111,6 +1150,7 @@ static BOOL sp_physical_touch(UITouch *touch) {
     sp_stub_log([NSString stringWithFormat:@"input: suspended by %@", notification.name ?: @"direct call"].UTF8String);
     [_touchChat close];
     [_thumbButton cancelHold];
+    [_gamepadCamera cancelInput];
     NSString *reason = [NSString stringWithFormat:@"suspension (%@)", notification.name ?: @"direct call"];
     for (SPKeyboardButton *button in _keyboardButtons) [button cancelInputWithReason:reason];
     [_joystick setSuspended:YES];

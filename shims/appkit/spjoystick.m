@@ -8,6 +8,18 @@ static const CGFloat sp_joystick_default_size = 156, sp_joystick_min_size = 100,
 static const CGFloat sp_joystick_touch_margin = 52;
 static const NSTimeInterval sp_joystick_move_hold = 2;
 
+static NSArray<NSString *> *sp_gamepad_buttons(void) {
+    return @[GCInputButtonA, GCInputLeftShoulder, GCInputRightShoulder, GCInputButtonX];
+}
+
+static CGPoint sp_stick_value(CGPoint offset, CGFloat travel, CGFloat deadzone) {
+    CGFloat x = offset.x / travel, y = -offset.y / travel;
+    CGFloat length = hypot(x, y);
+    if (length <= deadzone) return CGPointZero;
+    CGFloat strength = MIN(1, (length - deadzone) / (1 - deadzone));
+    return CGPointMake(x / length * strength, y / length * strength);
+}
+
 @protocol SPMovableControl <NSObject>
 - (void)beginMove:(UITouch *)touch;
 - (void)moveWithTouch:(UITouch *)touch;
@@ -19,6 +31,9 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 @property(nonatomic) BOOL showsMoveHandle;
 @property(nonatomic, readonly) CGPoint value;
 @property(nonatomic, readonly) GCController *controller;
+@property(nonatomic, readonly) BOOL gamepadReady;
+- (BOOL)setGamepadButton:(NSString *)element pressed:(BOOL)pressed;
+- (void)setCameraAxis:(CGPoint)value;
 - (void)layoutInRect:(CGRect)rect;
 @property(nonatomic, copy) void (^autorunChanged)(BOOL);
 - (void)toggleAutorun;
@@ -172,7 +187,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     GCVirtualController *_virtualController;
     CGPoint _value, _position, _fingerStart, _centerStart, _stickOrigin;
     CGRect _centers;
-    BOOL _moving, _suspended, _connected, _gameReady, _requested, _analog;
+    BOOL _moving, _suspended, _connected, _gameReady, _requested, _analog, _analogFallback, _fullGamepad;
     unsigned _movementKeys;
     BOOL _autorun;
 }
@@ -215,12 +230,39 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 
 - (CGPoint)value { return _value; }
 - (GCController *)controller { return _connected ? _virtualController.controller : nil; }
+- (BOOL)gamepadReady { return _fullGamepad && _connected; }
+
+- (BOOL)setGamepadButton:(NSString *)element pressed:(BOOL)pressed {
+    if (!self.gamepadReady) return NO;
+    [_virtualController setValue:pressed ? 1 : 0 forButtonElement:element];
+    return YES;
+}
+
+- (void)setCameraAxis:(CGPoint)value {
+    if (self.gamepadReady) [_virtualController setPosition:value forDirectionPadElement:GCInputRightThumbstick];
+}
+
+- (void)disconnectController {
+    if (_fullGamepad && _connected) {
+        [self setCameraAxis:CGPointZero];
+        for (NSString *element in sp_gamepad_buttons()) [self setGamepadButton:element pressed:NO];
+    }
+    [_virtualController disconnect];
+    _virtualController = nil;
+    _connected = NO;
+}
 
 - (void)drawValue {
     CGFloat size = self.bounds.size.width, travel = size * 0.30, knobSize = size * 0.36;
     _knob.bounds = CGRectMake(0, 0, knobSize, knobSize);
     _knob.layer.cornerRadius = knobSize / 2;
-    _knob.center = CGPointMake(size / 2 + _value.x * travel, size / 2 - _value.y * travel);
+    CGPoint center = _stickTouch ? _stickOrigin : CGPointMake(size / 2, size / 2);
+    CGPoint thumb = CGPointMake(center.x + _value.x * travel, center.y - _value.y * travel);
+    CGFloat dx = thumb.x - size / 2, dy = thumb.y - size / 2;
+    CGFloat maxDistance = (size - knobSize) / 2;
+    CGFloat distance = hypot(dx, dy);
+    CGFloat inset = distance > maxDistance ? maxDistance / distance : 1;
+    _knob.center = CGPointMake(size / 2 + dx * inset, size / 2 + dy * inset);
     _status.frame = _knob.bounds;
 }
 
@@ -233,7 +275,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     for (unsigned i = 0; i < 4; i++) {
         unsigned bit = 1 << i;
         BOOL held = (_movementKeys & bit) != 0;
-        BOOL next = !_analog && ((i == 0 && _autorun) || axes[i] >= (held ? 0.18 : 0.27));
+        BOOL next = (!_analog || _analogFallback) && ((i == 0 && _autorun) || axes[i] >= (held ? 0.18 : 0.27));
         if (held == next) continue;
         _movementKeys ^= bit;
         sp_touch_key(usages[i], next);
@@ -273,15 +315,21 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
                 self.window.windowScene.activationState == UISceneActivationStateForegroundActive;
     if (!want) {
         [self cancelInput];
-        [_virtualController disconnect];
-        _virtualController = nil;
-        _connected = NO;
+        BOOL wasConnected = _connected;
+        [self disconnectController];
+        _analogFallback = NO;
         _status.text = nil;
+        if (wasConnected) [self.superview setNeedsLayout];
         return;
     }
     if (_virtualController) return;  // includes an asynchronous connect already in progress
     GCVirtualControllerConfiguration *config = [GCVirtualControllerConfiguration new];
-    config.elements = [NSSet setWithObject:GCInputLeftThumbstick];
+    NSMutableSet<NSString *> *elements = [NSMutableSet setWithObject:GCInputLeftThumbstick];
+    if (_fullGamepad) {
+        [elements addObject:GCInputRightThumbstick];
+        [elements addObjectsFromArray:sp_gamepad_buttons()];
+    }
+    config.elements = elements;
     config.hidden = YES;  // our own view supplies the axes, with no system-wide touch overlay
     GCVirtualController *virtualController = [[GCVirtualController alloc] initWithConfiguration:config];
     _virtualController = virtualController;
@@ -295,14 +343,16 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
             self->_connected = !error && virtualController.controller != nil;
             self->_status.text = self->_connected ? nil : @"!";
             if (!self->_connected) {
-                sp_stub_log("input: virtual left joystick could not connect; next touch can retry");
-                [virtualController disconnect];
-                self->_virtualController = nil;
-                self->_stickTouch = nil;
-                [self sendValue:CGPointZero];
+                sp_stub_log("input: virtual controller connection failed; using WASD until retry");
+                [self disconnectController];
+                self->_analogFallback = YES;
+                [self sendValue:self->_value];
                 return;
             }
-            sp_stub_log("input: virtual left joystick connected");
+            self->_analogFallback = NO;
+            [self.superview setNeedsLayout];
+            sp_stub_log(self->_fullGamepad ? "input: experimental virtual gamepad connected"
+                                           : "input: virtual left joystick connected");
             // The first touch deliberately starts connection after the game is in use. Preserve
             // that held touch, but never revive one lifted/cancelled while the connection was pending.
             UITouch *touch = self->_stickTouch;
@@ -342,20 +392,22 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 - (void)layoutInRect:(CGRect)rect {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     BOOL analog = [defaults boolForKey:@"sp_joystick_analog"];
-    if (_analog != analog) {
+    BOOL fullGamepad = analog && self.compactHUD && [defaults boolForKey:@"sp_touch_virtual_gamepad"];
+    if (_analog != analog || _fullGamepad != fullGamepad) {
         [self cancelInput];
-        [_virtualController disconnect];
-        _virtualController = nil;
-        _connected = _requested = NO;
+        [self disconnectController];
+        _requested = _analogFallback = NO;
         _status.text = nil;
         _analog = analog;
+        _fullGamepad = fullGamepad;
     }
     BOOL enabled = ![defaults objectForKey:sp_joystick_enabled_key] || [defaults boolForKey:sp_joystick_enabled_key];
     CGFloat size = self.compactHUD
-        ? sp_touch_number(sp_joystick_size_key, 120, 104, 132)
+        ? sp_touch_number(sp_joystick_size_key, sp_joystick_default_size, sp_joystick_min_size, sp_joystick_max_size)
+            * 108 / sp_joystick_default_size
         : sp_touch_number(sp_joystick_size_key, sp_joystick_default_size, sp_joystick_min_size, sp_joystick_max_size);
     size *= sp_touch_setting(@"sp_touch_controls_scale", 0.6, 1.6);
-    CGFloat minimum = self.compactHUD ? 82 : sp_joystick_min_size;
+    CGFloat minimum = self.compactHUD ? 68 : sp_joystick_min_size;
     BOOL room = !CGRectIsNull(rect) && MIN(rect.size.width, rect.size.height) >= minimum + 16;
     if (room) size = MIN(size, MIN(rect.size.width, rect.size.height) - 16);
     CGRect centers = room ? CGRectInset(rect, size / 2 + 8, size / 2 + 8) : CGRectZero;
@@ -391,7 +443,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
         }
         _handle.hidden = !self.showsMoveHandle;
         _handle.frame = CGRectMake(size - handleSize, 0, handleSize, handleSize);
-        CGFloat margin = self.compactHUD ? 8 : sp_joystick_touch_margin;
+        CGFloat margin = self.compactHUD ? 0 : sp_joystick_touch_margin;
         _shield.frame = CGRectInset(self.bounds, -margin, -margin);
         [self drawValue];
     }
@@ -406,6 +458,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
     if ([self containsStickPoint:point]) return YES;
+    if (self.compactHUD) return NO;  // HUD 5's joystick keeps the surrounding chat and game area tappable.
     // Extend UIKit hit testing outside the visible circle without blocking a hardware pointer's clicks
     // or hover there. allTouches can still be empty during UIKit's initial hit test.
     if (event && event.type != UIEventTypeTouches) return NO;
@@ -415,19 +468,14 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
             touch.type != UITouchTypeDirect) return NO;
     }
     CGFloat r = self.bounds.size.width / 2;
-    return hypot(point.x - r, point.y - r) <= r + (self.compactHUD ? 8 : sp_joystick_touch_margin);
+    return hypot(point.x - r, point.y - r) <= r + sp_joystick_touch_margin;
 }
 
 - (void)updateTouch:(UITouch *)touch {
     CGPoint p = [touch locationInView:self];
-    CGFloat travel = self.bounds.size.width * 0.30;
-    CGFloat x = (p.x - _stickOrigin.x) / travel;
-    CGFloat y = (_stickOrigin.y - p.y) / travel;
-    CGFloat length = hypot(x, y);
-    // A radial dead zone removes thumb jitter while preserving every diagonal and analog speed.
+    CGPoint offset = CGPointMake(p.x - _stickOrigin.x, p.y - _stickOrigin.y);
     CGFloat deadzone = sp_touch_number(@"sp_joystick_deadzone", 0.12, 0, 0.5);
-    CGFloat strength = MIN(1, MAX(0, (length - deadzone) / (1 - deadzone)));
-    [self sendValue:length > 0 ? CGPointMake(x / length * strength, y / length * strength) : CGPointZero];
+    [self sendValue:sp_stick_value(offset, self.bounds.size.width * 0.30, deadzone)];
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
@@ -440,7 +488,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
         sp_stub_log([NSString stringWithFormat:@"input: joystick touch ready=%d suspended=%d moving=%d hidden=%d window=%d scene=%ld",
                      _gameReady, _suspended, _moving, self.hidden, self.window != nil,
                      (long)self.window.windowScene.activationState].UTF8String);
-    if (_stickTouch || _moving || (_analog && !_gameReady) || self.hidden) return;
+    if (_stickTouch || _moving || self.hidden) return;
     for (UITouch *touch in touches) if (touch.type == UITouchTypeDirect && !sp_physical_touch(touch)) {
         if (![self containsStickPoint:[touch locationInView:self]]) continue;
         // A real new touch in an active scene is fresher than a missed activation notification.
@@ -456,6 +504,7 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
         if ([NSUserDefaults.standardUserDefaults boolForKey:@"sp_joystick_floating"])
             _stickOrigin = [touch locationInView:self];
         _stickTouch = touch;
+        if (_analog && !_gameReady) _analogFallback = YES;
         _requested = YES;
         [self updateConnection];
         if (_stickTouch == touch) [self updateTouch:touch];
@@ -493,5 +542,55 @@ static const NSTimeInterval sp_joystick_move_hold = 2;
     if (!_moving) return;
     _moving = NO;
     [NSUserDefaults.standardUserDefaults setObject:@[@(_position.x), @(_position.y)] forKey:sp_joystick_position_key];
+}
+@end
+
+@interface SPGamepadCamera : UIControl
+@property(nonatomic, weak) SPJoystick *joystick;
+- (void)cancelInput;
+@end
+
+@implementation SPGamepadCamera {
+    UITouch *_touch;
+    CGPoint _origin;
+}
+
+- (void)cancelInput {
+    if (!_touch) return;
+    _touch = nil;
+    [self.joystick setCameraAxis:CGPointZero];
+    self.highlighted = NO;
+}
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    CGFloat radius = self.bounds.size.width / 2;
+    return hypot(point.x - radius, point.y - radius) <= radius;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (_touch || !self.joystick.gamepadReady) return;
+    for (UITouch *touch in touches) {
+        if (touch.type != UITouchTypeDirect || sp_physical_touch(touch)) continue;
+        _touch = touch;
+        _origin = [touch locationInView:self];
+        self.highlighted = YES;
+        break;
+    }
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (!_touch || ![touches containsObject:_touch]) return;
+    CGPoint point = [_touch locationInView:self];
+    CGPoint offset = CGPointMake(point.x - _origin.x, point.y - _origin.y);
+    CGFloat travel = 24 / sp_touch_setting(@"sp_touch_camera_sensitivity", 0.25, 3);
+    [self.joystick setCameraAxis:sp_stick_value(offset, travel, 0.12)];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (_touch && [touches containsObject:_touch]) [self cancelInput];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self touchesEnded:touches withEvent:event];
 }
 @end
