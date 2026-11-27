@@ -1,5 +1,164 @@
 #include <assert.h>
-#include "../spgraphics.h"
+#include "../spmemory.h"
+
+static void memory_tests(void) {
+    const char *original = "SET ThreadPoolPerThreadAllocator \"1\"\r\n"
+                           "\tset ThreadPoolPerThreadAllocator\t\"2\" \r\n"
+                           "SET maxFPS \"75\"";
+    char *output, *snapshot;
+    assert(sp_memory_edit(original, 0, NULL, NULL, &output, &snapshot));
+    assert(!output && !snapshot);
+    assert(sp_memory_edit(original, 0, "0", NULL, &output, &snapshot));
+    assert(output && strstr(output, "\tset ThreadPoolPerThreadAllocator\t\"0\" \r\n"));
+    assert(snapshot && !strcmp(snapshot, "\tset ThreadPoolPerThreadAllocator\t\"2\" \r\n"));
+    char *allocator = output, *allocatorBackup = snapshot;
+
+    // The other override sees a separate baseline, and an existing matching value needs no backup.
+    assert(sp_memory_edit(allocator, 0, "0", NULL, &output, &snapshot));
+    assert(!output && !snapshot);
+    assert(sp_memory_edit(allocator, 1, "1", NULL, &output, &snapshot));
+    assert(output && strstr(output, "SET ThreadPoolLimitLP \"1\"\r\nSET maxFPS"));
+    assert(snapshot && !strcmp(snapshot, "-"));
+    char *both = output, *limitBackup = snapshot;
+
+    // Re-read the saved bytes as on relaunch and switch values without replacing the backup.
+    char savedAbsence[2];
+    memcpy(savedAbsence, limitBackup, sizeof savedAbsence);
+    free(limitBackup);
+    assert(sp_memory_edit(both, 1, "2", savedAbsence, &output, &snapshot));
+    assert(output && strstr(output, "SET ThreadPoolLimitLP \"2\"") && !snapshot);
+    free(both);
+    both = output;
+    assert(sp_memory_edit(both, 1, "2", savedAbsence, &output, &snapshot));
+    assert(!output && !snapshot);
+    assert(!sp_memory_edit(both, 1, "0", savedAbsence, &output, &snapshot));
+    assert(!sp_memory_edit(both, 0, NULL, "invalid backup", &output, &snapshot));
+
+    size_t applied, unchanged;
+    char *graphicsBackup = sp_graphics_backup(both, SP_GRAPHICS_COUNT);
+    assert(graphicsBackup && !strstr(graphicsBackup, "ThreadPool"));
+    char *low = sp_graphics_edit(both, graphicsBackup, SP_GRAPHICS_A16_LOW_MEMORY,
+                                 false, false, &applied, &unchanged);
+    assert(low && strstr(low, "SET maxFPS \"30\"") && strstr(low, "SET ThreadPoolLimitLP \"2\""));
+    assert(sp_memory_edit(low, 0, NULL, allocatorBackup, &output, &snapshot));
+    assert(output && strstr(output, "\tset ThreadPoolPerThreadAllocator\t\"2\" \r\n"));
+    char *restored = sp_graphics_edit(output, graphicsBackup, SP_GRAPHICS_KEEP,
+                                      false, false, &applied, &unchanged);
+    assert(restored && strstr(restored, "SET ThreadPoolLimitLP \"2\""));
+    free(output);
+    assert(sp_memory_edit(restored, 1, NULL, savedAbsence, &output, &snapshot));
+    assert(output && !strcmp(output, original));
+    free(restored);
+    free(output);
+    free(low);
+    free(graphicsBackup);
+    free(both);
+    free(allocatorBackup);
+    free(allocator);
+
+    const char *eof = "\tset ThreadPoolLimitLP \"8\"  ";
+    assert(sp_memory_edit(eof, 1, "1", NULL, &output, &snapshot));
+    assert(output && snapshot && !strcmp(snapshot, eof));
+    free(output);
+    // The guest can rewrite the line in a new position or drop it altogether.
+    const char *rewritten = "SET ThreadPoolLimitLP \"5\"\nSET other \"x\"";
+    char *eofBackup = snapshot;
+    assert(sp_memory_edit(rewritten, 1, NULL, eofBackup, &output, &snapshot));
+    assert(output && !strcmp(output, "SET other \"x\"\n\tset ThreadPoolLimitLP \"8\"  "));
+    free(output);
+    assert(sp_memory_edit("", 1, NULL, eofBackup, &output, &snapshot));
+    assert(output && !strcmp(output, eof));
+    free(output);
+    free(eofBackup);
+
+    // The launcher's missing-file path supplies an empty string.
+    assert(sp_memory_edit("", 1, NULL, NULL, &output, &snapshot));
+    assert(!output && !snapshot);
+    assert(sp_memory_edit("", 1, "1", NULL, &output, &snapshot));
+    assert(output && !strcmp(output, "SET ThreadPoolLimitLP \"1\"\n"));
+    assert(snapshot && !strcmp(snapshot, "-"));
+    free(output);
+    free(snapshot);
+    assert(sp_memory_edit("", 1, NULL, savedAbsence, &output, &snapshot));
+    assert(!output && !snapshot);
+    puts("memory: defaults, apply, exact restore, absent restore, relaunch, switching, preset interaction, and missing config passed");
+}
+
+// Apply the choices in launch order, keeping a separate snapshot for each CVar.
+static void memory_pass(char **text, char *saved[SP_MEMORY_COUNT], const char *choices[SP_MEMORY_COUNT]) {
+    for (size_t key = 0; key < SP_MEMORY_COUNT; key++) {
+        char *output, *snapshot;
+        assert(sp_memory_edit(*text, key, choices[key], saved[key], &output, &snapshot));
+        if (output) {
+            free(*text);
+            *text = output;
+        }
+        if (!choices[key]) {
+            free(saved[key]);
+            saved[key] = NULL;
+        } else if (snapshot) {
+            assert(!saved[key]);
+            saved[key] = snapshot;
+        }
+    }
+}
+
+static void memory_experiment_tests(void) {
+    const char *original = "SET ThreadPoolPerThreadAllocator \"1\"\r\n"
+                           "SET ThreadPoolLimitLP \"8\"\r\n"
+                           "\tset GxAllowCachelessShaderMode\t\"0\" \r\n"
+                           "SET worldPreloadNonCritical \"1\"\r\n"
+                           "SET other \"x\"";
+    char *text = malloc(strlen(original) + 1);
+    assert(text);
+    strcpy(text, original);
+    char *saved[SP_MEMORY_COUNT] = {0};
+    const char *choices[SP_MEMORY_COUNT];
+    sp_memory_choices(choices, 0, 0, 0, 0);
+    memory_pass(&text, saved, choices);
+    assert(!strcmp(text, original));
+
+    sp_memory_choices(choices, 1, 2, 1, 1);
+    memory_pass(&text, saved, choices);
+    assert(strstr(text, "SET ThreadPoolPerThreadAllocator \"0\""));
+    assert(strstr(text, "SET ThreadPoolLimitLP \"2\""));
+    assert(strstr(text, "\tset GxAllowCachelessShaderMode\t\"1\" \r\n"));
+    assert(strstr(text, "SET worldPreloadNonCritical \"0\""));
+    assert(strstr(text, "SET worldPreloadHighResTextures \"0\""));
+    assert(!strcmp(saved[SP_MEMORY_CACHELESS], "\tset GxAllowCachelessShaderMode\t\"0\" \r\n"));
+    assert(!strcmp(saved[SP_MEMORY_PRELOAD_OBJECTS], "SET worldPreloadNonCritical \"1\"\r\n"));
+    assert(!strcmp(saved[SP_MEMORY_PRELOAD_TEXTURES], "-"));
+
+    sp_memory_choices(choices, 0, 0, 0, 1);
+    memory_pass(&text, saved, choices);
+    assert(strstr(text, "SET ThreadPoolPerThreadAllocator \"1\""));
+    assert(strstr(text, "SET ThreadPoolLimitLP \"8\""));
+    assert(strstr(text, "\tset GxAllowCachelessShaderMode\t\"0\" \r\n"));
+    assert(strstr(text, "SET worldPreloadNonCritical \"0\""));
+    assert(strstr(text, "SET worldPreloadHighResTextures \"0\""));
+
+    sp_memory_choices(choices, 0, 0, 1, 0);
+    memory_pass(&text, saved, choices);
+    assert(strstr(text, "\tset GxAllowCachelessShaderMode\t\"1\" \r\n"));
+    assert(strstr(text, "SET worldPreloadNonCritical \"1\""));
+    assert(!strstr(text, "worldPreloadHighResTextures"));
+
+    sp_memory_choices(choices, 9, -1, 2, 2);
+    memory_pass(&text, saved, choices);
+    assert(!strcmp(text, original));
+    for (size_t key = 0; key < SP_MEMORY_COUNT; key++) assert(!saved[key]);
+
+    for (size_t key = SP_MEMORY_CACHELESS; key < SP_MEMORY_COUNT; key++) {
+        char *output, *snapshot;
+        const char *wrong = key == SP_MEMORY_CACHELESS ? "0" : "1";
+        assert(!sp_memory_edit(text, key, wrong, NULL, &output, &snapshot));
+        assert(!output && !snapshot);
+        assert(!sp_memory_edit(text, key, "2", NULL, &output, &snapshot));
+        assert(!output && !snapshot);
+    }
+    free(text);
+    puts("memory experiments: all five CVars, partial choices, per-key validation, and exact restore passed");
+}
 
 int main(void) {
     const char *original =
@@ -122,5 +281,7 @@ int main(void) {
     seeded = sp_wtf_edit("set playintromovie \"1\"\r\n", &seed, 1);
     assert(seeded && !seed.changed && !strcmp(seeded, "set playintromovie \"1\"\r\n"));
     free(seeded);
+    memory_tests();
+    memory_experiment_tests();
     puts("graphics: presets including A16 Low Memory, both legacy backup expansions, FPS gating, exact restore, invalid backup and intro seeding passed");
 }
