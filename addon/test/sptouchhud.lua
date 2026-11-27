@@ -509,7 +509,10 @@ assert(math.abs(first.point[5] - 36) < 0.001, "overlapping hitbox should be reje
 click(overlay, "Principal")
 click(toolbar, "Menor")
 assert(SPTouchHUDCharDB.positions[8][3] == 62)
+click(toolbar, "Opacidade")
+assert(math.abs(saved.buttonOpacity[8] - 0.85) < 0.001)
 click(toolbar, "Restaurar botões")
+assert(next(saved.buttonOpacity) == nil)
 assert(first:GetWidth() == 48 and first.point[5] == 30 and next(SPTouchHUDCharDB.positions) == nil)
 combat = true
 fire("PLAYER_REGEN_DISABLED")
@@ -530,3 +533,15 @@ assert(first:GetWidth() == 48 and not hud.children[7]:IsShown() and pageButton:I
 assert(next(first.icon.masks))
 assert(nativeWrites == 0)
 print("sptouchhud: classic fallback, reset, and zero mutations of native action frames")
+
+local deferred = {}
+C_Timer.After = function(_, callback) deferred[#deferred + 1] = callback end
+local before = first:GetAttribute("action")
+empty[before] = true
+fire("ACTIONBAR_SLOT_CHANGED", before)
+fire("ACTIONBAR_SLOT_CHANGED", 0)
+fire("SPELLS_CHANGED")
+assert(#deferred == 1 and first:GetAttribute("action") == before)
+deferred[1]()
+assert(first:GetAttribute("action") ~= before)
+print("sptouchhud: coalesces slot and talent events before updating secure attributes")
